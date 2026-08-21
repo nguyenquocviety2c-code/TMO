@@ -1005,7 +1005,7 @@ export async function searchEntities(
           ftParams.entityType = options.entityType
         }
         ftCypher += ` RETURN n.name AS name, n.entity_type AS type, n.domain AS domain, n.description AS description
-                      ORDER BY score DESC LIMIT $limit`
+                      ORDER BY score DESC LIMIT toInteger($limit)`
 
         const ftResult = await session.executeRead((tx) => tx.run(ftCypher, ftParams))
         if (ftResult.records.length > 0) {
@@ -1033,23 +1033,23 @@ export async function searchEntities(
         if (options.domain) {
           cypher = `MATCH (n:${label}) WHERE n.name CONTAINS $term AND n.domain = $domain
                     RETURN n.name AS name, n.entity_type AS type, n.domain AS domain, n.description AS description
-                    ORDER BY n.name LIMIT $limit`
+                    ORDER BY n.name LIMIT toInteger($limit)`
           params = { term: query, domain: options.domain, limit }
         } else {
           cypher = `MATCH (n:${label}) WHERE n.name CONTAINS $term
                     RETURN n.name AS name, n.entity_type AS type, n.domain AS domain, n.description AS description
-                    ORDER BY n.name LIMIT $limit`
+                    ORDER BY n.name LIMIT toInteger($limit)`
           params = { term: query, limit }
         }
       } else if (options?.domain) {
         cypher = `MATCH (n) WHERE n.name CONTAINS $term AND n.domain = $domain AND n.entity_type IS NOT NULL
                   RETURN n.name AS name, n.entity_type AS type, n.domain AS domain, n.description AS description
-                  ORDER BY n.name LIMIT $limit`
+                  ORDER BY n.name LIMIT toInteger($limit)`
         params = { term: query, domain: options.domain, limit }
       } else {
         cypher = `MATCH (n) WHERE n.name CONTAINS $term AND n.entity_type IS NOT NULL
                   RETURN n.name AS name, n.entity_type AS type, n.domain AS domain, n.description AS description
-                  ORDER BY n.name LIMIT $limit`
+                  ORDER BY n.name LIMIT toInteger($limit)`
         params = { term: query, limit }
       }
 
@@ -2041,7 +2041,7 @@ export async function getEntityNeighborhood(
   entityName: string,
   options?: { limit?: number }
 ): Promise<EntityNeighborhood | null> {
-  const limit = options?.limit || 30
+  const limit = Math.floor(options?.limit || 30)
   try {
     const session = await getSession()
     try {
@@ -2069,7 +2069,7 @@ export async function getEntityNeighborhood(
            RETURN neighbor.name AS name, neighbor.entity_type AS type, neighbor.domain AS domain,
                   CASE WHEN startNode(r).name = $name THEN 'outgoing' ELSE 'incoming' END AS direction,
                   type(r) AS relType
-           LIMIT $limit`,
+           LIMIT toInteger($limit)`,
           { name: entityName, limit }
         )
       )
