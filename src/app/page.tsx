@@ -5779,9 +5779,9 @@ function SmolabModule({ sidebarOpen }: { sidebarOpen: boolean }) {
   const isLiveModeRef = useRef(false) // ref mirror for async callbacks
   const isAgentRespondingRef = useRef(false) // true while waiting for agent / playing TTS
 
-  const SILENCE_THRESHOLD = 0.01 // audio level below this = silence
-  const SILENCE_DURATION_MS = 1000 // 1s silence → auto-stop + send
-  const STOP_COMMAND = 'xin hết' // lowercase — detected at end of transcription
+  const SILENCE_THRESHOLD = 0.015 // audio level below this = silence (tuned for typical mic noise)
+  const SILENCE_DURATION_MS = 1000 // 1s silence → stop recording, send to ASR, check for "Xin hết"
+  const STOP_COMMANDS = ['xin hết', 'xin het', 'xinhết', 'xinh et', 'hết', 'het'] // lowercase — fuzzy match end command
 
   // Start VAD (Voice Activity Detection) on the persistent stream
   const startVAD = useCallback(() => {
@@ -5879,7 +5879,7 @@ function SmolabModule({ sidebarOpen }: { sidebarOpen: boolean }) {
         // DON'T stop stream tracks — keep mic open for Live mode
         const audioBlob = new Blob(audioChunksRef.current, { type: 'audio/webm' })
 
-        // DELETE user audio immediately (per requirement — no storage)
+        // DELETE user audio immediately (per requirement — no storage after send)
         audioChunksRef.current = []
 
         if (audioBlob.size === 0) {
@@ -5905,32 +5905,37 @@ function SmolabModule({ sidebarOpen }: { sidebarOpen: boolean }) {
             let text = data.text.trim()
             const textLower = text.toLowerCase()
 
-            // Check for "Xin hết" command
-            if (textLower.endsWith(STOP_COMMAND) || textLower.includes(STOP_COMMAND)) {
-              // Strip "Xin hết" from the text
-              text = text.replace(new RegExp(STOP_COMMAND, 'gi'), '').trim()
+            // Fuzzy check for any "Xin hết" variant at end of transcription
+            const foundStopCommand = STOP_COMMANDS.some(cmd => 
+              textLower.endsWith(cmd) || textLower.includes(cmd)
+            )
+
+            if (foundStopCommand) {
+              // Strip "Xin hết" (and variants) from the text
+              for (const cmd of STOP_COMMANDS) {
+                text = text.replace(new RegExp(cmd, 'gi'), '').trim()
+              }
 
               if (text.length > 0) {
-                // Auto-send the message
+                // Auto-send the message (text without "Xin hết")
                 setLiveStatus('Đang gửi tin nhắn...')
                 isAgentRespondingRef.current = true
                 setInput(text)
                 // Trigger send — sendMessage reads from input
-                // Use setTimeout to let setInput take effect
                 setTimeout(() => {
                   sendMessage(text)
                 }, 100)
               } else {
-                // Only "Xin hết" was spoken — restart listening
+                // Only "Xin hết" was spoken (no content) — restart listening
                 if (isLiveModeRef.current) {
                   setTimeout(() => startLiveRecording(), 500)
                 }
               }
             } else {
-              // No "Xin hết" — append to input (accumulating)
-              // This allows multi-segment speech
+              // No "Xin hết" — append to input (accumulating for multi-segment speech)
+              // Per requirement 4: user paused 1s but didn't say "Xin hết" → continue recording
               setInput(prev => prev ? `${prev} ${text}` : text)
-              setLiveStatus('🔴 LIVE — Tiếp tục nói... (kết thúc bằng "Xin hết")')
+              setLiveStatus('🔴 LIVE — Tiếp tục nói... (nói "Xin hết" để gửi)')
               // Restart recording for next segment
               if (isLiveModeRef.current && !isAgentRespondingRef.current) {
                 setTimeout(() => startLiveRecording(), 300)
