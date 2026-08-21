@@ -16,7 +16,7 @@ import {
   FolderUp, ListChecks, BarChart3, Bot, MessageCircle, Lightbulb, Target,
   Network as GraphIcon, Route, TrendingUp, Cable, ZoomIn, ZoomOut, Maximize,
   X, PieChart as PieChartIcon, AlertCircle, ChevronsLeft, ChevronsRight, Calendar,
-  ThumbsUp, ThumbsDown, Settings, Wrench, Radio, BookMarked, Zap as ZapIcon, Plus, CircleDot, Table,
+  ThumbsUp, ThumbsDown, Settings, Wrench, Radio, BookMarked, Zap as ZapIcon, Plus, CircleDot, Table, Mic,
   Download, Upload as UploadIcon, FileJson, GraduationCap, RotateCcw, FileDown, FileUp, Edit3, Pencil, Users, User,
   Code2, Terminal as TerminalIcon, FolderTree, FileCode, Bug, RefreshCw as RefreshCwIcon, Monitor,
   Play as PlayIcon, Square, ScrollText, ArrowRight as ArrowRightIcon, Cpu as CpuIcon, Cable as CableIcon,
@@ -5758,6 +5758,136 @@ function SmolabModule({ sidebarOpen }: { sidebarOpen: boolean }) {
   const [activeTaskIds, setActiveTaskIds] = useState<Map<string, string>>(new Map()) // sessionId → taskId
   const [taskPolling, setTaskPolling] = useState(false)
 
+  // Voice mode state — mic recording + TTS playback + voice selection
+  const [isRecording, setIsRecording] = useState(false)
+  const [voiceError, setVoiceError] = useState<string | null>(null)
+  const [selectedVoice, setSelectedVoice] = useState<string>(() => {
+    try { return localStorage.getItem('smolab-voice') || 'tongtong' } catch { return 'tongtong' }
+  })
+  const [isPlaying, setIsPlaying] = useState(false)
+  const mediaRecorderRef = useRef<MediaRecorder | null>(null)
+  const audioChunksRef = useRef<Blob[]>([])
+  const audioPlaybackRef = useRef<HTMLAudioElement | null>(null)
+  const [showVoiceSelect, setShowVoiceSelect] = useState(false)
+
+  // Start mic recording
+  const startRecording = useCallback(async () => {
+    setVoiceError(null)
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true })
+      const mediaRecorder = new MediaRecorder(stream, { mimeType: 'audio/webm' })
+      mediaRecorderRef.current = mediaRecorder
+      audioChunksRef.current = []
+
+      mediaRecorder.ondataavailable = (event) => {
+        if (event.data.size > 0) audioChunksRef.current.push(event.data)
+      }
+
+      mediaRecorder.onstop = async () => {
+        // Stop all tracks to release mic
+        stream.getTracks().forEach(t => t.stop())
+
+        const audioBlob = new Blob(audioChunksRef.current, { type: 'audio/webm' })
+        if (audioBlob.size === 0) {
+          setVoiceError('Không ghi được audio. Thử lại.')
+          return
+        }
+
+        // Send to ASR endpoint
+        const formData = new FormData()
+        formData.append('audio', audioBlob, 'voice-input.webm')
+
+        try {
+          setVoiceError('Đang chuyển giọng nói thành văn bản...')
+          const res = await fetch('/api/voice/transcribe', { method: 'POST', body: formData })
+          if (!res.ok) throw new Error(`ASR error: ${res.status}`)
+          const data = await res.json()
+          if (data.success && data.text) {
+            setInput(data.text)
+            setVoiceError(null)
+          } else {
+            setVoiceError(data.error || 'Không nhận diện được giọng nói')
+          }
+        } catch (err) {
+          setVoiceError('Lỗi chuyển giọng nói: ' + (err instanceof Error ? err.message : String(err)))
+        }
+      }
+
+      mediaRecorder.start()
+      setIsRecording(true)
+    } catch (err) {
+      setVoiceError('Không truy cập được mic: ' + (err instanceof Error ? err.message : String(err)))
+    }
+  }, [])
+
+  // Stop mic recording
+  const stopRecording = useCallback(() => {
+    if (mediaRecorderRef.current && isRecording) {
+      mediaRecorderRef.current.stop()
+      setIsRecording(false)
+    }
+  }, [isRecording])
+
+  // Play TTS audio for assistant response
+  const playTTS = useCallback(async (text: string) => {
+    if (!text || text.length < 5) return // skip very short responses
+
+    try {
+      setIsPlaying(true)
+      const res = await fetch('/api/voice/speak', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ text: text.slice(0, 1000), voice: selectedVoice, speed: 1.0 }),
+      })
+
+      if (!res.ok) throw new Error(`TTS error: ${res.status}`)
+
+      const audioBlob = await res.blob()
+      const audioUrl = URL.createObjectURL(audioBlob)
+
+      // Create or reuse audio element
+      if (!audioPlaybackRef.current) {
+        audioPlaybackRef.current = new Audio()
+      }
+      const audio = audioPlaybackRef.current
+      audio.src = audioUrl
+
+      audio.onended = () => {
+        setIsPlaying(false)
+        URL.revokeObjectURL(audioUrl)
+      }
+      audio.onerror = () => {
+        setIsPlaying(false)
+        URL.revokeObjectURL(audioUrl)
+      }
+
+      await audio.play()
+    } catch (err) {
+      console.warn('[Voice] TTS playback failed:', err instanceof Error ? err.message : String(err))
+      setIsPlaying(false)
+    }
+  }, [selectedVoice])
+
+  // Save voice selection to localStorage
+  useEffect(() => {
+    try { localStorage.setItem('smolab-voice', selectedVoice) } catch {}
+  }, [selectedVoice])
+
+  // Auto-play TTS when a new assistant message arrives
+  const lastMessageRef = useRef<string | null>(null)
+  useEffect(() => {
+    if (!messages || messages.length === 0) return
+    const lastMsg = messages[messages.length - 1]
+    // Only play for assistant messages that are new (different from last played)
+    if (lastMsg && lastMsg.role === 'assistant' && lastMsg.content && lastMsg.id !== lastMessageRef.current) {
+      lastMessageRef.current = lastMsg.id
+      // Only auto-play if not currently loading (response is complete)
+      if (!isLoading) {
+        playTTS(lastMsg.content)
+      }
+    }
+  }, [messages, isLoading, playTTS])
+
   // canChat — PHẢI chọn Agent/Team trước khi chat (Phase 5)
   const canChat = (chatMode === 'single' && !!selectedAgentId) || (chatMode === 'multi' && !!selectedTeam)
 
@@ -7770,6 +7900,7 @@ function SmolabModule({ sidebarOpen }: { sidebarOpen: boolean }) {
             {/* Input Box — Phase 5: Disable khi chưa chọn Agent/Team */}
             <div className="flex-shrink-0 p-3 border-t border-cyan-400/35">
               {canChat ? (
+              <>
               <div className="flex items-center gap-2">
                 <input
                   ref={chatInputRef}
@@ -7777,18 +7908,78 @@ function SmolabModule({ sidebarOpen }: { sidebarOpen: boolean }) {
                   value={input}
                   onChange={e => setInput(e.target.value)}
                   onKeyDown={e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendMessage() } }}
-                  placeholder="Nhập câu hỏi..."
+                  placeholder={isRecording ? "🔴 Đang ghi âm... bấm mic để dừng" : "Nhập câu hỏi..."}
                   className="chamfer-sm flex-1 px-3 py-2 text-xs bg-slate-950/60 border border-cyan-400/40 text-stone-200 placeholder:text-stone-500 focus:outline-none focus:border-cyan-500/50 transition-colors"
                   disabled={isLoading}
                 />
+                {/* Voice selector dropdown */}
+                <div className="relative">
+                  <Button
+                    onClick={() => setShowVoiceSelect(!showVoiceSelect)}
+                    className="chamfer-sm h-8 w-8 p-0 bg-slate-800/60 hover:bg-slate-700/60 text-cyan-400 border border-cyan-400/30"
+                    title="Chọn giọng nói"
+                  >
+                    <span className="text-[10px]">🎤</span>
+                  </Button>
+                  {showVoiceSelect && (
+                    <div className="absolute bottom-10 right-0 w-48 bg-slate-900 border border-cyan-400/30 rounded-lg shadow-xl z-50 p-2">
+                      <div className="text-[10px] text-stone-500 mb-1 px-1">Chọn giọng nói:</div>
+                      {[
+                        { id: 'tongtong', name: 'Tong Tong', desc: 'Trung tính (mặc định)' },
+                        { id: 'male', name: 'Male', desc: 'Giọng nam' },
+                        { id: 'female', name: 'Female', desc: 'Giọng nữ' },
+                      ].map(v => (
+                        <button
+                          key={v.id}
+                          onClick={() => { setSelectedVoice(v.id); setShowVoiceSelect(false) }}
+                          className={`w-full text-left px-2 py-1.5 rounded text-[10px] transition-colors ${
+                            selectedVoice === v.id
+                              ? 'bg-cyan-900/40 text-cyan-300'
+                              : 'text-stone-300 hover:bg-slate-800'
+                          }`}
+                        >
+                          <div className="font-bold">{v.name}</div>
+                          <div className="text-stone-500 text-[9px]">{v.desc}</div>
+                        </button>
+                      ))}
+                    </div>
+                  )}
+                </div>
+                {/* Mic button — hold to record, click to stop */}
+                <Button
+                  onClick={() => isRecording ? stopRecording() : startRecording()}
+                  disabled={isLoading}
+                  className={`chamfer-sm h-8 w-8 p-0 text-white transition-colors ${
+                    isRecording
+                      ? 'bg-red-600 hover:bg-red-700 animate-pulse'
+                      : 'bg-slate-700/60 hover:bg-slate-600/60'
+                  }`}
+                  title={isRecording ? 'Dừng ghi âm' : 'Ghi âm (nói vào mic)'}
+                >
+                  {isRecording ? (
+                    <span className="h-3 w-3 bg-white rounded-full inline-block" />
+                  ) : (
+                    <Mic className="h-3.5 w-3.5" />
+                  )}
+                </Button>
                 <Button
                   onClick={() => sendMessage()}
                   disabled={isLoading || !input.trim()}
                   className="chamfer-sm h-8 w-8 p-0 bg-gradient-to-r from-emerald-600 to-teal-700 hover:from-emerald-500 hover:to-teal-600 text-white"
                 >
-                  <Send className="h-3.5 w-3.5" />
+                  {isLoading ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Send className="h-3.5 w-3.5" />}
                 </Button>
               </div>
+              {/* Voice error/status display */}
+              {voiceError && (
+                <div className="mt-1 text-[9px] text-amber-400/80 px-1">{voiceError}</div>
+              )}
+              {isPlaying && (
+                <div className="mt-1 text-[9px] text-cyan-400/80 px-1 flex items-center gap-1">
+                  <Loader2 className="h-2.5 w-2.5 animate-spin" /> Đang đọc phản hồi...
+                </div>
+              )}
+              </>
               ) : (
                 <div className="flex items-center justify-center h-10 text-stone-500 text-xs gap-2">
                   <Zap className="h-4 w-4 opacity-30" />

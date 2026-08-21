@@ -130,8 +130,19 @@ const modelRotationCounters: Record<string, number> = {
 
 /** Get a rotated copy of a model list for a provider.
  *  The starting model changes each call so all models get used.
+ *
+ *  NOTE: For EXTRACTION models, rotation is DISABLED (user Option C — 2026-08-21).
+ *  nemotron-3-ultra-550b is ALWAYS tried first because it produces higher-quality
+ *  extraction. gpt-oss-120b is only used as fallback when nemotron returns 429/timeout.
+ *  This trades ~15x slower response time for better extraction quality.
  */
 function getRotatedModels(provider: string, models: string[]): string[] {
+  // EXTRACTION models: no rotation — always try primary (nemotron-550b) first
+  // Compare by reference — if it's the extraction list, skip rotation
+  if (models === NVIDIA_EXTRACTION_MODELS) {
+    return models // Always [nemotron-550b, gpt-oss-120b]
+  }
+  // Non-extraction models: rotate as before
   const offset = modelRotationCounters[provider] % models.length
   modelRotationCounters[provider]++
   if (offset === 0) return models // No rotation needed
@@ -1880,7 +1891,7 @@ async function tryNvidiaSlot(slotIndex: number, prompt: string, systemPrompt: st
     NVIDIA_EXTRACTION_MODELS,
     prompt,
     systemPrompt,
-    60000, // 60s timeout
+    120000, // 120s timeout (increased from 60s — user Option C: nemotron-550b is ~9s/call, allow longer)
     {},
     30000, // 30s rate limit cooldown — shorter to recover faster from temporary rate limits
     temperature ?? 0.1,

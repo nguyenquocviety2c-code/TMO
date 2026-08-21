@@ -90,7 +90,7 @@ type DuplicatePair = DuplicatePairLib
 const VALID_ENTITY_TYPES: EntityType[] = ['Concept', 'Technology', 'Framework', 'Vulnerability', 'Principle', 'Domain', 'Document', 'Person']
 const VALID_RELATIONSHIP_TYPES: RelationshipType[] = ['PART_OF', 'IMPLEMENTED_IN', 'USES', 'EXPLOITS', 'MITIGATES', 'RUNS_ON', 'DEPENDS_ON', 'CONTRASTS_WITH', 'ENABLES', 'CONTAINS', 'EXTENDS', 'APPLIES_TO', 'CREATED_BY', 'DOCUMENTED_IN', 'ALTERNATIVE_TO']
 const RATE_LIMIT_DELAY_MS = 100
-const CONCURRENT_CHUNKS = 8
+const CONCURRENT_CHUNKS = 4 // Reduced from 8 → 4 (user Option C: less rate-limit on nemotron-550b)
 
 /** Sliding window concurrency: each worker takes the next chunk from the iterator
  *  as soon as it finishes the current one. No waiting for group completion.
