@@ -43,7 +43,7 @@ export const CODE_TEAM_AGENTS: CodeTeamAgentDef[] = [
     domain: 'programming',
     capable: 'Phân tích thị giác, routing decision, code UI/UX, verify kết quả, điều phối team',
     provider: 'nvidia',
-    model: 'moonshotai/kimi-k2.6',
+    model: 'moonshotai/kimi-k3',
     temperature: 0.5,
     maxTokens: 8192,
     team: 'code',
@@ -58,7 +58,7 @@ export const CODE_TEAM_AGENTS: CodeTeamAgentDef[] = [
     domain: 'programming',
     capable: 'Thiết kế kiến trúc, DB schema, API design, component tree, state management, security architecture',
     provider: 'nvidia',
-    model: 'deepseek-ai/deepseek-v4-flash',
+    model: 'deepseek-ai/deepseek-v4-flash-0731',
     temperature: 0.4,
     maxTokens: 8192,
     team: 'code',
@@ -73,7 +73,7 @@ export const CODE_TEAM_AGENTS: CodeTeamAgentDef[] = [
     domain: 'programming',
     capable: 'Code TypeScript/React/Next.js, implement API, database operations, error handling',
     provider: 'nvidia',
-    model: 'qwen/qwen3.5-397b-a17b',
+    model: 'moonshotai/kimi-k3',
     temperature: 0.3,
     maxTokens: 8192,
     team: 'code',
@@ -88,7 +88,7 @@ export const CODE_TEAM_AGENTS: CodeTeamAgentDef[] = [
     domain: 'security',
     capable: 'Code review, tìm bugs, kiểm tra security, fix bugs, iterative refinement',
     provider: 'nvidia',
-    model: 'z-ai/glm-5.1',
+    model: 'z-ai/glm-5.2',
     temperature: 0.2,
     maxTokens: 8192,
     team: 'code',
@@ -103,7 +103,7 @@ export const CODE_TEAM_AGENTS: CodeTeamAgentDef[] = [
     domain: 'programming',
     capable: 'Tối ưu performance, refactor code, scalability, best practices, UI+Backend integration',
     provider: 'nvidia',
-    model: 'minimaxai/minimax-m2.7',
+    model: 'minimaxai/minimax-m3',
     temperature: 0.3,
     maxTokens: 8192,
     team: 'code',
@@ -339,4 +339,48 @@ export function getPipelineForMode(mode: 'A' | 'B' | 'C', tier: number): string[
 
   // Mode B (Pure Backend): standard tier pipeline — TL only analyzes + verifies
   return getPipelineForTier(tier)
+}
+
+/**
+ * Auto-seed MCPBridgeConfig + KnowledgeAccessPolicy
+ * Called after ensureCodeTeamAgents to ensure these configs exist.
+ * Prevents data loss when running locally (no manual setup needed).
+ */
+export async function ensureMCPBridgeConfig(): Promise<void> {
+  try {
+    const existing = await db.mCPBridgeConfig.count()
+    if (existing > 0) return // already seeded
+
+    const configs = [
+      { direction: 'outbound', toolName: 'knowledge_search', enabled: true },
+      { direction: 'outbound', toolName: 'knowledge_graph', enabled: true },
+      { direction: 'outbound', toolName: 'knowledge_write', enabled: true },
+      { direction: 'outbound', toolName: 'web_search', enabled: true },
+      { direction: 'inbound', toolName: 'file_read', enabled: true },
+      { direction: 'inbound', toolName: 'file_edit', enabled: true },
+      { direction: 'inbound', toolName: 'bash_exec', enabled: true },
+      { direction: 'inbound', toolName: 'lsp_diag', enabled: true },
+      { direction: 'inbound', toolName: 'fetch_url', enabled: true },
+    ]
+
+    for (const c of configs) {
+      await db.mCPBridgeConfig.create({ data: c })
+    }
+
+    // Knowledge Access Policy
+    await db.knowledgeAccessPolicy.create({
+      data: {
+        agentId: 'default',
+        allowRead: true,
+        allowWrite: true,
+        allowDelete: false,
+        allowedCollections: 'theopus_documents,theopus_chunks',
+        allowedLabels: '*',
+      },
+    })
+
+    console.log(`[Seed] MCPBridgeConfig: ${configs.length} configs + 1 KnowledgeAccessPolicy created`)
+  } catch (err) {
+    console.warn('[Seed] MCPBridgeConfig seed failed:', err instanceof Error ? err.message : String(err))
+  }
 }

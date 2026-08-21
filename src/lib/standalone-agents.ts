@@ -148,7 +148,7 @@ LEARNING & MEMORY
     capable:
       'Tìm kiếm web, phân tích thông tin, thảo luận triết học, thuật toán, brainstorming đa lĩnh vực, code & tools, skill installation, research sâu, creative ideation',
     provider: 'nvidia',
-    model: 'moonshotai/kimi-k2.6',
+    model: 'moonshotai/kimi-k3',
     temperature: 0.7,
     maxTokens: 6000,
     team: null,

@@ -23,7 +23,7 @@ import {
   AGENT_MAX_TOKENS_MIN,
   AGENT_MAX_TOKENS_MAX,
 } from '@/lib/agent-constants'
-import { ensureCodeTeamAgents } from '@/lib/code-team/agents'
+import { ensureCodeTeamAgents, ensureMCPBridgeConfig } from '@/lib/code-team/agents'
 import { ensureStandaloneAgents } from '@/lib/standalone-agents'
 
 // ==================== DB RETRY HELPER ====================
@@ -122,7 +122,7 @@ function validateDomain(domain: string): string | null {
 export async function GET(request: NextRequest) {
   try {
     // Auto-seed Code Team + Standalone agents on first agents fetch (idempotent, cached)
-    await Promise.all([ensureCodeTeamAgents(), ensureStandaloneAgents()])
+    await Promise.all([ensureCodeTeamAgents(), ensureStandaloneAgents(), ensureMCPBridgeConfig()])
 
     const { searchParams } = new URL(request.url)
     const id = searchParams.get('id')
