@@ -98,7 +98,7 @@ function classifyByRule(message: string): IntentResult | null {
  */
 async function classifyByLLM(message: string): Promise<IntentResult> {
   // Lazy import to avoid Edge bundler issues
-  const { callLLM } = await import('./llm')
+  const { callLLM } = await import('@/lib/llm')
 
   const prompt = `Classify this user message into exactly ONE category. Reply with ONLY the category name, nothing else.
 
@@ -155,15 +155,32 @@ Category:`
 /**
  * Classify the intent of a user message.
  * Tries rule-based first (fast), falls back to LLM if ambiguous.
+ *
+ * @param message - User message to classify
+ * @param options - Optional config:
+ *   - skipLLMFallback: if true, default to 'factual' instead of calling LLM (for fast chat path)
  */
-export async function classifyIntent(message: string): Promise<IntentResult> {
+export async function classifyIntent(
+  message: string,
+  options?: { skipLLMFallback?: boolean }
+): Promise<IntentResult> {
   // Step 1: Try rule-based (fast, 0ms)
   const ruleResult = classifyByRule(message)
   if (ruleResult) {
     return ruleResult
   }
 
-  // Step 2: LLM fallback (only when rules inconclusive)
+  // Step 2: If LLM fallback skipped (e.g., chat route for speed), default to factual
+  if (options?.skipLLMFallback) {
+    return {
+      intent: 'factual',
+      confidence: 0.5,
+      source: 'rule',
+      reason: 'No rule matched, defaulted to factual (LLM fallback skipped)',
+    }
+  }
+
+  // Step 3: LLM fallback (only when rules inconclusive and not skipped)
   return classifyByLLM(message)
 }
 

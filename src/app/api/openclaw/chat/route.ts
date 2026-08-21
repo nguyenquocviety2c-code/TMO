@@ -26,6 +26,10 @@ import { recallMemories, extractMemoriesFromConversation, saveChatMessages, getU
 import { executeTool } from '@/lib/code-team/tool-executor'
 import { parseToolCallsFromOutput, formatMessagesForLLM } from '@/lib/tool-calls'
 import { getStandaloneAgentTools } from '@/lib/standalone-agents'
+// Phase A: Smart KB Routing — Intent Classifier
+// Phase C: Smart KB Writeback — replaces autoLearnFromAnswer with confidence-filtered writeback
+// Phase B: Smart KB Pre-Search — search Qdrant+Neo4j before building system prompt
+import { classifyIntent, writebackToKB, searchUserKB } from '@/lib/kb-routing'
 
 export const dynamic = 'force-dynamic'
 
@@ -42,6 +46,45 @@ function isTrivialExchange(userMsg: string, assistantMsg: string): boolean {
   const trivialPatterns = /^(hi|hello|hey|chào|xin chào|ok|okay|cảm ơn|thanks|thank you|bye|tạm biệt|được|vâng|yes|no|không)$/i
   if (trivialPatterns.test(userMsg.trim())) return true
   return false
+}
+
+/**
+ * Phase A: Generate a fast response for casual messages (greetings, thanks, etc.)
+ * without hitting the LLM or Knowledge Base.
+ *
+ * This is the "fast path" — saves ~2s of latency and ~500 tokens per casual message.
+ */
+function generateCasualResponse(userMsg: string, agentName?: string): string {
+  const name = agentName || 'The Magnum Opus'
+  const lower = userMsg.toLowerCase().trim()
+
+  // Greetings
+  if (/^(hi|hello|hey|yo|chào|xin chào|halo|alo)\b/i.test(lower)) {
+    return `Xin chào! Tôi là ${name}. Tôi có thể giúp gì cho bạn hôm nay?`
+  }
+
+  // Thanks
+  if (/^(cảm ơn|cám ơn|thanks|thank you|ty|tks)\b/i.test(lower)) {
+    return `Không có gì! Tôi luôn sẵn sàng giúp bạn. Còn gì nữa không?`
+  }
+
+  // Goodbye
+  if (/^(bye|tạm biệt|goodbye|see you)\b/i.test(lower)) {
+    return `Tạm biệt! Hẹn gặp lại bạn. 👋`
+  }
+
+  // Confirmations
+  if (/^(ok|okay|được|vâng|yes|có|uh|ừm)\b/i.test(lower)) {
+    return `Vâng, tôi hiểu. Bạn cần tôi làm gì tiếp theo?`
+  }
+
+  // Negative
+  if (/^(no|không|sai|nope)\b/i.test(lower)) {
+    return `Đã rõ. Bạn muốn tôi làm gì khác?`
+  }
+
+  // Default casual fallback
+  return `Tôi đã nhận được tin nhắn của bạn. Bạn có thể hỏi tôi về bất kỳ chủ đề nào — tôi sẽ tìm trong Knowledge Base hoặc dùng kiến thức của mình để trả lời.`
 }
 
 // ============================================
@@ -404,6 +447,71 @@ export async function POST(request: NextRequest) {
     const lastUserContent = typeof lastUserMsg?.content === 'string' ? lastUserMsg.content : ''
 
     // ============================================
+    // PHASE A: INTENT CLASSIFICATION — Smart KB Routing
+    // Classify the user message intent BEFORE doing any KB/memory work.
+    // This allows casual messages (greetings, thanks) to skip the entire
+    // KB pipeline — saving ~2s of latency and ~500 tokens per casual message.
+    // ============================================
+    let intent: 'casual' | 'factual' | 'procedural' | 'meta' = 'factual'
+    let intentConfidence = 0
+    let intentSource = 'default'
+
+    if (lastUserContent) {
+      try {
+        // skipLLMFallback=true: for chat, we don't want to add LLM latency for ambiguous messages
+        // — just default to 'factual' and let the existing flow handle it
+        const intentResult = await classifyIntent(lastUserContent, { skipLLMFallback: true })
+        intent = intentResult.intent
+        intentConfidence = intentResult.confidence
+        intentSource = intentResult.source
+        console.log(`[OpenClaw Chat] Intent: ${intent} (confidence: ${intentConfidence.toFixed(2)}, source: ${intentSource})`)
+      } catch (err) {
+        console.warn('[OpenClaw Chat] Intent classification failed, defaulting to factual:', err instanceof Error ? err.message : String(err))
+      }
+    }
+
+    // CASUAL intent: skip everything — return fast response without hitting LLM or KB
+    if (intent === 'casual') {
+      const casualResponse = generateCasualResponse(lastUserContent, agentProfileName)
+
+      // Save chat messages (non-blocking — for session history)
+      if (sessionId) {
+        saveChatMessages(sessionId, [
+          { role: 'user', content: lastUserContent },
+          { role: 'assistant', content: casualResponse, model: 'casual-fast-path', provider: 'intent-classifier' },
+        ]).catch(() => {})
+      }
+
+      return NextResponse.json({
+        content: casualResponse,
+        model: 'casual-fast-path',
+        provider: 'intent-classifier',
+        sessionId: sessionId || `session-${Date.now()}`,
+        agentProfileId: agentProfileId || undefined,
+        intent,
+        intentConfidence,
+        kbResults: 'skipped',
+        memoriesRecalled: 0,
+      })
+    }
+
+    // PROCEDURAL intent: route to OpenCode (keep existing isCodeQuery logic as backup)
+    // classifyIntent may catch procedural queries that isCodeQuery misses
+    if (intent === 'procedural' || isCodeQuery(lastUserContent)) {
+      const opencodeResponse = await routeToOpenCode(lastUserContent, model, sessionId, messages, agentProfileId, teamMode, teamName)
+      if (opencodeResponse) {
+        return opencodeResponse
+      }
+      // If OpenCode is offline, fall through to regular flow (with a note)
+    }
+
+    // META intent: queries about the agent itself ("who are you", "what can you do")
+    // Skip KB context injection (Phase B will handle this), but continue with existing flow
+    // so the agent can use its profile + skills to respond
+
+    // FACTUAL intent: run full flow (memory recall + KB + LLM) — existing behavior continues below
+
+    // ============================================
     // PROACTIVE MEMORY RECALL — Phase 5
     // Before building the response, recall relevant memories for this agent
     // and inject them into the system prompt so the agent remembers past interactions.
@@ -437,9 +545,44 @@ export async function POST(request: NextRequest) {
       }
     }
 
-    // Build system prompt with static KB context (fast, no DB queries)
+    // ============================================
+    // PHASE B: KB PRE-SEARCH — Smart KB Routing
+    // For factual queries, search Qdrant chunks + Neo4j entities BEFORE building
+    // the system prompt. This gives the agent dynamic KB context (instead of static).
+    // Results are stored in kbSearchResult for later use by writeback (Phase C) and /api/query (Phase D).
+    // ============================================
+    let kbSearchResult: Awaited<ReturnType<typeof searchUserKB>> | null = null
+    let dynamicKBContext = ''
+
+    if (intent === 'factual' && lastUserContent) {
+      try {
+        kbSearchResult = await searchUserKB(lastUserContent, agentProfileId || undefined, { topK: 5 })
+        console.log(`[OpenClaw Chat] KB pre-search: ${kbSearchResult.chunks.length} chunks, ${kbSearchResult.entities.length} entities, confidence=${kbSearchResult.confidence.toFixed(2)}`)
+
+        // Build dynamic KB context from search results
+        const parts: string[] = []
+        if (kbSearchResult.chunks.length > 0) {
+          parts.push('--- Document Chunks (from Knowledge Base) ---')
+          parts.push(kbSearchResult.chunks.map((c, i) =>
+            `[${i + 1}] (similarity: ${c.score.toFixed(2)}) ${c.text.slice(0, 500)}`
+          ).join('\n'))
+        }
+        if (kbSearchResult.entities.length > 0) {
+          parts.push('--- Known Entities (from Knowledge Graph) ---')
+          parts.push(kbSearchResult.entities.map(e =>
+            `- ${e.name} (${e.type}): ${e.description.slice(0, 200)}`
+          ).join('\n'))
+        }
+        dynamicKBContext = parts.join('\n\n')
+      } catch (err) {
+        console.warn('[OpenClaw Chat] KB pre-search failed:', err instanceof Error ? err.message : String(err))
+      }
+    }
+
+    // Build system prompt — use dynamic KB context if available, otherwise static
     // If agentInstruction is provided (from Agent Profile), prepend it to the system prompt
-    let systemPrompt = DEFAULT_SYSTEM_PROMPT + `\n\n--- Knowledge Base Context ---\n${STATIC_KB_CONTEXT}`
+    const kbContextForPrompt = dynamicKBContext || STATIC_KB_CONTEXT
+    let systemPrompt = DEFAULT_SYSTEM_PROMPT + `\n\n--- Knowledge Base Context ---\n${kbContextForPrompt}`
 
     if (agentInstruction && typeof agentInstruction === 'string' && agentInstruction.trim()) {
       systemPrompt = agentInstruction.trim() + '\n\n--- Base System Prompt ---\n' + systemPrompt
@@ -527,7 +670,9 @@ export async function POST(request: NextRequest) {
     //   3. No agent config → try Gateway → then /api/query → then mock
 
     // If the query is code-related, try routing to OpenCode first
-    if (isCodeQuery(lastUserContent)) {
+    // NOTE: Phase A already handles this via classifyIntent() above (intent === 'procedural')
+    // This is a safety net for when classifyIntent defaults to 'factual' but isCodeQuery still matches
+    if (intent !== 'procedural' && isCodeQuery(lastUserContent)) {
       const opencodeResponse = await routeToOpenCode(lastUserContent, model, sessionId, messages, agentProfileId, teamMode, teamName)
       if (opencodeResponse) {
         return opencodeResponse
@@ -586,19 +731,35 @@ export async function POST(request: NextRequest) {
           } catch {}
         }
 
-        // Background: Auto-learn (if applicable)
+        // Phase C: Smart KB Writeback — replaces autoLearnFromAnswer
+        // writebackToKB extracts entities/relationships with confidence filter (> 0.5),
+        // writes to Qdrant + Neo4j + AgentMemory. Falls back to autoLearnFromAnswer if it fails.
+        // Phase B: uses kbSearchResult (pre-searched) instead of empty step1Result
         const hasAgent = !!(agentProfileId && agentProvider && agentModel)
-        if (shouldAutoLearn(0.5, hasAgent)) {
-          autoLearnFromAnswer({
+        if (hasAgent && !isTrivialExchange(lastUserContent, content)) {
+          writebackToKB({
             query: lastUserContent,
-            answer: content,
-            confidence: 0.6,
+            step2Result: { used: true, content, supplemented: true, source: 'model-knowledge' },
+            step1Result: kbSearchResult || { chunks: [], entities: [], memories: recalledMemories, confidence: 0, source: 'user-kb' },
             agentId: agentProfileId!,
             agentName: agentProfileName || 'unknown',
-            provider: agentProvider!,
-            model: agentModel!,
-            sources: [],
-          }).catch(err => console.error('[AutoLearn] Background error:', err instanceof Error ? err.message : String(err)))
+            sessionId,
+          }).catch(err => {
+            console.error('[Writeback] Failed, falling back to autoLearn:', err instanceof Error ? err.message : String(err))
+            // Fallback: old auto-learn path (writes to SQLite buffer)
+            if (shouldAutoLearn(0.5, hasAgent)) {
+              autoLearnFromAnswer({
+                query: lastUserContent,
+                answer: content,
+                confidence: 0.6,
+                agentId: agentProfileId!,
+                agentName: agentProfileName || 'unknown',
+                provider: agentProvider!,
+                model: agentModel!,
+                sources: [],
+              }).catch(() => {})
+            }
+          })
         }
 
         // Background: Memory & Learning
@@ -640,6 +801,8 @@ export async function POST(request: NextRequest) {
           reactIterations: reactResult.iterations,
           toolCallsExecuted: reactResult.toolCallsExecuted,
           memoriesRecalled: recalledMemories.length || undefined,
+          intent,
+          kbConfidence: kbSearchResult?.confidence || undefined,
         })
       } catch (err) {
         console.warn('[OpenClaw Chat] ReAct loop error, falling back to /api/query:', err instanceof Error ? err.message : String(err))
@@ -746,6 +909,16 @@ export async function POST(request: NextRequest) {
             // Skip meta-cognitive reasoning for chat flow — reduces latency by ~15s
             // KB results are already enriched with memories in the system prompt
             skipMetaCog: true,
+            // Phase D (Option b): Pass pre-fetched KB results from Phase B
+            // /api/query can use these instead of searching again (avoiding duplicate search)
+            ...(kbSearchResult ? {
+              prefetchedKB: {
+                chunks: kbSearchResult.chunks.map(c => ({ text: c.text, score: c.score, documentId: c.documentId })),
+                entities: kbSearchResult.entities.map(e => ({ name: e.name, type: e.type, description: e.description })),
+                confidence: kbSearchResult.confidence,
+              },
+              skipKBSearch: kbSearchResult.confidence >= 0.5, // skip /api/query's own search if we already have good results
+            } : {}),
             ...(agentTemperature !== undefined ? { temperature: agentTemperature } : {}),
             ...(agentMaxTokens !== undefined ? { maxTokens: agentMaxTokens } : {}),
             ...(agentProfileId ? { agentId: agentProfileId } : {}),
@@ -789,22 +962,34 @@ export async function POST(request: NextRequest) {
           } catch {}
         }
 
-        // Phase 4: Auto-Learn — if agent has provider/model and confidence is in learning zone,
-        // trigger background learning so the knowledge is available for future queries.
-        // Non-blocking: fire-and-forget, don't delay the response.
+        // Phase C: Smart KB Writeback — replaces autoLearnFromAnswer
+        // Same as ReAct path: writeback with confidence filter, fallback to autoLearnFromAnswer
+        // Phase B: uses kbSearchResult (pre-searched) instead of empty step1Result
         const queryConfidence = data.confidence ?? 0
         const hasAgent = !!(agentProfileId && agentProvider && agentModel)
-        if (shouldAutoLearn(queryConfidence, hasAgent)) {
-          autoLearnFromAnswer({
+        if (hasAgent && !isTrivialExchange(lastUserContent, content)) {
+          writebackToKB({
             query: lastUserContent,
-            answer: content,
-            confidence: queryConfidence,
+            step2Result: { used: true, content, supplemented: true, source: 'model-knowledge' },
+            step1Result: kbSearchResult || { chunks: [], entities: [], memories: recalledMemories, confidence: queryConfidence, source: 'user-kb' },
             agentId: agentProfileId!,
             agentName: agentProfileName || 'unknown',
-            provider: agentProvider!,
-            model: agentModel!,
-            sources: data.sources,
-          }).catch(err => console.error('[AutoLearn] Background error:', err instanceof Error ? err.message : String(err)))
+            sessionId,
+          }).catch(err => {
+            console.error('[Writeback] Failed (fallback path), falling back to autoLearn:', err instanceof Error ? err.message : String(err))
+            if (shouldAutoLearn(queryConfidence, hasAgent)) {
+              autoLearnFromAnswer({
+                query: lastUserContent,
+                answer: content,
+                confidence: queryConfidence,
+                agentId: agentProfileId!,
+                agentName: agentProfileName || 'unknown',
+                provider: agentProvider!,
+                model: agentModel!,
+                sources: data.sources,
+              }).catch(() => {})
+            }
+          })
         }
 
         // Phase 5: Memory & Learning — save messages + extract memories in background
@@ -849,6 +1034,8 @@ export async function POST(request: NextRequest) {
           kbResults: 'included',
           codeQuery: isCodeQuery(lastUserContent) || undefined,
           memoriesRecalled: recalledMemories.length || undefined,
+          intent,
+          kbConfidence: kbSearchResult?.confidence || undefined,
         })
       }
     } catch (err) {
