@@ -1,0 +1,754 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+// ============================================
+// ARCHITECTURE: SQLite (buffer) → Qdrant (vector+document) + Neo4j (graph)
+// SQLite handles: Token counters, Job queue, Local extraction buffer
+// Qdrant handles: Document metadata, Chunk text+embeddings, Semantic search
+// Neo4j handles: Entity nodes, Relationship edges, Graph traversal
+// ============================================
+
+/// Job queue for tracking document processing tasks
+model JobQueue {
+  id          String   @id @default(cuid())
+  type        String   /// Job type: "document_parse", "entity_extract", "entity_resolve", "embedding_generate", "graph_sync"
+  status      String   @default("pending") /// Job status: "pending", "running", "completed", "failed"
+  documentId  String?  /// Reference to the document UUID (stored in Qdrant)
+  input       String?  /// JSON input data for the job
+  output      String?  /// JSON output data from the job
+  error       String?  /// Error message if job failed
+  progress    Int      @default(0) /// Progress percentage 0-100
+  priority    Int      @default(0) /// Higher priority jobs run first
+  attempts    Int      @default(0) /// Number of attempts made
+  maxAttempts Int      @default(3) /// Maximum number of retry attempts
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+  startedAt   DateTime?
+  completedAt DateTime?
+
+  @@index([status, priority])
+  @@index([type, status])
+  @@index([documentId])
+}
+
+/// Daily token usage tracking — resets at midnight (SQLite only, no remote sync needed)
+model DailyTokenUsage {
+  id        String   @id @default(cuid())
+  date      String   @unique /// ISO date string "YYYY-MM-DD"
+  tokens    Int      @default(0) /// Total tokens used for the day
+  updatedAt DateTime @updatedAt
+
+  @@index([date])
+}
+
+/// Per-provider daily token usage — tracks tokens used by each LLM provider per day
+model DailyTokenByProvider {
+  id        String   @id @default(cuid())
+  date      String   /// ISO date string "YYYY-MM-DD"
+  provider  String   /// Provider name: "nvidia" (NVIDIA NIM only)
+  tokens    Int      @default(0) /// Tokens used by this provider on this date
+  updatedAt DateTime @updatedAt
+
+  @@unique([date, provider])
+  @@index([date])
+}
+
+/// Per-provider-per-key daily token usage — tracks tokens per provider per key per day
+model DailyTokenByProviderSlot {
+  id        String   @id @default(cuid())
+  date      String   /// ISO date string "YYYY-MM-DD"
+  provider  String   /// Provider name: "nvidia" (NVIDIA NIM only)
+  slot      Int      /// Key index: 0-3
+  tokens    Int      @default(0) /// Tokens used by this provider's slot key on this date
+  updatedAt DateTime @updatedAt
+
+  @@unique([date, provider, slot])
+  @@index([date])
+}
+
+/// Per-provider-per-model daily token usage — tracks tokens per provider per model per day
+model DailyTokenByProviderModel {
+  id        String   @id @default(cuid())
+  date      String   /// ISO date string "YYYY-MM-DD"
+  provider  String   /// Provider name: "nvidia" (NVIDIA NIM only)
+  model     String   /// Model name (e.g. "deepseek-ai/deepseek-v4-pro", "nvidia/nemotron-3-super-120b-a12b")
+  tokens    Int      @default(0) /// Tokens used by this provider's model on this date
+  updatedAt DateTime @updatedAt
+
+  @@unique([date, provider, model])
+  @@index([date])
+}
+
+/// Per-agent daily token usage — tracks tokens consumed by each Agent per day
+model DailyTokenByAgent {
+  id           String   @id @default(cuid())
+  date         String   /// ISO date string "YYYY-MM-DD"
+  agentId      String   /// AgentProfile.id
+  agentName    String   /// Agent name (denormalized for quick display)
+  provider     String   /// Provider used: "nvidia" (NVIDIA NIM only)
+  model        String   /// Model used
+  tokens       Int      @default(0) /// Total tokens (input + output)
+  inputTokens  Int      @default(0) /// Prompt/input tokens
+  outputTokens Int      @default(0) /// Completion/output tokens
+  updatedAt    DateTime @updatedAt
+
+  @@unique([date, agentId, provider, model])
+  @@index([date])
+  @@index([agentId])
+  @@index([date, agentId])
+}
+
+/// Document metadata — primary storage in SQLite (Qdrant is optional, used for vector search only)
+/// This model was added so documents work locally even without Qdrant running.
+/// Previously, documents were stored ONLY in Qdrant, causing silent failures when Qdrant was down.
+model Document {
+  id                String   @id @default(uuid()) /// UUID matching Qdrant point ID
+  title             String   @unique /// File name (e.g. "report.pdf")
+  filePath          String   @default("") /// Local filesystem path in UPLOAD_DIR
+  domain            String   @default("mixed") /// Document domain
+  pageCount         Int?     /// Number of pages in the PDF
+  status            String   @default("uploaded") /// uploaded | parsing | chunked | extracting | extracted | partial | indexed | error
+  errorMessage      String?  /// Error message if status = 'error'
+  userPaused        Boolean  @default(false) /// Whether the user explicitly paused this document — prevents auto-continue/auto-recovery
+  processingSteps   String   @default("[]") /// JSON: array of ProcessingStep objects
+  processingPercent Int      @default(0) /// 0-100 progress percentage
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+
+  @@index([status])
+  @@index([domain])
+  @@index([createdAt])
+  @@index([userPaused])
+}
+
+// ============================================
+// LOCAL EXTRACTION BUFFER
+// Written during extraction pipeline, batch synced to Neo4j + Qdrant on completion
+// After sync: synced=true means data is permanent in Neo4j/Qdrant
+// ============================================
+
+/// Local extracted entities — accumulated during pipeline, batch written to Neo4j
+model LocalEntity {
+  id                String   @id @default(uuid()) /// Pre-generated UUID, reused as Neo4j node ID
+  documentId        String?  /// Reference to the document UUID (Qdrant point ID)
+  chunkId           String?  /// Reference to the chunk (Qdrant point ID)
+  entityName        String   /// Entity name (exact case from LLM)
+  entityType        String   /// Concept, Algorithm, Language, Tool, System, Technique, Vulnerability, Principle, Domain, Document, Person
+  description       String?  /// Entity description
+  properties        String?  /// JSON string of entity properties
+  confidenceScore   Float    @default(0.5)
+  source            String   @default("unknown") /// e.g. "nvidia/nemotron-3-super-120b-a12b"
+  domain            String?  /// Document domain
+  resolvedEntityId  String?  /// UUID of resolved entity in Neo4j (set after resolution)
+  synced            Boolean  @default(false) /// Whether synced to Neo4j
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+
+  @@index([documentId])
+  @@index([entityName])
+  @@index([entityType])
+  @@index([domain])
+  @@index([synced])
+}
+
+/// Local extracted relationships — accumulated during pipeline, batch written to Neo4j
+model LocalRelationship {
+  id                String   @id @default(uuid()) /// Pre-generated UUID
+  documentId        String?  /// Reference to the document UUID
+  sourceEntityId    String?  /// UUID of source entity (matches LocalEntity.id or Neo4j node UUID)
+  targetEntityId    String?  /// UUID of target entity
+  sourceEntityName  String?  /// Name of source entity (for local reference before Neo4j sync)
+  targetEntityName  String?  /// Name of target entity
+  relationshipType  String   /// PART_OF, IMPLEMENTED_IN, USES, etc.
+  description       String?  /// Relationship description
+  confidenceScore   Float    @default(0.5)
+  source            String   @default("unknown")
+  synced            Boolean  @default(false) /// Whether synced to Neo4j
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+
+  @@index([documentId])
+  @@index([relationshipType])
+  @@index([sourceEntityId])
+  @@index([targetEntityId])
+  @@index([synced])
+}
+
+// ============================================
+// OPENCLAW AGENT SYSTEM
+// Self-hosted AI Agent platform — sessions, learning, skills, automation
+// ============================================
+
+/// Agent profiles — user-created AI agents with custom configuration
+/// Each agent has its own name, role description, instructions, and AI core
+/// System agents (isSystem=true) are seeded on startup and cannot be deleted
+model AgentProfile {
+  id          String   @id @default(cuid())
+  name        String   @unique /// Agent display name (e.g. "Code Architect", "Research Analyst")
+  description String   /// Mô tả vai trò (Describe)
+  instruction String   /// Hướng dẫn chi tiết — injected as system prompt
+  domain      String   @default("mixed") /// Lĩnh vực chuyên môn: programming, algorithm, ml, security, linux, meta_cognitive, ux_ui, mixed
+  capable     String   /// Agent có thể làm gì với chuyên môn
+  provider    String   /// AI provider: "nvidia" (NVIDIA NIM only)
+  model       String   /// Model ID from TOKEN THEO PROVIDER table
+  temperature Float    @default(0.7) /// Generation temperature (0.0 - 2.0)
+  maxTokens   Int      @default(4096) /// Maximum output tokens
+  team        String?  /// Team: "code" | "research" | null (không bắt buộc)
+  position    String?  /// Vị trí trong team: TL | G1 | G2 | G3 | G4 (code) | TL | G1 | G2 | G3 (research)
+  avatar      String?  /// Emoji hoặc icon name cho avatar
+  isSystem    Boolean  @default(false) /// System agent — seeded on startup, cannot be deleted. Customizable but persistent.
+  enabled     Boolean  @default(true)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  /// Related sessions — one agent can have many chat sessions
+  sessions    AgentSession[]
+
+  @@index([team])
+  @@index([provider])
+  @@index([enabled])
+  @@index([isSystem])
+}
+
+/// Agent chat sessions — tracks conversation sessions with OpenClaw agents
+model AgentSession {
+  id              String   @id @default(cuid())
+  agentId         String   @default("default")
+  sessionId       String   @unique
+  model           String?
+  provider        String?
+  title           String?
+  messageCount    Int      @default(0)
+  agentProfileId  String?  /// FK → AgentProfile.id (null = default agent)
+  teamMode        String?  /// "single" | "multi" — null = legacy session
+  teamName        String?  /// "code" | "research" — null = single mode or legacy
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  agentProfile    AgentProfile? @relation(fields: [agentProfileId], references: [id], onDelete: SetNull)
+  tasks           SmolabTask[]
+
+  @@index([agentId])
+  @@index([agentProfileId])
+  @@index([teamName])
+  @@index([createdAt])
+}
+
+/// Learning log — records all agent learning events (feedback, insights, corrections)
+model LearningLog {
+  id        String   @id @default(cuid())
+  sessionId String?
+  agentId   String   @default("default")
+  eventType String   /// feedback | insight | correction | preference | pattern
+  content   String   /// JSON string with event details
+  metadata  String?  /// Optional JSON metadata
+  createdAt DateTime @default(now())
+
+  @@index([agentId])
+  @@index([eventType])
+  @@index([createdAt])
+}
+
+/// Agent insights — auto-extracted or manually taught knowledge
+model AgentInsight {
+  id         String   @id @default(cuid())
+  agentId    String   @default("default")
+  content    String
+  source     String   /// auto | manual | feedback | correction
+  type       String   /// factual | procedural | preference | pattern
+  confidence Float    @default(0.5)
+  createdAt  DateTime @default(now())
+
+  @@index([agentId])
+  @@index([type])
+  @@index([createdAt])
+}
+
+/// Agent corrections — tracks when agent was wrong and corrected
+model AgentCorrection {
+  id            String   @id @default(cuid())
+  agentId       String   @default("default")
+  wrongAnswer   String
+  correctAnswer String
+  reason        String?
+  applied       Boolean  @default(false)
+  createdAt     DateTime @default(now())
+
+  @@index([agentId])
+  @@index([applied])
+}
+
+/// Agent preferences — learned user preferences and behavioral patterns
+model AgentPreference {
+  id              String   @id @default(cuid())
+  agentId         String   @default("default")
+  preferenceKey   String
+  preferenceValue String
+  source          String   /// auto | manual | feedback
+  createdAt       DateTime @default(now())
+
+  @@unique([agentId, preferenceKey])
+}
+
+/// Agent skills — installed and custom SKILL.md instruction packs
+model AgentSkill {
+  id          String   @id @default(cuid())
+  agentId     String   @default("default")
+  slug        String
+  name        String
+  content     String   /// SKILL.md content
+  source      String   @default("bundled") /// clawhub | custom | bundled
+  enabled     Boolean  @default(true)
+  version     String   @default("1.0.0")
+  installedAt DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@unique([agentId, slug])
+}
+
+/// Tool permissions — controls which tools each agent can use
+model ToolPermission {
+  id         String @id @default(cuid())
+  agentId    String @default("default")
+  toolName   String
+  permission String /// allow | deny | ask
+
+  @@unique([agentId, toolName])
+}
+
+/// Knowledge access policy — controls agent DB access (read/write/delete)
+model KnowledgeAccessPolicy {
+  id                 String  @id @default(cuid())
+  agentId            String  @default("default")
+  allowRead          Boolean @default(true)
+  allowWrite         Boolean @default(true)
+  allowDelete        Boolean @default(false)
+  allowedCollections String  @default("theopus_documents,theopus_chunks")
+  allowedLabels      String  @default("*")
+
+  @@unique([agentId])
+}
+
+/// Cron jobs — scheduled agent tasks
+model CronJob {
+  id         String    @id @default(cuid())
+  agentId    String    @default("default")
+  expression String
+  taskPrompt String
+  enabled    Boolean   @default(true)
+  lastRunAt  DateTime?
+  nextRunAt  DateTime?
+  createdAt  DateTime  @default(now())
+  updatedAt  DateTime  @updatedAt
+
+  @@index([agentId])
+  @@index([enabled])
+}
+
+/// Webhooks — inbound/outbound webhook configurations
+model Webhook {
+  id        String   @id @default(cuid())
+  agentId   String   @default("default")
+  url       String
+  events    String   /// JSON array of event types
+  secret    String?
+  enabled   Boolean  @default(true)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([agentId])
+}
+
+/// Standing orders — persistent agent instructions
+model StandingOrder {
+  id        String   @id @default(cuid())
+  agentId   String   @default("default")
+  order     String
+  priority  Int      @default(0)
+  enabled   Boolean  @default(true)
+  createdAt DateTime @default(now())
+
+  @@index([agentId])
+}
+
+/// Task execution history — tracks all automation task runs
+model TaskExecution {
+  id           String    @id @default(cuid())
+  jobId        String?
+  type         String    /// cron | webhook | heartbeat | manual
+  status       String    /// pending | running | completed | failed
+  result       String?
+  errorMessage String?
+  startedAt    DateTime  @default(now())
+  completedAt  DateTime?
+
+  @@index([type])
+  @@index([status])
+  @@index([startedAt])
+}
+
+/// Channel configurations — messaging platform connections
+model ChannelConfig {
+  id          String    @id @default(cuid())
+  channelType String    @unique /// telegram | discord | slack | webchat | ...
+  config      String    /// JSON config (tokens, URLs, etc.)
+  enabled     Boolean   @default(false)
+  connectedAt DateTime?
+}
+
+/// Local resolved entities — deduplicated canonical entities, batch synced to Neo4j
+model LocalResolvedEntity {
+  id              String   @id @default(uuid()) /// Pre-generated UUID
+  documentId      String?  /// Reference to the document UUID (Qdrant point ID)
+  canonicalName   String   @unique /// Unique canonical name
+  entityType      String   /// Entity type
+  description     String?  /// Merged description
+  properties      String?  /// JSON string of merged properties
+  avgConfidence   Float    @default(0.5)
+  occurrenceCount Int      @default(1)
+  domains         String?  /// JSON array of domains
+  synced          Boolean  @default(false) /// Whether synced to Neo4j
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  @@index([documentId])
+  @@index([synced])
+}
+
+// ============================================
+// OPENCODE CODING AGENT SYSTEM
+// AI Coding Agent — file ops, bash, LSP, MCP bridge
+// Port: 18790 (mini-service)
+// ============================================
+
+/// OpenCode sessions — tracks coding agent sessions (synced from OpenCode server)
+model OpenCodeSession {
+  id           String   @id @default(cuid())
+  sessionId    String   @unique
+  model        String?
+  provider     String?
+  prompt       String?
+  status       String   @default("active") /// active | paused | completed | failed
+  filesTouched String   @default("[]") /// JSON array of file paths modified
+  toolsUsed    String   @default("[]") /// JSON array of tool names used
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  @@index([status])
+  @@index([createdAt])
+}
+
+/// MCP Bridge configuration — controls tool sharing between OpenClaw and OpenCode
+model MCPBridgeConfig {
+  id        String   @id @default(cuid())
+  direction String   /// outbound (OpenClaw→OpenCode) | inbound (OpenCode→OpenClaw)
+  toolName  String
+  enabled   Boolean  @default(true)
+  config    String   @default("{}") /// JSON config for the tool mapping
+  updatedAt DateTime @updatedAt
+
+  @@unique([direction, toolName])
+  @@index([direction])
+}
+
+// ============================================
+// AUTO-LEARN SYSTEM (Phase 4)
+// Agent tự bổ sung kiến thức vào DB khi confidence thấp
+// ============================================
+
+/// Auto-learn records — tracks when agents self-learn and add knowledge to DB
+model AutoLearnRecord {
+  id                 String   @id @default(cuid())
+  agentId            String   /// AgentProfile.id
+  agentName          String   /// Agent name (denormalized for quick display)
+  query              String   /// Original user query
+  answerPreview      String   /// First 500 chars of agent answer
+  confidence         Float    /// Confidence score of the answer
+  provider           String   /// Provider used (e.g. "mistral")
+  model              String   /// Model used (e.g. "mistral-large-2512")
+  entitiesCount      Int      @default(0) /// Number of entities extracted
+  relationshipsCount Int      @default(0) /// Number of relationships extracted
+  chunkSaved         Boolean  @default(false) /// Whether chunk was saved to Qdrant
+  neo4jSynced        Boolean  @default(false) /// Whether Neo4j sync completed
+  qdrantPointId      String?  /// Qdrant point ID of the stored vector
+  documentId         String?  /// Virtual document ID for auto-learned knowledge
+  status             String   @default("pending") /// pending | completed | failed
+  errorMessage       String?  /// Error message if auto-learn failed
+  createdAt          DateTime @default(now())
+
+  @@index([agentId])
+  @@index([createdAt])
+  @@index([confidence])
+  @@index([status])
+}
+
+// ============================================
+// EMBEDDING CACHE (Phase 6)
+// SQLite-backed L2 cache — survives server restarts
+// L1 = in-memory Map (1h TTL, fast), L2 = SQLite (7d TTL, persistent)
+// ============================================
+
+/// Embedding cache — stores previously computed embeddings to avoid redundant API calls
+/// Survives server restarts (unlike in-memory cache)
+/// IMPORTANT: Same text gets DIFFERENT embeddings for "query" vs "passage" (NVIDIA input_type)
+/// So the unique key is (hash, inputType) — NOT just hash
+model EmbeddingCache {
+  id        String   @id @default(cuid())
+  hash     String   /// SHA-256 hash of the input text
+  inputType String  @default("passage") /// "query" | "passage" — different embeddings for same text
+  model    String   /// Model used to generate the embedding (e.g. "nvidia/llama-nemotron-embed-1b-v2")
+  vector   String   /// JSON array of the embedding vector (1536 floats)
+  hitCount Int      @default(1) /// Number of cache hits (for LRU eviction)
+  createdAt DateTime @default(now())
+  lastHitAt DateTime @default(now()) /// Last time this cache entry was used
+  expiresAt DateTime /// When this cache entry expires
+
+  @@unique([hash, inputType]) /// Composite key — same text has separate query & passage embeddings
+  @@index([expiresAt])
+  @@index([lastHitAt])
+}
+
+// ============================================
+// CODE TEAM WORKFLOW SYSTEM
+// Multi-agent code team — worklog, sessions, tool calls
+// ============================================
+
+/// Code Team worklog entries — tracks each agent's output in a workflow session
+model CodeTeamWorklog {
+  id          String   @id @default(cuid())
+  sessionId   String   /// Session ID (maps to AgentSession.sessionId)
+  agentName   String   /// APEX | CORTEX | BOLT | SENTINEL | CATALYST
+  position    String   /// TL | G1 | G2-A | G2-B | G3
+  step        String   /// analyze | design | code | review | optimize | verify | routing
+  summary     String   /// Tóm tắt những gì agent đã làm
+  content     String   /// JSON: full WorklogEntry (issues, codeLocationMap, suggestions, etc.)
+  toolCalls   String   @default("[]") /// JSON: array of tool calls made during this step
+  duration    Int      @default(0) /// Duration in milliseconds
+  createdAt   DateTime @default(now())
+
+  @@index([sessionId])
+  @@index([agentName])
+  @@index([sessionId, position])
+  @@index([createdAt])
+}
+
+/// Code Team workflow sessions — tracks overall workflow state
+model CodeTeamSession {
+  id              String   @id @default(cuid())
+  sessionId       String   @unique /// Maps to AgentSession.sessionId
+  routingMode     String   /// A | B | C
+  tier            Int      /// 1 | 2 | 3
+  score           Int      /// Complexity score 3-9
+  currentStep     String   @default("pending") /// pending | running | checkpoint | completed | failed
+  currentAgent    String?  /// Agent đang chạy
+  completedAgents String   @default("[]") /// JSON: array of completed agent names
+  partsDefinition String   @default("[]") /// JSON: array of PartDefinition from TL
+  opencodeSessionId String? /// OpenCode session ID (nếu có)
+  totalDuration   Int      @default(0) /// Total duration in ms
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  @@index([sessionId])
+  @@index([currentStep])
+  @@index([createdAt])
+}
+
+// ============================================
+// AGENT MEMORY & LEARNING SYSTEM
+// Episodic Memory (Qdrant) + Semantic Memory (Neo4j) + User Profile
+// ============================================
+
+/// Chat messages — persisted per session, used for Memory extraction
+model ChatMessage {
+  id        String   @id @default(cuid())
+  sessionId String   /// AgentSession.sessionId
+  role      String   /// user | assistant | system | tool_call | error
+  content   String   /// Message text content
+  model     String?  /// LLM model used (for assistant messages)
+  provider  String?  /// LLM provider used
+  metadata  String?  /// JSON: sources, confidence, toolCalls, etc.
+  createdAt DateTime @default(now())
+
+  @@index([sessionId])
+  @@index([role])
+  @@index([createdAt])
+}
+
+// ============================================
+// SMOLAB BACKGROUND TASK SYSTEM
+// Chat session isolation + background task continuation
+// When user switches sessions, tasks in previous sessions continue running.
+// Max 3 concurrent tasks via SmolabTaskWorker singleton.
+// ============================================
+
+/// Smolab background tasks — tracks long-running agent/team work that continues
+/// even when user switches to another session. Each task is tied to one session
+/// and one agent (or team lead agent).
+model SmolabTask {
+  id              String   @id @default(cuid())
+  type            String   /// "agent_chat" | "team_workflow" | "agent_react" | "memory_extraction"
+  status          String   @default("pending") /// "pending" | "running" | "completed" | "failed" | "cancelled"
+  progress        Int      @default(0) /// 0-100 percentage
+
+  // Liên kết Session + Agent
+  sessionId       String   /// AgentSession.sessionId — phiên chat gốc
+  agentProfileId  String?  /// AgentProfile.id — agent đang xử lý (null nếu team mode)
+  teamName        String?  /// "code" | "research" — team đang xử lý (nếu team mode)
+
+  // Task input/output
+  inputSummary    String?  /// Tóm tắt yêu cầu (first 200 chars của user message)
+  result          String?  /// Kết quả khi hoàn thành (JSON string)
+  error           String?  /// Lỗi nếu thất bại
+
+  // Thời gian
+  createdAt       DateTime @default(now())
+  startedAt       DateTime?
+  completedAt     DateTime?
+  updatedAt       DateTime @updatedAt
+
+  // Relations — Cascade: khi session bị xóa, tất cả tasks của session đó cũng bị xóa
+  session         AgentSession  @relation(fields: [sessionId], references: [sessionId], onDelete: Cascade, onUpdate: Cascade)
+
+  @@index([sessionId])
+  @@index([agentProfileId, status])
+  @@index([teamName, status])
+  @@index([status])
+  @@index([createdAt])
+}
+
+/// Agent episodic memories — extracted from conversations, stored as vectors in Qdrant
+/// Each memory is a discrete piece of knowledge the agent learned from interaction
+///
+/// Memory Tier Architecture (Phase 4):
+///   - HOT  → WorkingMemory table (current session, in-RAM fallback)
+///   - WARM → AgentMemory table (this table — verified important, isActive=true)
+///   - COLD → MemoryArchive table (compressed summary, isActive=false here)
+model AgentMemory {
+  id             String   @id @default(cuid())
+  agentId        String   /// AgentProfile.id
+  agentName      String   /// Agent name (denormalized)
+  sessionId      String?  /// Source session
+  category       String   /// insight | fact | preference | correction | procedure | user_info
+  content        String   /// The actual memory content (text)
+  context        String?  /// Context: what triggered this memory (query, situation, etc.)
+  importance     Float    @default(0.5) /// 0.0-1.0 — how important this memory is
+  accessCount    Int      @default(0) /// How many times this memory was recalled
+  lastAccessedAt DateTime? /// Last time this memory was used in a response
+  qdrantPointId  String?  /// Qdrant point ID for vector search
+  embeddingModel String?  /// Embedding model used (e.g. nvidia/llama-nemotron-embed-1b-v2)
+  source         String   @default("auto") /// auto | manual | feedback | correction | auto-learn
+  tags           String?  /// JSON array of tags for categorization
+  /// Memory domain — separates user data from work data (Phase 4)
+  /// "user" = personal info (name, language, preferences) — decays slowly
+  /// "work" = project/code/technical — decays by project cycle
+  /// "meta" = patterns about how user interacts — never decays
+  domain         String   @default("work") /// user | work | meta
+  isActive       Boolean  @default(true) /// Soft delete — inactive memories are not recalled
+  /// Tier: which memory tier this belongs to (Phase 4)
+  /// "warm"  = active long-term (default)
+  /// "cold"  = archived (also has MemoryArchive record)
+  tier           String   @default("warm") /// warm | cold
+  expiresAt      DateTime? /// Optional expiration for time-sensitive memories
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  @@index([agentId])
+  @@index([category])
+  @@index([importance])
+  @@index([accessCount])
+  @@index([isActive])
+  @@index([createdAt])
+  @@index([lastAccessedAt])
+  @@index([domain])
+  @@index([tier])
+}
+
+/// Working Memory (HOT tier) — current session messages + recent recalls.
+/// TTL = session end + 1h grace. Promoted to AgentMemory (WARM) on session end.
+/// Survives server restarts (unlike pure in-RAM cache).
+model WorkingMemory {
+  id          String   @id @default(cuid())
+  agentId     String   /// AgentProfile.id
+  sessionId   String   /// Current chat session
+  content     String   /// Raw chat message or recalled memory text
+  /// Role in conversation: user message, assistant response, system note, or recall
+  role        String   /// user | assistant | system | recall
+  importance  Float    @default(0.8) /// HOT defaults high — promoted if still relevant
+  /// When this working memory expires (session end + 1h grace)
+  expiresAt   DateTime
+  createdAt   DateTime @default(now())
+
+  @@index([agentId, sessionId])
+  @@index([expiresAt])
+  @@index([createdAt])
+}
+
+/// Memory Archive (COLD tier) — compressed long-term storage.
+/// Created when WARM memories decay below threshold (importance < 0.1, isActive=false).
+/// Multiple WARM memories → 1 COLD summary (via LLM summarization, Phase 5).
+/// Hard-deleted after 90 days (configurable).
+model MemoryArchive {
+  id             String   @id @default(cuid())
+  agentId        String   /// AgentProfile.id
+  /// JSON array of source AgentMemory IDs that were merged into this archive
+  originalIds    String   /// JSON: ["memId1", "memId2", ...]
+  /// LLM-compressed summary of the source memories (Phase 5)
+  summaryContent String   /// Compressed text (typically 100-300 chars from 5-10 memories)
+  /// Domain tag carried over from source memories
+  domain         String   @default("work") /// user | work | meta
+  /// Lowered importance after compression (default 0.3, can be boosted on recall)
+  importance     Float    @default(0.3)
+  /// How many source memories were merged into this summary
+  sourceCount    Int      @default(1)
+  /// Embedding of the summary (for similarity search in COLD tier)
+  qdrantPointId  String?  /// Qdrant point ID for vector search on archive
+  embeddingModel String?  /// Embedding model used
+  /// Auto-delete after 90 days (configurable via expiresAt)
+  expiresAt      DateTime? /// 90 days after createdAt → hard delete
+  createdAt      DateTime @default(now())
+
+  @@index([agentId])
+  @@index([expiresAt])
+  @@index([domain])
+  @@index([importance])
+}
+
+/// User profile — accumulated knowledge about the user across all conversations
+model UserProfile {
+  id            String   @id @default(cuid())
+  userId        String   @default("default") /// Multi-user support for future
+  key           String   /// Profile key: name, language, role, expertise, preference_xxx, etc.
+  value         String   /// Profile value
+  source        String   @default("auto") /// auto | manual | agent_observation
+  confidence    Float    @default(0.5) /// How confident we are about this profile fact
+  accessCount   Int      @default(0) /// How many times this was used
+  isActive      Boolean  @default(true)
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  @@unique([userId, key])
+  @@index([userId])
+  @@index([key])
+  @@index([isActive])
+}
+
+/// Memory access log — tracks which memories are recalled, for decay/relevance optimization
+model MemoryAccessLog {
+  id        String   @id @default(cuid())
+  memoryId  String   /// AgentMemory.id
+  agentId   String   /// Which agent accessed this memory
+  sessionId String?  /// In which session
+  query     String?  /// What query triggered the recall
+  relevance Float    @default(0.5) /// How relevant the memory was (0-1)
+  createdAt DateTime @default(now())
+
+  @@index([memoryId])
+  @@index([agentId])
+  @@index([createdAt])
+}

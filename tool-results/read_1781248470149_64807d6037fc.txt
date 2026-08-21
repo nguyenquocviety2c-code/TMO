@@ -1,0 +1,1268 @@
+     1→     1→/**
+     2→     2→ * OpenClaw Chat API — Upgraded for Phase OC-3 (Deep Integration)
+     3→     3→ *
+     4→     4→ * POST /api/openclaw/chat — Forward chat to OpenClaw Gateway or fallback
+     5→     5→ *
+     6→     6→ * Supports:
+     7→     7→ * - { messages, model, sessionId, stream } — full OpenAI-compatible format
+     8→     8→ * - Auto knowledge search before responding
+     9→     9→ * - System prompt injection with knowledge context
+    10→    10→ * - Session tracking in SQLite
+    11→    11→ * - Intelligent routing: code queries → OpenCode with KB enrichment, knowledge queries → OpenClaw
+    12→    12→ * - Knowledge-Aware Coding: enriches OpenCode sessions with KB context
+    13→    13→ * - Cross-Session Learning: incorporates past corrections and insights
+    14→    14→ * - Mock mode when gateway is offline
+    15→    15→ */
+    16→    16→
+    17→    17→import { NextRequest, NextResponse } from 'next/server'
+    18→    18→import { chatCompletion, isGatewayOnline, gatewayFetch } from '@/lib/openclaw'
+    19→    19→import { isOpenCodeOnline, createOpenCodeSession, opencodeFetch } from '@/lib/opencode'
+    20→    20→import { enrichCodeContext, isCodeQuery as isCodeQueryAdvanced, detectCodeConfidence } from '@/lib/opencode-knowledge-context'
+    21→    21→import { generateOpenCodeSystemPrompt } from '@/lib/opencode-system-prompt'
+    22→    22→import { db } from '@/lib/db'
+    23→    23→import { addTokensUsed, addTokensUsedByAgent, callLLMForAgent, callLLMForAgentWithMessages, ChatMessageForLLM } from '@/lib/llm'
+    24→    24→import { autoLearnFromAnswer, shouldAutoLearn } from '@/lib/auto-learn'
+    25→    25→import { recallMemories, extractMemoriesFromConversation, saveChatMessages, getUserProfile, ensureAgentMemoryCollection, decayMemories } from '@/lib/agent-memory'
+    26→    26→import { executeTool } from '@/lib/code-team/tool-executor'
+    27→    27→import { parseToolCallsFromOutput } from '@/lib/tool-calls'
+    28→    28→import { getStandaloneAgentTools } from '@/lib/standalone-agents'
+    29→    29→
+    30→    30→export const dynamic = 'force-dynamic'
+    31→    31→
+    32→    32→// Module-level counter for periodic memory decay (Bug 3 fix)
+    33→    33→let memoryDecayCounter = 0
+    34→    34→
+    35→    35→// Gateway status cache (30s TTL to avoid spamming health endpoint)
+    36→    36→let gatewayOnlineCached = false
+    37→    37→let gatewayCacheTime = 0
+    38→    38→const GATEWAY_CACHE_TTL = 30000
+    39→    39→
+    40→    40→async function isGatewayOnlineCached(): Promise<boolean> {
+    41→    41→  const now = Date.now()
+    42→    42→  if (now - gatewayCacheTime < GATEWAY_CACHE_TTL) return gatewayOnlineCached
+    43→    43→  gatewayCacheTime = now
+    44→    44→  const result = await isGatewayOnline()
+    45→    45→  gatewayOnlineCached = result.online
+    46→    46→  return gatewayOnlineCached
+    47→    47→}
+    48→    48→
+    49→    49→/**
+    50→    50→ * Check if a chat exchange is too trivial to warrant memory extraction.
+    51→    51→ * Avoids wasting LLM tokens on greetings and short confirmations.
+    52→    52→ */
+    53→    53→function isTrivialExchange(userMsg: string, assistantMsg: string): boolean {
+    54→    54→  // Skip memory extraction for trivial exchanges (greetings, short confirmations)
+    55→    55→  if (userMsg.trim().length < 15 && assistantMsg.trim().length < 50) return true
+    56→    56→  const trivialPatterns = /^(hi|hello|hey|chào|xin chào|ok|okay|cảm ơn|thanks|thank you|bye|tạm biệt|được|vâng|yes|no|không)$/i
+    57→    57→  if (trivialPatterns.test(userMsg.trim())) return true
+    58→    58→  return false
+    59→    59→}
+    60→    60→
+    61→    61→// ============================================
+    62→    62→// ReAct LOOP — Standalone Agent Tool Execution
+    63→    63→// ============================================
+    64→    64→
+    65→    65→/**
+    66→    66→ * Run a ReAct (Reason-Act-Observe) loop for an agent with tool execution.
+    67→    67→ *
+    68→    68→ * This enables standalone agents like Omega to actually USE their declared tools
+    69→    69→ * (opencode, knowledge_search, tavily, etc.) instead of just having them in prompts.
+    70→    70→ *
+    71→    71→ * Flow:
+    72→    72→ * 1. Call LLM with system prompt + user message
+    73→    73→ * 2. Parse tool_call patterns from LLM output
+    74→    74→ * 3. If tool calls found → execute → feed results back → repeat
+    75→    75→ * 4. If no tool calls → return final answer
+    76→    76→ * 5. Max 5 iterations to prevent infinite loops
+    77→    77→ */
+    78→    78→async function runAgentReActLoop(params: {
+    79→    79→  systemPrompt: string
+    80→    80→  userMessage: string
+    81→    81→  chatHistory: Array<{ role: string; content: string }>
+    82→    82→  agentProvider: string
+    83→    83→  agentModel: string
+    84→    84→  agentId: string
+    85→    85→  agentName: string
+    86→    86→  agentTemperature?: number
+    87→    87→  agentMaxTokens?: number
+    88→    88→  agentTools?: string[]
+    89→    89→  maxIterations?: number
+    90→    90→}): Promise<{ content: string; iterations: number; toolCallsExecuted: number }> {
+    91→    91→  const {
+    92→    92→    systemPrompt,
+    93→    93→    userMessage,
+    94→    94→    chatHistory,
+    95→    95→    agentProvider,
+    96→    96→    agentModel,
+    97→    97→    agentId,
+    98→    98→    agentName,
+    99→    99→    agentTemperature,
+   100→   100→    agentMaxTokens,
+   101→   101→    agentTools = [],
+   102→   102→    maxIterations = 5,
+   103→   103→  } = params
+   104→   104→
+   105→   105→  // Build messages array for multi-turn conversation using ChatMessageForLLM type
+   106→   106→  // This preserves structured tool_calls with tool_call_id for proper multi-turn tool calling
+   107→   107→  const messages: ChatMessageForLLM[] = [
+   108→   108→    { role: 'system', content: systemPrompt },
+   109→   109→    // Include last 6 messages from chat history for context
+   110→   110→    ...chatHistory.slice(-6).map(m => ({
+   111→   111→      role: m.role as 'user' | 'assistant',
+   112→   112→      content: m.content,
+   113→   113→    })),
+   114→   114→    { role: 'user', content: userMessage },
+   115→   115→  ]
+   116→   116→
+   117→   117→  let finalContent = ''
+   118→   118→  let iterations = 0
+   119→   119→  let totalToolCalls = 0
+   120→   120→
+   121→   121→  while (iterations < maxIterations) {
+   122→   122→    iterations++
+   123→   123→
+   124→   124→    // Get tool definitions for this agent (for structured tool calling)
+   125→   125→    const toolDefs = agentTools.length > 0 ? getToolDefinitionsForLLM(agentTools) : []
+   126→   126→
+   127→   127→    // Call LLM with full messages array — preserves tool_calls structure (CRITICAL FIX)
+   128→   128→    // Previously used formatMessagesForLLM() which flattened tool_calls to text, losing tool_call_id
+   129→   129→    const result = await callLLMForAgentWithMessages(
+   130→   130→      messages,
+   131→   131→      { provider: agentProvider, model: agentModel },
+   132→   132→      {
+   133→   133→        agentId,
+   134→   134→        agentName,
+   135→   135→        temperature: agentTemperature,
+   136→   136→        maxTokens: agentMaxTokens,
+   137→   137→        tools: toolDefs.length > 0 ? toolDefs : undefined,
+   138→   138→      }
+   139→   139→    )
+   140→   140→
+   141→   141→    if (!result || (result.error && !result.content && !result.toolCalls?.length)) {
+   142→   142→      finalContent = result?.error || 'LLM call failed'
+   143→   143→      break
+   144→   144→    }
+   145→   145→
+   146→   146→    finalContent = result.content || ''
+   147→   147→
+   148→   148→    // Parse tool calls — prefer structured tool_calls from LLM, fallback to regex
+   149→   149→    let toolCalls: Array<{ id: string; name: string; args: Record<string, unknown> }> = []
+   150→   150→
+   151→   151→    if (result.toolCalls && result.toolCalls.length > 0) {
+   152→   152→      // ✅ Structured tool_calls from LLM (preferred — P0.4)
+   153→   153→      toolCalls = result.toolCalls.map(tc => ({
+   154→   154→        id: tc.id,
+   155→   155→        name: tc.function.name,
+   156→   156→        args: (() => { try { return JSON.parse(tc.function.arguments) } catch { return {} } })(),
+   157→   157→      }))
+   158→   158→      console.log(`[ReAct] ${agentName} structured tool_calls: ${toolCalls.map(tc => tc.name).join(', ')}`)
+   159→   159→    } else {
+   160→   160→      // ❌ Fallback regex parsing (for models that don't support tool calling)
+   161→   161→      toolCalls = parseToolCallsFromOutput(result.content)
+   162→   162→    }
+   163→   163→
+   164→   164→    if (toolCalls.length === 0) {
+   165→   165→      // No tool calls → agent is done
+   166→   166→      break
+   167→   167→    }
+   168→   168→
+   169→   169→    // Execute tool calls
+   170→   170→    console.log(`[ReAct] ${agentName} calling ${toolCalls.length} tools (iteration ${iterations})`)
+   171→   171→
+   172→   172→    // Add assistant message with tool calls to conversation
+   173→   173→    messages.push({
+   174→   174→      role: 'assistant',
+   175→   175→      content: result.content,
+   176→   176→      ...(result.toolCalls && result.toolCalls.length > 0 ? {
+   177→   177→        tool_calls: result.toolCalls,
+   178→   178→      } : {}),
+   179→   179→    })
+   180→   180→
+   181→   181→    for (const tc of toolCalls) {
+   182→   182→      totalToolCalls++
+   183→   183→
+   184→   184→      // Only execute tools that the agent has permission for
+   185→   185→      if (agentTools.length > 0 && !agentTools.includes(tc.name)) {
+   186→   186→        messages.push({
+   187→   187→          role: 'tool',
+   188→   188→          content: JSON.stringify({ tool: tc.name, success: false, result: `Tool "${tc.name}" not available for this agent. Available tools: ${agentTools.join(', ')}` }),
+   189→   189→          tool_call_id: tc.id,
+   190→   190→        })
+   191→   191→        continue
+   192→   192→      }
+   193→   193→
+   194→   194→      console.log(`[ReAct] Executing: ${tc.name}(${JSON.stringify(tc.args).slice(0, 200)})`)
+   195→   195→
+   196→   196→      const toolResult = await executeTool(tc.name, tc.args)
+   197→   197→
+   198→   198→      // Add tool result to conversation (with tool_call_id for OpenAI format)
+   199→   199→      messages.push({
+   200→   200→        role: 'tool',
+   201→   201→        content: JSON.stringify({
+   202→   202→          tool: tc.name,
+   203→   203→          success: toolResult.success,
+   204→   204→          result: toolResult.result,
+   205→   205→        }),
+   206→   206→        tool_call_id: tc.id,
+   207→   207→      })
+   208→   208→    }
+   209→   209→
+   210→   210→    // If max iterations reached, break
+   211→   211→    if (iterations >= maxIterations) {
+   212→   212→      finalContent += `\n\n⚠️ Đạt max ${maxIterations} vòng iteration.`
+   213→   213→      break
+   214→   214→    }
+   215→   215→  }
+   216→   216→
+   217→   217→  console.log(`[ReAct] ${agentName} done: ${iterations} iterations, ${totalToolCalls} tool calls`)
+   218→   218→  return { content: finalContent, iterations, toolCallsExecuted: totalToolCalls }
+   219→   219→}
+   220→   220→
+   221→   221→const DEFAULT_SYSTEM_PROMPT = `Bạn là AI Agent của The Magnum Opus — Hệ thống GraphRAG Knowledge Base.
+   222→   222→
+   223→   223→Bạn có quyền truy cập Knowledge Base local với các công cụ:
+   224→   224→- knowledge_search: Tìm kiếm semantic trong Knowledge Base
+   225→   225→- knowledge_graph: Truy vấn đồ thị Neo4j (Cypher)
+   226→   226→- knowledge_write: Ghi entity/relationship mới vào Knowledge Base
+   227→   227→
+   228→   228→Quy tắc:
+   229→   229→1. Knowledge Base là nguồn BỔ SUNG — bạn có vốn kiến thức riêng, HÃY SỬ DỤNG tự do
+   230→   230→2. Tìm kiếm trong Knowledge Base TRƯỚC khi trả lời — nếu có dữ liệu, cite nguồn
+   231→   231→3. Nếu Knowledge Base không có dữ liệu liên quan, trả lời bằng vốn kiến thức của bạn — KHÔNG nói "tôi không tìm thấy thông tin"
+   232→   232→4. Khi phát hiện thông tin mới giá trị, đề xuất ghi vào Knowledge Base
+   233→   233→5. Trả lời bằng tiếng Việt trừ khi user dùng ngôn ngữ khác
+   234→   234→6. Cite nguồn từ Knowledge Base khi sử dụng dữ liệu từ đó`
+   235→   235→
+   236→   236→// Lightweight static system prompt context (no DB queries)
+   237→   237→const STATIC_KB_CONTEXT = `SQLite Models: JobQueue, DailyTokenUsage, DailyTokenByProvider, DailyTokenByProviderSlot, DailyTokenByProviderModel, LocalEntity, LocalRelationship, LocalResolvedEntity, AgentProfile, AgentSession, LearningLog, AgentInsight, AgentCorrection, AgentPreference, AgentSkill, ToolPermission, KnowledgeAccessPolicy, CronJob, Webhook, StandingOrder, TaskExecution, ChannelConfig, OpenCodeSession, MCPBridgeConfig
+   238→   238→Neo4j: Entity nodes with properties (name, type, domain, description), Relationship edges
+   239→   239→Qdrant: theopus_documents, theopus_chunks (1536-dim vectors, nvidia/llama-nemotron-embed-1b-v2)`
+   240→   240→
+   241→   241→/**
+   242→   242→ * Get OpenAI-compatible tool definitions for the given tool names.
+   243→   243→ * These definitions are sent to the LLM so it knows what tools are available.
+   244→   244→ */
+   245→   245→function getToolDefinitionsForLLM(toolNames: string[]): Array<{ type: string; function: { name: string; description: string; parameters: Record<string, unknown> } }> {
+   246→   246→  const ALL_TOOL_DEFINITIONS: Record<string, { type: string; function: { name: string; description: string; parameters: Record<string, unknown> } }> = {
+   247→   247→    opencode: {
+   248→   248→      type: 'function',
+   249→   249→      function: {
+   250→   250→        name: 'opencode',
+   251→   251→        description: 'Thực hiện code operations: read/write/bash/diagnostics qua OpenCode Server',
+   252→   252→        parameters: {
+   253→   253→          type: 'object',
+   254→   254→          properties: {
+   255→   255→            action: { type: 'string', enum: ['read', 'write', 'bash', 'diagnostics', 'mkdir', 'tree'], description: 'Hành động cần thực hiện' },
+   256→   256→            path: { type: 'string', description: 'Đường dẫn file/thư mục' },
+   257→   257→            content: { type: 'string', description: 'Nội dung file (cho action write)' },
+   258→   258→            command: { type: 'string', description: 'Lệnh shell (cho action bash)' },
+   259→   259→          },
+   260→   260→          required: ['action'],
+   261→   261→        },
+   262→   262→      },
+   263→   263→    },
+   264→   264→    knowledge_search: {
+   265→   265→      type: 'function',
+   266→   266→      function: {
+   267→   267→        name: 'knowledge_search',
+   268→   268→        description: 'Tìm kiếm semantic trong Knowledge Base (Qdrant vector search)',
+   269→   269→        parameters: {
+   270→   270→          type: 'object',
+   271→   271→          properties: {
+   272→   272→            query: { type: 'string', description: 'Câu hỏi cần tìm kiếm' },
+   273→   273→            topK: { type: 'number', description: 'Số kết quả trả về', default: 5 },
+   274→   274→          },
+   275→   275→          required: ['query'],
+   276→   276→        },
+   277→   277→      },
+   278→   278→    },
+   279→   279→    knowledge_graph: {
+   280→   280→      type: 'function',
+   281→   281→      function: {
+   282→   282→        name: 'knowledge_graph',
+   283→   283→        description: 'Truy vấn đồ thị Neo4j bằng Cypher query',
+   284→   284→        parameters: {
+   285→   285→          type: 'object',
+   286→   286→          properties: {
+   287→   287→            query: { type: 'string', description: 'Cypher query' },
+   288→   288→          },
+   289→   289→          required: ['query'],
+   290→   290→        },
+   291→   291→      },
+   292→   292→    },
+   293→   293→    knowledge_write: {
+   294→   294→      type: 'function',
+   295→   295→      function: {
+   296→   296→        name: 'knowledge_write',
+   297→   297→        description: 'Ghi entity/relationship mới vào Knowledge Base',
+   298→   298→        parameters: {
+   299→   299→          type: 'object',
+   300→   300→          properties: {
+   301→   301→            type: { type: 'string', enum: ['entity', 'relationship'], description: 'Loại dữ liệu' },
+   302→   302→            data: { type: 'object', description: 'Dữ liệu cần ghi' },
+   303→   303→          },
+   304→   304→          required: ['type', 'data'],
+   305→   305→        },
+   306→   306→      },
+   307→   307→    },
+   308→   308→    tavily: {
+   309→   309→      type: 'function',
+   310→   310→      function: {
+   311→   311→        name: 'tavily',
+   312→   312→        description: 'AI-optimized web search — tìm kiếm web thông minh',
+   313→   313→        parameters: {
+   314→   314→          type: 'object',
+   315→   315→          properties: {
+   316→   316→            query: { type: 'string', description: 'Câu hỏi tìm kiếm' },
+   317→   317→          },
+   318→   318→          required: ['query'],
+   319→   319→        },
+   320→   320→      },
+   321→   321→    },
+   322→   322→    serper: {
+   323→   323→      type: 'function',
+   324→   324→      function: {
+   325→   325→        name: 'serper',
+   326→   326→        description: 'Google Search API — tìm kiếm Google',
+   327→   327→        parameters: {
+   328→   328→          type: 'object',
+   329→   329→          properties: {
+   330→   330→            query: { type: 'string', description: 'Câu hỏi tìm kiếm' },
+   331→   331→          },
+   332→   332→          required: ['query'],
+   333→   333→        },
+   334→   334→      },
+   335→   335→    },
+   336→   336→    jina: {
+   337→   337→      type: 'function',
+   338→   338→      function: {
+   339→   339→        name: 'jina',
+   340→   340→        description: 'Web page reader — đọc nội dung trang web từ URL',
+   341→   341→        parameters: {
+   342→   342→          type: 'object',
+   343→   343→          properties: {
+   344→   344→            url: { type: 'string', description: 'URL trang web cần đọc' },
+   345→   345→          },
+   346→   346→          required: ['url'],
+   347→   347→        },
+   348→   348→      },
+   349→   349→    },
+   350→   350→    web_search: {
+   351→   351→      type: 'function',
+   352→   352→      function: {
+   353→   353→        name: 'web_search',
+   354→   354→        description: 'Tìm kiếm trên web qua Gateway. Trả về kết quả với nội dung tóm tắt.',
+   355→   355→        parameters: {
+   356→   356→          type: 'object',
+   357→   357→          properties: {
+   358→   358→            query: { type: 'string', description: 'Câu hỏi tìm kiếm' },
+   359→   359→          },
+   360→   360→          required: ['query'],
+   361→   361→        },
+   362→   362→      },
+   363→   363→    },
+   364→   364→    web_fetch: {
+   365→   365→      type: 'function',
+   366→   366→      function: {
+   367→   367→        name: 'web_fetch',
+   368→   368→        description: 'Fetch nội dung trang web từ URL qua Gateway. Trả về text content.',
+   369→   369→        parameters: {
+   370→   370→          type: 'object',
+   371→   371→          properties: {
+   372→   372→            url: { type: 'string', description: 'URL trang web cần đọc' },
+   373→   373→          },
+   374→   374→          required: ['url'],
+   375→   375→        },
+   376→   376→      },
+   377→   377→    },
+   378→   378→    memory_search: {
+   379→   379→      type: 'function',
+   380→   380→      function: {
+   381→   381→        name: 'memory_search',
+   382→   382→        description: 'Tìm kiếm semantic trong memory (ký ức agent) qua Gateway',
+   383→   383→        parameters: {
+   384→   384→          type: 'object',
+   385→   385→          properties: {
+   386→   386→            query: { type: 'string', description: 'Câu hỏi tìm kiếm trong memory' },
+   387→   387→          },
+   388→   388→          required: ['query'],
+   389→   389→        },
+   390→   390→      },
+   391→   391→    },
+   392→   392→    browser: {
+   393→   393→      type: 'function',
+   394→   394→      function: {
+   395→   395→        name: 'browser',
+   396→   396→        description: 'Điều khiển browser qua Gateway (navigate, click, screenshot).',
+   397→   397→        parameters: {
+   398→   398→          type: 'object',
+   399→   399→          properties: {
+   400→   400→            action: { type: 'string', description: 'Hành động browser (navigate/click/screenshot/type)' },
+   401→   401→            url: { type: 'string', description: 'URL (cho navigate)' },
+   402→   402→            selector: { type: 'string', description: 'CSS selector (cho click/type)' },
+   403→   403→            text: { type: 'string', description: 'Text (cho type)' },
+   404→   404→          },
+   405→   405→          required: ['action'],
+   406→   406→        },
+   407→   407→      },
+   408→   408→    },
+   409→   409→    canvas: {
+   410→   410→      type: 'function',
+   411→   411→      function: {
+   412→   412→        name: 'canvas',
+   413→   413→        description: 'Vẽ/tạo hình trên canvas qua Gateway.',
+   414→   414→        parameters: {
+   415→   415→          type: 'object',
+   416→   416→          properties: {
+   417→   417→            action: { type: 'string', description: 'Hành động canvas (draw/clear/render)' },
+   418→   418→          },
+   419→   419→          required: ['action'],
+   420→   420→        },
+   421→   421→      },
+   422→   422→    },
+   423→   423→    tts: {
+   424→   424→      type: 'function',
+   425→   425→      function: {
+   426→   426→        name: 'tts',
+   427→   427→        description: 'Text-to-speech qua Gateway.',
+   428→   428→        parameters: {
+   429→   429→          type: 'object',
+   430→   430→          properties: {
+   431→   431→            text: { type: 'string', description: 'Văn bản cần chuyển thành giọng nói' },
+   432→   432→          },
+   433→   433→          required: ['text'],
+   434→   434→        },
+   435→   435→      },
+   436→   436→    },
+   437→   437→    create_goal: {
+   438→   438→      type: 'function',
+   439→   439→      function: {
+   440→   440→        name: 'create_goal',
+   441→   441→        description: 'Tạo goal/objective mới trên Gateway.',
+   442→   442→        parameters: {
+   443→   443→          type: 'object',
+   444→   444→          properties: {
+   445→   445→            objective: { type: 'string', description: 'Mô tả goal' },
+   446→   446→          },
+   447→   447→          required: ['objective'],
+   448→   448→        },
+   449→   449→      },
+   450→   450→    },
+   451→   451→    get_goal: {
+   452→   452→      type: 'function',
+   453→   453→      function: {
+   454→   454→        name: 'get_goal',
+   455→   455→        description: 'Xem goal hiện tại trên Gateway.',
+   456→   456→        parameters: {
+   457→   457→          type: 'object',
+   458→   458→          properties: {},
+   459→   459→        },
+   460→   460→      },
+   461→   461→    },
+   462→   462→  }
+   463→   463→
+   464→   464→  return toolNames
+   465→   465→    .map(name => ALL_TOOL_DEFINITIONS[name])
+   466→   466→    .filter(Boolean)
+   467→   467→}
+   468→   468→
+   469→   469→// ============================================
+   470→   470→// CODE QUERY DETECTION — Intelligent Routing
+   471→   471→// Uses shared patterns from opencode-knowledge-context
+   472→   472→// ============================================
+   473→   473→
+   474→   474→// Additional patterns specific to chat routing (supplement the shared isCodeQuery)
+   475→   475→const CHAT_CODE_PATTERNS = [
+   476→   476→  /npm run/i,
+   477→   477→  /chỉnh sửa.*file/i,
+   478→   478→  /undefined.*variable/i,
+   479→   479→  /git (commit|push|pull|merge)/i,
+   480→   480→  /terminal|command line/i,
+   481→   481→  /deploy/i,
+   482→   482→]
+   483→   483→
+   484→   484→function isCodeQuery(message: string): boolean {
+   485→   485→  // Use the shared advanced detection from opencode-knowledge-context, plus chat-specific patterns
+   486→   486→  return isCodeQueryAdvanced(message) || CHAT_CODE_PATTERNS.some(pattern => pattern.test(message))
+   487→   487→}
+   488→   488→
+   489→   489→// ============================================
+   490→   490→// OPENCODE ROUTING
+   491→   491→// ============================================
+   492→   492→
+   493→   493→async function routeToOpenCode(
+   494→   494→  userMessage: string,
+   495→   495→  model?: string,
+   496→   496→  sessionId?: string,
+   497→   497→  messages?: Array<{ role: string; content: string }>,
+   498→   498→  agentProfileId?: string,
+   499→   499→  teamMode?: string,
+   500→   500→  teamName?: string,
+   501→   501→): Promise<NextResponse | null> {
+   502→   502→  try {
+   503→   503→    const online = await isOpenCodeOnline()
+   504→   504→    if (!online) return null
+   505→   505→
+   506→   506→    // OC-3.1: Enrich with Knowledge Base context before creating session
+   507→   507→    const codeConfidence = detectCodeConfidence(userMessage)
+   508→   508→    const enrichment = await enrichCodeContext(userMessage)
+   509→   509→    
+   510→   510→    // OC-3.5: Cross-Session Learning — incorporate past corrections and insights
+   511→   511→    let entityTypeCount = 0
+   512→   512→    let documentCount = 0  
+   513→   513→    let correctionCount = 0
+   514→   514→    let insightCount = 0
+   515→   515→    let filesInWorkspace = 0
+   516→   516→    try {
+   517→   517→      entityTypeCount = await db.localEntity.count()
+   518→   518→      correctionCount = await db.agentCorrection.count({ where: { applied: true } })
+   519→   519→      insightCount = await db.agentInsight.count()
+   520→   520→      documentCount = await db.localEntity.count({ where: { domain: 'document' } })
+   521→   521→    } catch {}
+   522→   522→
+   523→   523→    // Count workspace files (cross-platform: uses Node.js fs instead of `find` command)
+   524→   524→    try {
+   525→   525→      const { readdirSync, statSync } = await import('fs')
+   526→   526→      const { join } = await import('path')
+   527→   527→      const workspaceDir = process.env.OPENCODE_WORKSPACE || process.cwd()
+   528→   528→      const skipDirs = new Set(['.next', 'node_modules', '.git', 'qdrant-storage', 'db', 'upload', 'skills'])
+   529→   529→      function countFiles(dir: string): number {
+   530→   530→        let count = 0
+   531→   531→        try {
+   532→   532→          for (const entry of readdirSync(dir)) {
+   533→   533→            const full = join(dir, entry)
+   534→   534→            try {
+   535→   535→              const stat = statSync(full)
+   536→   536→              if (stat.isDirectory()) {
+   537→   537→                if (!skipDirs.has(entry)) count += countFiles(full)
+   538→   538→              } else {
+   539→   539→                count++
+   540→   540→              }
+   541→   541→            } catch {}
+   542→   542→          }
+   543→   543→        } catch {}
+   544→   544→        return count
+   545→   545→      }
+   546→   546→      filesInWorkspace = countFiles(workspaceDir)
+   547→   547→    } catch {}
+   548→   548→
+   549→   549→    // OC-3.7: Generate enriched system prompt with KB context
+   550→   550→    const enrichedSystemPrompt = generateOpenCodeSystemPrompt({
+   551→   551→      entityTypeCount,
+   552→   552→      documentCount,
+   553→   553→      correctionCount,
+   554→   554→      insightCount,
+   555→   555→      filesInWorkspace,
+   556→   556→      modelList: [],
+   557→   557→      kbEnabled: true,
+   558→   558→      mcpToolsEnabled: ['knowledge_search', 'knowledge_graph', 'knowledge_write', 'web_search'],
+   559→   559→      recentCorrections: enrichment.corrections,
+   560→   560→      recentInsights: enrichment.insights.slice(0, 5),
+   561→   561→      relatedEntities: enrichment.entities,
+   562→   562→    })
+   563→   563→
+   564→   564→    // Try to create an OpenCode session with the prompt + enriched context
+   565→   565→    const session = await createOpenCodeSession({
+   566→   566→      prompt: userMessage,
+   567→   567→      model: model || undefined,
+   568→   568→    })
+   569→   569→
+   570→   570→    if (!session) return null
+   571→   571→
+   572→   572→    // Track in SQLite
+   573→   573→    if (sessionId) {
+   574→   574→      try {
+   575→   575→        await db.agentSession.upsert({
+   576→   576→          where: { sessionId },
+   577→   577→          create: {
+   578→   578→            sessionId,
+   579→   579→            model: model || 'opencode',
+   580→   580→            provider: 'opencode',
+   581→   581→            title: userMessage.slice(0, 50) || 'Code Session',
+   582→   582→            messageCount: 1,
+   583→   583→            agentProfileId: agentProfileId || null,
+   584→   584→            teamMode: teamMode || null,
+   585→   585→            teamName: teamName || null,
+   586→   586→          },
+   587→   587→          update: {
+   588→   588→            messageCount: { increment: 1 },
+   589→   589→            model: model || undefined,
+   590→   590→          },
+   591→   591→        })
+   592→   592→      } catch {}
+   593→   593→    }
+   594→   594→
+   595→   595→    // Also track as OpenCodeSession
+   596→   596→    try {
+   597→   597→      await db.openCodeSession.create({
+   598→   598→        data: {
+   599→   599→          sessionId: session.sessionId || session.id || `oc-${Date.now()}`,
+   600→   600→          model: model || null,
+   601→   601→          provider: 'opencode',
+   602→   602→          prompt: userMessage,
+   603→   603→          status: 'active',
+   604→   604→        },
+   605→   605→      })
+   606→   606→    } catch {}
+   607→   607→
+   608→   608→    // Build enrichment info for the response
+   609→   609→    const enrichmentInfo = enrichment.enrichmentScore > 0
+   610→   610→      ? `\n\n📊 **KB Context Enrichment** (score: ${(enrichment.enrichmentScore * 100).toFixed(0)}%):\n` +
+   611→   611→        (enrichment.entities.length > 0 ? `• Entities: ${enrichment.entities.length} found (${enrichment.entities.slice(0, 3).map(e => e.name).join(', ')}${enrichment.entities.length > 3 ? '...' : ''})\n` : '') +
+   612→   612→        (enrichment.documents.length > 0 ? `• Documents: ${enrichment.documents.length} relevant\n` : '') +
+   613→   613→        (enrichment.corrections.length > 0 ? `• Corrections: ${enrichment.corrections.length} from past sessions\n` : '') +
+   614→   614→        (enrichment.insights.length > 0 ? `• Insights: ${enrichment.insights.length} available\n` : '')
+   615→   615→      : ''
+   616→   616→
+   617→   617→    // Return a response indicating the session was created with KB enrichment
+   618→   618→    return NextResponse.json({
+   619→   619→      content: `🔧 **Đã tạo Knowledge-Aware OpenCode Session** — "${userMessage.slice(0, 80)}${userMessage.length > 80 ? '...' : ''}"\n\nSession đã được gửi đến OpenCode Server với Knowledge Base context. Agent sẽ:\n1. 📖 Đọc file liên quan\n2. 🔍 Tìm kiếm Knowledge Base qua MCP Bridge\n3. 📝 Kiểm tra corrections từ sessions trước\n4. ✏️ Phân tích và thực hiện chỉnh sửa\n5. 🔧 Chạy LSP diagnostics để kiểm tra\n6. 💡 Tự động capture insights mới vào KB${enrichmentInfo}\n📋 **Session ID**: ${session.sessionId || session.id}\n💻 Xem tiến trình trong tab **Code** → Active Sessions\n\n🤖 _Agent đang xử lý... Xem real-time progress tại Code Tab_`,
+   620→   620→      model: model || 'opencode',
+   621→   621→      provider: 'opencode',
+   622→   622→      sessionId: sessionId || `session-${Date.now()}`,
+   623→   623→      opencodeSessionId: session.sessionId || session.id,
+   624→   624→      kbResults: 'opencode-routed-enriched',
+   625→   625→      routedTo: 'opencode',
+   626→   626→      enrichment: {
+   627→   627→        score: enrichment.enrichmentScore,
+   628→   628→        entitiesFound: enrichment.entities.length,
+   629→   629→        documentsFound: enrichment.documents.length,
+   630→   630→        correctionsFound: enrichment.corrections.length,
+   631→   631→        insightsFound: enrichment.insights.length,
+   632→   632→        codeConfidence,
+   633→   633→      },
+   634→   634→      systemPromptLength: enrichedSystemPrompt.length,
+   635→   635→    })
+   636→   636→  } catch (err) {
+   637→   637→    console.warn('[OpenClaw Chat] OpenCode routing error:', err instanceof Error ? err.message : String(err))
+   638→   638→    return null
+   639→   639→  }
+   640→   640→}
+   641→   641→
+   642→   642→// ============================================
+   643→   643→// GATEWAY ROUTING — P0.2
+   644→   644→// ============================================
+   645→   645→
+   646→   646→/**
+   647→   647→ * Route chat through hybrid Gateway + local architecture.
+   648→   648→ *
+   649→   649→ * Architecture (Hybrid ReAct):
+   650→   650→ *   - LLM calls → NVIDIA NIM directly (callLLMForAgent)
+   651→   651→ *   - Tool execution → Gateway /tools/invoke when available, local fallback
+   652→   652→ *
+   653→   653→ * This replaces the old approach of routing ALL through Gateway /v1/chat/completions
+   654→   654→ * which returned 404 (Gateway uses WebSocket internally, not REST for chat).
+   655→   655→ */
+   656→   656→async function routeThroughGateway(params: {
+   657→   657→  messages: Array<{ role: string; content: string }>
+   658→   658→  agentProvider: string
+   659→   659→  agentModel: string
+   660→   660→  sessionId?: string
+   661→   661→  temperature?: number
+   662→   662→  maxTokens?: number
+   663→   663→  agentProfileId?: string
+   664→   664→  agentProfileName?: string
+   665→   665→  teamMode?: string
+   666→   666→  teamName?: string
+   667→   667→  agentTools?: string[]
+   668→   668→}): Promise<NextResponse | null> {
+   669→   669→  const { messages, agentProvider, agentModel, sessionId, temperature, maxTokens,
+   670→   670→          agentProfileId, agentProfileName, teamMode, teamName, agentTools = [] } = params
+   671→   671→
+   672→   672→  try {
+   673→   673→    // Hybrid approach: Use local ReAct loop with Gateway tool proxy
+   674→   674→    // This avoids the 404 from /v1/chat/completions while still using Gateway tools
+   675→   675→    const lastUserMsg = [...messages].reverse().find(m => m.role === 'user')
+   676→   676→    const userContent = typeof lastUserMsg?.content === 'string' ? lastUserMsg.content : ''
+   677→   677→    const systemMsg = messages.find(m => m.role === 'system')
+   678→   678→    const systemPrompt = systemMsg?.content || ''
+   679→   679→    const chatHistory = messages.filter(m => m.role === 'user' || m.role === 'assistant')
+   680→   680→
+   681→   681→    // Use the existing ReAct loop which already supports Gateway tool proxy
+   682→   682→    const reactResult = await runAgentReActLoop({
+   683→   683→      systemPrompt,
+   684→   684→      userMessage: userContent,
+   685→   685→      chatHistory,
+   686→   686→      agentProvider,
+   687→   687→      agentModel,
+   688→   688→      agentId: agentProfileId || 'unknown',
+   689→   689→      agentName: agentProfileName || 'Agent',
+   690→   690→      agentTemperature: temperature,
+   691→   691→      agentMaxTokens: maxTokens,
+   692→   692→      agentTools,
+   693→   693→      maxIterations: 5,
+   694→   694→    })
+   695→   695→
+   696→   696→    // Track session
+   697→   697→    if (sessionId) {
+   698→   698→      await db.agentSession.upsert({
+   699→   699→        where: { sessionId },
+   700→   700→        create: {
+   701→   701→          sessionId,
+   702→   702→          model: agentModel,
+   703→   703→          provider: agentProvider,
+   704→   704→          title: userContent.slice(0, 50) || 'New Chat',
+   705→   705→          messageCount: messages.length + 1,
+   706→   706→          agentProfileId: agentProfileId || null,
+   707→   707→          teamMode: teamMode || null,
+   708→   708→          teamName: teamName || null,
+   709→   709→        },
+   710→   710→        update: { messageCount: { increment: 1 } },
+   711→   711→      }).catch(() => {})
+   712→   712→    }
+   713→   713→
+   714→   714→    return NextResponse.json({
+   715→   715→      content: reactResult.content,
+   716→   716→      model: agentModel,
+   717→   717→      provider: agentProvider,
+   718→   718→      sessionId: sessionId || `session-${Date.now()}`,
+   719→   719→      agentProfileId: agentProfileId || undefined,
+   720→   720→      sources: [],
+   721→   721→      confidence: 0.7,
+   722→   722→      kbResults: 'hybrid-react',
+   723→   723→      gatewayToolsAvailable: true,
+   724→   724→      reactIterations: reactResult.iterations,
+   725→   725→      toolCallsExecuted: reactResult.toolCallsExecuted,
+   726→   726→    })
+   727→   727→  } catch (err) {
+   728→   728→    console.warn('[Gateway Hybrid] Error:', err instanceof Error ? err.message : String(err))
+   729→   729→    return null
+   730→   730→  }
+   731→   731→}
+   732→   732→
+   733→   733→// ============================================
+   734→   734→// MAIN HANDLER
+   735→   735→// ============================================
+   736→   736→
+   737→   737→export async function POST(request: NextRequest) {
+   738→   738→  try {
+   739→   739→    const body = await request.json()
+   740→   740→    const { messages, model, sessionId, stream, systemPromptAdditions,
+   741→   741→            agentInstruction, agentTemperature, agentMaxTokens, agentProfileId, agentProfileName,
+   742→   742→            agentProvider, agentModel, teamMode, teamName } = body
+   743→   743→
+   744→   744→    if (!messages || !Array.isArray(messages) || messages.length === 0) {
+   745→   745→      return NextResponse.json(
+   746→   746→        { error: 'Messages array is required' },
+   747→   747→        { status: 400 }
+   748→   748→      )
+   749→   749→    }
+   750→   750→
+   751→   751→    // Extract last user message early — needed for memory recall and routing
+   752→   752→    const lastUserMsg = [...messages].reverse().find((m: { role: string }) => m.role === 'user')
+   753→   753→    const lastUserContent = typeof lastUserMsg?.content === 'string' ? lastUserMsg.content : ''
+   754→   754→
+   755→   755→    // ============================================
+   756→   756→    // PROACTIVE MEMORY RECALL — Phase 5
+   757→   757→    // Before building the response, recall relevant memories for this agent
+   758→   758→    // and inject them into the system prompt so the agent remembers past interactions.
+   759→   759→    // ============================================
+   760→   760→    let recalledMemories: Array<{ id: string; content: string; category: string; importance: number; relevance: number; context?: string | null }> = []
+   761→   761→    let userProfileContext = ''
+   762→   762→
+   763→   763→    if (agentProfileId && lastUserContent) {
+   764→   764→      try {
+   765→   765→        // Ensure agent_memory collection exists in Qdrant
+   766→   766→        await ensureAgentMemoryCollection().catch(() => {})
+   767→   767→
+   768→   768→        // Recall relevant memories (non-blocking if it fails)
+   769→   769→        recalledMemories = await recallMemories({
+   770→   770→          agentId: agentProfileId,
+   771→   771→          query: lastUserContent,
+   772→   772→          topK: 5,
+   773→   773→          minImportance: 0.3,
+   774→   774→        }).catch(err => {
+   775→   775→          console.warn('[OpenClaw Chat] Memory recall failed:', err instanceof Error ? err.message : String(err))
+   776→   776→          return []
+   777→   777→        })
+   778→   778→
+   779→   779→        // Load user profile
+   780→   780→        const profile = await getUserProfile().catch(() => [])
+   781→   781→        if (profile.length > 0) {
+   782→   782→          userProfileContext = profile.map(p => `- ${p.key}: ${p.value}`).join('\n')
+   783→   783→        }
+   784→   784→      } catch (err) {
+   785→   785→        console.warn('[OpenClaw Chat] Memory system error:', err instanceof Error ? err.message : String(err))
+   786→   786→      }
+   787→   787→    }
+   788→   788→
+   789→   789→    // Build system prompt with static KB context (fast, no DB queries)
+   790→   790→    // If agentInstruction is provided (from Agent Profile), prepend it to the system prompt
+   791→   791→    let systemPrompt = DEFAULT_SYSTEM_PROMPT + `\n\n--- Knowledge Base Context ---\n${STATIC_KB_CONTEXT}`
+   792→   792→
+   793→   793→    if (agentInstruction && typeof agentInstruction === 'string' && agentInstruction.trim()) {
+   794→   794→      systemPrompt = agentInstruction.trim() + '\n\n--- Base System Prompt ---\n' + systemPrompt
+   795→   795→    }
+   796→   796→
+   797→   797→    // Inject enabled skills from AgentSkill DB table into the system prompt
+   798→   798→    // NOTE: Skills are injected via TWO mechanisms serving DIFFERENT paths:
+   799→   799→    //   1. DB → systemPrompt (this code) — used by OpenClaw Chat & Workflow Engine
+   800→   800→    //   2. Filesystem (skills/<slug>/SKILL.md) — used by z.ai platform sandbox
+   801→   801→    //   Do NOT add a third injection point without checking for duplication.
+   802→   802→    try {
+   803→   803→      // Load ALL enabled skills — skills are global (not per-agent)
+   804→   804→      // agentId field on AgentSkill is for future per-agent assignment
+   805→   805→      const enabledSkills = await db.agentSkill.findMany({
+   806→   806→        where: { enabled: true },
+   807→   807→        select: { name: true, slug: true, content: true, source: true },
+   808→   808→      })
+   809→   809→      if (enabledSkills.length > 0) {
+   810→   810→        // Token budget: limit skills injection to ~4K tokens (~16K chars) to avoid bloating system prompt
+   811→   811→        const MAX_SKILLS_CHARS = 16000
+   812→   812→        let skillsText = ''
+   813→   813→        for (const skill of enabledSkills) {
+   814→   814→          const section = `## Skill: ${skill.name} (source: ${skill.source})\n${skill.content}\n\n---\n\n`
+   815→   815→          if ((skillsText + section).length > MAX_SKILLS_CHARS) {
+   816→   816→            skillsText += `## Skill: ${skill.name} (source: ${skill.source})\n[Content truncated — skill content too large. Use the skill name to look up details.]\n\n---\n\n`
+   817→   817→            break
+   818→   818→          }
+   819→   819→          skillsText += section
+   820→   820→        }
+   821→   821→        systemPrompt += `\n\n--- Available Skills ---\nYou have access to the following skills. Each skill is a guide that tells you WHEN and HOW to use a specific capability. Follow the instructions in each skill when the situation calls for it.\n\n${skillsText}`
+   822→   822→      }
+   823→   823→    } catch (skillErr) {
+   824→   824→      console.warn('[OpenClaw Chat] Failed to load enabled skills:', skillErr instanceof Error ? skillErr.message : String(skillErr))
+   825→   825→    }
+   826→   826→
+   827→   827→    // Inject standing orders — persistent agent instructions
+   828→   828→    try {
+   829→   829→      const standingOrders = await db.standingOrder.findMany({
+   830→   830→        where: { enabled: true },
+   831→   831→        select: { order: true, priority: true },
+   832→   832→        orderBy: { priority: 'desc' },
+   833→   833→      })
+   834→   834→      if (standingOrders.length > 0) {
+   835→   835→        const ordersText = standingOrders.map(o => `- [P${o.priority}] ${o.order}`).join('\n')
+   836→   836→        systemPrompt += `\n\n--- Standing Orders ---\nYou MUST follow these standing orders at all times:\n${ordersText}`
+   837→   837→      }
+   838→   838→    } catch (orderErr) {
+   839→   839→      console.warn('[OpenClaw Chat] Failed to load standing orders:', orderErr instanceof Error ? orderErr.message : String(orderErr))
+   840→   840→    }
+   841→   841→
+   842→   842→    // Inject recalled memories into system prompt
+   843→   843→    if (recalledMemories.length > 0) {
+   844→   844→      const memoryText = recalledMemories.map((m, i) =>
+   845→   845→        `[Memory ${i + 1}] (${m.category}, importance: ${m.importance.toFixed(1)}) ${m.content}${m.context ? ` \n  Context: ${m.context}` : ''}`
+   846→   846→      ).join('\n')
+   847→   847→      systemPrompt += `\n\n--- Recalled Memories ---\nYou have the following memories from past interactions. Use them to personalize your response and remember what you've learned:\n${memoryText}`
+   848→   848→    }
+   849→   849→
+   850→   850→    // Inject user profile into system prompt
+   851→   851→    if (userProfileContext) {
+   852→   852→      systemPrompt += `\n\n--- User Profile ---\nWhat you know about the user:\n${userProfileContext}`
+   853→   853→    }
+   854→   854→
+   855→   855→    // Append systemPromptAdditions AFTER skills so user-provided additions take precedence
+   856→   856→    if (systemPromptAdditions) {
+   857→   857→      systemPrompt += `\n\n${systemPromptAdditions}`
+   858→   858→    }
+   859→   859→
+   860→   860→    // Prepend system prompt to messages
+   861→   861→    const fullMessages = [
+   862→   862→      { role: 'system', content: systemPrompt },
+   863→   863→      ...messages,
+   864→   864→    ]
+   865→   865→
+   866→   866→    // If the query is code-related, try routing to OpenCode first
+   867→   867→    if (isCodeQuery(lastUserContent)) {
+   868→   868→      const opencodeResponse = await routeToOpenCode(lastUserContent, model, sessionId, messages, agentProfileId, teamMode, teamName)
+   869→   869→      if (opencodeResponse) {
+   870→   870→        return opencodeResponse
+   871→   871→      }
+   872→   872→      // If OpenCode is offline, fall through to regular flow
+   873→   873→      // (with a note that code features are unavailable)
+   874→   874→    }
+   875→   875→
+   876→   876→    // ============================================
+   877→   877→    // GATEWAY-FIRST ROUTING — P0
+   878→   878→    // ============================================
+   879→   879→    // Strategy: Gateway online → route ALL through Gateway (37 tools)
+   880→   880→    //           Gateway offline → fallback local ReAct loop (7+ tools)
+   881→   881→
+   882→   882→    const hasAgentProviderModel = agentProvider && agentModel
+   883→   883→
+   884→   884→    // Step 1: Check Gateway status (cached 30s)
+   885→   885→    const gatewayAvailable = await isGatewayOnlineCached()
+   886→   886→
+   887→   887→    if (gatewayAvailable) {
+   888→   888→      // Gateway online → route through Gateway (ALL agents)
+   889→   889→      console.log(`[OpenClaw Chat] Gateway online — routing through Gateway (${agentProvider || 'default'}/${agentModel || 'default'})`)
+   890→   890→
+   891→   891→      const agentTools = agentProfileName ? getStandaloneAgentTools(agentProfileName) : []
+   892→   892→      const gatewayResponse = await routeThroughGateway({
+   893→   893→        messages: fullMessages,
+   894→   894→        agentProvider: agentProvider || 'nvidia',
+   895→   895→        agentModel: agentModel || 'nvidia/nemotron-3-super-120b-a12b',
+   896→   896→        sessionId,
+   897→   897→        temperature: agentTemperature,
+   898→   898→        maxTokens: agentMaxTokens,
+   899→   899→        agentProfileId: agentProfileId || undefined,
+   900→   900→        agentProfileName: agentProfileName || undefined,
+   901→   901→        teamMode,
+   902→   902→        teamName,
+   903→   903→        agentTools,
+   904→   904→      })
+   905→   905→
+   906→   906→      if (gatewayResponse) {
+   907→   907→        // Gateway succeeded — background tasks (auto-learn, memory)
+   908→   908→        const hasAgent = !!(agentProfileId && agentProvider && agentModel)
+   909→   909→        if (shouldAutoLearn(0.5, hasAgent) && agentProfileId) {
+   910→   910→          autoLearnFromAnswer({
+   911→   911→            query: lastUserContent,
+   912→   912→            answer: '',  // Content is in the response, not accessible here
+   913→   913→            confidence: 0.7,
+   914→   914→            agentId: agentProfileId,
+   915→   915→            agentName: agentProfileName || 'unknown',
+   916→   916→            provider: agentProvider || 'nvidia',
+   917→   917→            model: agentModel || 'nvidia/nemotron-3-super-120b-a12b',
+   918→   918→            sources: [],
+   919→   919→          }).catch(err => console.error('[AutoLearn] Background error:', err instanceof Error ? err.message : String(err)))
+   920→   920→        }
+   921→   921→
+   922→   922→        if (agentProfileId && sessionId) {
+   923→   923→          saveChatMessages(sessionId, [
+   924→   924→            { role: 'user', content: lastUserContent },
+   925→   925→            { role: 'assistant', content: 'gateway-response', provider: agentProvider || 'nvidia', model: agentModel, metadata: { gatewayRouted: true } },
+   926→   926→          ]).catch(() => {})
+   927→   927→        }
+   928→   928→
+   929→   929→        return gatewayResponse
+   930→   930→      }
+   931→   931→      // Gateway returned null (error) → fall through to local fallback
+   932→   932→      console.log('[OpenClaw Chat] Gateway error, falling back to local ReAct loop')
+   933→   933→    }
+   934→   934→
+   935→   935→    // Step 2: Gateway offline or error → fallback local ReAct loop
+   936→   936→    if (hasAgentProviderModel) {
+   937→   937→      console.log(`[OpenClaw Chat] Local ReAct loop: Agent using own provider/model (${agentProvider}/${agentModel})`)
+   938→   938→
+   939→   939→      try {
+   940→   940→        const agentTools = agentProfileName ? getStandaloneAgentTools(agentProfileName) : []
+   941→   941→
+   942→   942→        const reactResult = await runAgentReActLoop({
+   943→   943→          systemPrompt,
+   944→   944→          userMessage: lastUserContent,
+   945→   945→          chatHistory: messages.filter((m: { role: string }) => m.role === 'user' || m.role === 'assistant'),
+   946→   946→          agentProvider,
+   947→   947→          agentModel,
+   948→   948→          agentId: agentProfileId || 'unknown',
+   949→   949→          agentName: agentProfileName || 'Agent',
+   950→   950→          agentTemperature,
+   951→   951→          agentMaxTokens,
+   952→   952→          agentTools,
+   953→   953→          maxIterations: 5,
+   954→   954→        })
+   955→   955→
+   956→   956→        const content = reactResult.content
+   957→   957→
+   958→   958→        // Track session
+   959→   959→        if (sessionId) {
+   960→   960→          try {
+   961→   961→            await db.agentSession.upsert({
+   962→   962→              where: { sessionId },
+   963→   963→              create: {
+   964→   964→                sessionId,
+   965→   965→                model: agentModel,
+   966→   966→                provider: agentProvider,
+   967→   967→                title: messages[0]?.content?.slice(0, 50) || 'New Chat',
+   968→   968→                messageCount: messages.length + 1,
+   969→   969→                agentProfileId: agentProfileId || null,
+   970→   970→                teamMode: teamMode || null,
+   971→   971→                teamName: teamName || null,
+   972→   972→              },
+   973→   973→              update: {
+   974→   974→                messageCount: { increment: 1 },
+   975→   975→              },
+   976→   976→            })
+   977→   977→          } catch {}
+   978→   978→        }
+   979→   979→
+   980→   980→        // Background: Auto-learn
+   981→   981→        const hasAgent = !!(agentProfileId && agentProvider && agentModel)
+   982→   982→        if (shouldAutoLearn(0.5, hasAgent)) {
+   983→   983→          autoLearnFromAnswer({
+   984→   984→            query: lastUserContent,
+   985→   985→            answer: content,
+   986→   986→            confidence: 0.6,
+   987→   987→            agentId: agentProfileId!,
+   988→   988→            agentName: agentProfileName || 'unknown',
+   989→   989→            provider: agentProvider!,
+   990→   990→            model: agentModel!,
+   991→   991→            sources: [],
+   992→   992→          }).catch(err => console.error('[AutoLearn] Background error:', err instanceof Error ? err.message : String(err)))
+   993→   993→        }
+   994→   994→
+   995→   995→        // Background: Memory
+   996→   996→        if (agentProfileId && sessionId) {
+   997→   997→          saveChatMessages(sessionId, [
+   998→   998→            { role: 'user', content: lastUserContent },
+   999→   999→            { role: 'assistant', content, model: agentModel, provider: agentProvider, metadata: { reactIterations: reactResult.iterations, toolCallsExecuted: reactResult.toolCallsExecuted } },
+  1000→  1000→          ]).catch(err => console.warn('[Memory] Failed to save chat messages:', err instanceof Error ? err.message : String(err)))
+  1001→  1001→
+  1002→  1002→          if (!isTrivialExchange(lastUserContent, content)) {
+  1003→  1003→            extractMemoriesFromConversation({
+  1004→  1004→              agentId: agentProfileId,
+  1005→  1005→              agentName: agentProfileName || 'unknown',
+  1006→  1006→              sessionId,
+  1007→  1007→              userMessage: lastUserContent,
+  1008→  1008→              assistantMessage: content,
+  1009→  1009→            }).catch(err => console.warn('[Memory] Failed to extract memories:', err instanceof Error ? err.message : String(err)))
+  1010→  1010→          }
+  1011→  1011→
+  1012→  1012→          memoryDecayCounter++
+  1013→  1013→          if (memoryDecayCounter >= 20 && agentProfileId) {
+  1014→  1014→            memoryDecayCounter = 0
+  1015→  1015→            decayMemories(agentProfileId).catch(err =>
+  1016→  1016→              console.warn('[Memory] Periodic decay error:', err instanceof Error ? err.message : String(err))
+  1017→  1017→            )
+  1018→  1018→          }
+  1019→  1019→        }
+  1020→  1020→
+  1021→  1021→        return NextResponse.json({
+  1022→  1022→          content,
+  1023→  1023→          model: agentModel,
+  1024→  1024→          provider: agentProvider,
+  1025→  1025→          sessionId: sessionId || `session-${Date.now()}`,
+  1026→  1026→          agentProfileId: agentProfileId || undefined,
+  1027→  1027→          sources: [],
+  1028→  1028→          confidence: 0.6,
+  1029→  1029→          kbResults: 'agent-react',
+  1030→  1030→          reactIterations: reactResult.iterations,
+  1031→  1031→          toolCallsExecuted: reactResult.toolCallsExecuted,
+  1032→  1032→          memoriesRecalled: recalledMemories.length || undefined,
+  1033→  1033→        })
+  1034→  1034→      } catch (err) {
+  1035→  1035→        console.warn('[OpenClaw Chat] ReAct loop error, falling back to /api/query:', err instanceof Error ? err.message : String(err))
+  1036→  1036→        // Fall through to /api/query fallback below
+  1037→  1037→      }
+  1038→  1038→    }
+  1039→  1039→
+  1040→  1040→    if (!hasAgentProviderModel) {
+  1041→  1041→      // No agent config → try OpenClaw Gateway first (original flow)
+  1042→  1042→      try {
+  1043→  1043→        const onlineResult = await isGatewayOnline()
+  1044→  1044→        if (onlineResult.online) {
+  1045→  1045→          const res = await chatCompletion({
+  1046→  1046→            messages: fullMessages,
+  1047→  1047→            model: model || 'openclaw/default',
+  1048→  1048→            sessionId,
+  1049→  1049→            stream: false,
+  1050→  1050→            temperature: agentTemperature,
+  1051→  1051→            max_tokens: agentMaxTokens,
+  1052→  1052→            tools: [
+  1053→  1053→              {
+  1054→  1054→                type: 'function',
+  1055→  1055→                function: {
+  1056→  1056→                  name: 'knowledge_search',
+  1057→  1057→                  description: 'Tìm kiếm semantic trong Knowledge Base',
+  1058→  1058→                  parameters: {
+  1059→  1059→                    type: 'object',
+  1060→  1060→                    properties: {
+  1061→  1061→                      query: { type: 'string', description: 'Câu hỏi cần tìm kiếm' },
+  1062→  1062→                      topK: { type: 'number', description: 'Số kết quả trả về', default: 5 },
+  1063→  1063→                    },
+  1064→  1064→                    required: ['query'],
+  1065→  1065→                  },
+  1066→  1066→                },
+  1067→  1067→              },
+  1068→  1068→            ],
+  1069→  1069→          })
+  1070→  1070→
+  1071→  1071→          const data = await res.json()
+  1072→  1072→          const content = data.choices?.[0]?.message?.content || data.content || data.message || 'No response'
+  1073→  1073→          const toolCalls = data.choices?.[0]?.message?.tool_calls
+  1074→  1074→
+  1075→  1075→          // Track token usage from gateway response (if available)
+  1076→  1076→          const gwUsage = data.usage as { prompt_tokens?: number; completion_tokens?: number; total_tokens?: number } | undefined
+  1077→  1077→          const gwTotalTokens = gwUsage?.total_tokens ?? ((gwUsage?.prompt_tokens ?? 0) + (gwUsage?.completion_tokens ?? 0))
+  1078→  1078→          if (gwTotalTokens > 0) {
+  1079→  1079→            addTokensUsed(gwTotalTokens, 'openclaw', undefined, data.model || model)
+  1080→  1080→          }
+  1081→  1081→
+  1082→  1082→          // Update session in SQLite
+  1083→  1083→          if (sessionId) {
+  1084→  1084→            try {
+  1085→  1085→              await db.agentSession.upsert({
+  1086→  1086→                where: { sessionId },
+  1087→  1087→                create: {
+  1088→  1088→                  sessionId,
+  1089→  1089→                  model: model || 'openclaw/default',
+  1090→  1090→                  provider: 'openclaw',
+  1091→  1091→                  title: messages[0]?.content?.slice(0, 50) || 'New Chat',
+  1092→  1092→                  messageCount: messages.length + 1,
+  1093→  1093→                  agentProfileId: agentProfileId || null,
+  1094→  1094→                  teamMode: teamMode || null,
+  1095→  1095→                  teamName: teamName || null,
+  1096→  1096→                },
+  1097→  1097→                update: {
+  1098→  1098→                  messageCount: { increment: 1 },
+  1099→  1099→                  model: model || undefined,
+  1100→  1100→                },
+  1101→  1101→              })
+  1102→  1102→            } catch {}
+  1103→  1103→          }
+  1104→  1104→
+  1105→  1105→          return NextResponse.json({
+  1106→  1106→            content,
+  1107→  1107→            toolCalls,
+  1108→  1108→            model: data.model || model,
+  1109→  1109→            provider: 'openclaw',
+  1110→  1110→            agentProfileId: agentProfileId || undefined,
+  1111→  1111→            usage: data.usage,
+  1112→  1112→            sessionId: sessionId || data.session_id,
+  1113→  1113→            kbResults: 'gateway',
+  1114→  1114→          })
+  1115→  1115→        }
+  1116→  1116→      } catch (err) {
+  1117→  1117→        console.warn('[OpenClaw Chat] Gateway error:', err instanceof Error ? err.message : String(err))
+  1118→  1118→      }
+  1119→  1119→    }
+  1120→  1120→
+  1121→  1121→    // /api/query fallback path — used for:
+  1122→  1122→    //   - Agent with configured provider/model when ReAct loop fails (fallback)
+  1123→  1123→    //   - Gateway offline fallback (no agent config)
+  1124→  1124→    if (hasAgentProviderModel) {
+  1125→  1125→      console.log(`[OpenClaw Chat] ReAct loop failed, falling back to /api/query for agent (${agentProvider}/${agentModel})`)
+  1126→  1126→    }
+  1127→  1127→    try {
+  1128→  1128→      const baseUrl = process.env.NEXT_PUBLIC_BASE_URL || 'http://localhost:3000'
+  1129→  1129→      const queryRes = await fetch(`${baseUrl}/api/query`, {
+  1130→  1130→        method: 'POST',
+  1131→  1131→        headers: { 'Content-Type': 'application/json' },
+  1132→  1132→        body: JSON.stringify({
+  1133→  1133→          query: lastUserContent,
+  1134→  1134→          options: {
+  1135→  1135→            chatHistory: messages.filter((m: { role: string }) => m.role === 'user' || m.role === 'assistant').slice(-6).map((m: { role: string; content: string }) => ({ role: m.role, content: m.content })),
+  1136→  1136→            // Skip meta-cognitive reasoning for chat flow — reduces latency by ~15s
+  1137→  1137→            // KB results are already enriched with memories in the system prompt
+  1138→  1138→            skipMetaCog: true,
+  1139→  1139→            ...(agentTemperature !== undefined ? { temperature: agentTemperature } : {}),
+  1140→  1140→            ...(agentMaxTokens !== undefined ? { maxTokens: agentMaxTokens } : {}),
+  1141→  1141→            ...(agentProfileId ? { agentId: agentProfileId } : {}),
+  1142→  1142→            ...(agentProfileName ? { agentName: agentProfileName } : {}),
+  1143→  1143→            ...(agentProvider ? { agentProvider } : {}),
+  1144→  1144→            ...(agentModel ? { agentModel } : {}),
+  1145→  1145→          },
+  1146→  1146→        }),
+  1147→  1147→        signal: AbortSignal.timeout(60000),
+  1148→  1148→      })
+  1149→  1149→
+  1150→  1150→      if (queryRes.ok) {
+  1151→  1151→        const data = await queryRes.json()
+  1152→  1152→        const content = data.answer || 'Không thể tạo câu trả lời.'
+  1153→  1153→
+  1154→  1154→        // If this was a code query but OpenCode was offline, add a note
+  1155→  1155→        const codeNote = isCodeQuery(lastUserContent)
+  1156→  1156→          ? '\n\n⚠️ **OpenCode Server đang offline** — Không thể thực hiện code editing. Kết quả trên chỉ dựa trên Knowledge Base. Hãy bật OpenCode Server để sử dụng đầy đủ tính năng code.'
+  1157→  1157→          : ''
+  1158→  1158→
+  1159→  1159→        // Track session (include agentProfileId if from an Agent)
+  1160→  1160→        // NOTE: agentTemperature/agentMaxTokens are now passed to the local fallback via /api/query
+  1161→  1161→        if (sessionId) {
+  1162→  1162→          try {
+  1163→  1163→            await db.agentSession.upsert({
+  1164→  1164→              where: { sessionId },
+  1165→  1165→              create: {
+  1166→  1166→                sessionId,
+  1167→  1167→                model: model || 'local-rag',
+  1168→  1168→                provider: 'local-fallback',
+  1169→  1169→                title: messages[0]?.content?.slice(0, 50) || 'New Chat',
+  1170→  1170→                messageCount: messages.length + 1,
+  1171→  1171→                agentProfileId: agentProfileId || null,
+  1172→  1172→                teamMode: teamMode || null,
+  1173→  1173→                teamName: teamName || null,
+  1174→  1174→              },
+  1175→  1175→              update: {
+  1176→  1176→                messageCount: { increment: 1 },
+  1177→  1177→              },
+  1178→  1178→            })
+  1179→  1179→          } catch {}
+  1180→  1180→        }
+  1181→  1181→
+  1182→  1182→        // Phase 4: Auto-Learn — if agent has provider/model and confidence is in learning zone,
+  1183→  1183→        // trigger background learning so the knowledge is available for future queries.
+  1184→  1184→        // Non-blocking: fire-and-forget, don't delay the response.
+  1185→  1185→        const queryConfidence = data.confidence ?? 0
+  1186→  1186→        const hasAgent = !!(agentProfileId && agentProvider && agentModel)
+  1187→  1187→        if (shouldAutoLearn(queryConfidence, hasAgent)) {
+  1188→  1188→          autoLearnFromAnswer({
+  1189→  1189→            query: lastUserContent,
+  1190→  1190→            answer: content,
+  1191→  1191→            confidence: queryConfidence,
+  1192→  1192→            agentId: agentProfileId!,
+  1193→  1193→            agentName: agentProfileName || 'unknown',
+  1194→  1194→            provider: agentProvider!,
+  1195→  1195→            model: agentModel!,
+  1196→  1196→            sources: data.sources,
+  1197→  1197→          }).catch(err => console.error('[AutoLearn] Background error:', err instanceof Error ? err.message : String(err)))
+  1198→  1198→        }
+  1199→  1199→
+  1200→  1200→        // Phase 5: Memory & Learning — save messages + extract memories in background
+  1201→  1201→        // Non-blocking: fire-and-forget, don't delay the response.
+  1202→  1202→        if (agentProfileId && sessionId) {
+  1203→  1203→          // Save chat messages to DB for persistence
+  1204→  1204→          saveChatMessages(sessionId, [
+  1205→  1205→            { role: 'user', content: lastUserContent },
+  1206→  1206→            { role: 'assistant', content, model: agentModel || model, provider: agentProvider || 'local-fallback', metadata: { confidence: queryConfidence, sources: data.sources?.length || 0 } },
+  1207→  1207→          ]).catch(err => console.warn('[Memory] Failed to save chat messages:', err instanceof Error ? err.message : String(err)))
+  1208→  1208→
+  1209→  1209→          // Extract memories from this conversation (skip trivial exchanges to save LLM tokens)
+  1210→  1210→          if (!isTrivialExchange(lastUserContent, content)) {
+  1211→  1211→            extractMemoriesFromConversation({
+  1212→  1212→              agentId: agentProfileId,
+  1213→  1213→              agentName: agentProfileName || 'unknown',
+  1214→  1214→              sessionId,
+  1215→  1215→              userMessage: lastUserContent,
+  1216→  1216→              assistantMessage: content,
+  1217→  1217→            }).catch(err => console.warn('[Memory] Failed to extract memories:', err instanceof Error ? err.message : String(err)))
+  1218→  1218→          }
+  1219→  1219→
+  1220→  1220→          // Periodic memory decay — every ~20 chat requests, decay old memories
+  1221→  1221→          // This prevents stale memories from accumulating without requiring a cron scheduler
+  1222→  1222→          memoryDecayCounter++
+  1223→  1223→          if (memoryDecayCounter >= 20 && agentProfileId) {
+  1224→  1224→            memoryDecayCounter = 0
+  1225→  1225→            decayMemories(agentProfileId).catch(err =>
+  1226→  1226→              console.warn('[Memory] Periodic decay error:', err instanceof Error ? err.message : String(err))
+  1227→  1227→            )
+  1228→  1228→          }
+  1229→  1229→        }
+  1230→  1230→
+  1231→  1231→        return NextResponse.json({
+  1232→  1232→          content: content + codeNote,
+  1233→  1233→          model: model || 'local-rag',
+  1234→  1234→          provider: 'local-fallback',
+  1235→  1235→          sessionId: sessionId || `session-${Date.now()}`,
+  1236→  1236→          agentProfileId: agentProfileId || undefined,
+  1237→  1237→          sources: data.sources || [],
+  1238→  1238→          confidence: data.confidence,
+  1239→  1239→          kbResults: 'included',
+  1240→  1240→          codeQuery: isCodeQuery(lastUserContent) || undefined,
+  1241→  1241→          memoriesRecalled: recalledMemories.length || undefined,
+  1242→  1242→        })
+  1243→  1243→      }
+  1244→  1244→    } catch (err) {
+  1245→  1245→      console.warn('[OpenClaw Chat] Local fallback error:', err instanceof Error ? err.message : String(err))
+  1246→  1246→    }
+  1247→  1247→
+  1248→  1248→    // Final fallback: mock response
+  1249→  1249→    const userContent = lastUserContent || ''
+  1250→  1250→    const mockContent = userContent.toLowerCase().includes('hello') || userContent.toLowerCase().includes('hi')
+  1251→  1251→      ? `Xin chào! Tôi là AI Agent của The Magnum Opus. Gateway hiện đang offline nên tôi hoạt động ở chế độ mock. Hãy kết nối Gateway để nhận phản hồi AI thực sự.`
+  1252→  1252→      : `Tôi đã nhận tin nhắn của bạn: "${userContent.slice(0, 100)}${userContent.length > 100 ? '...' : ''}"\n\nOpenClaw Gateway đang offline và Knowledge Base cũng không khả dụng. Tôi đang ở chế độ mock. Vui lòng kiểm tra kết nối.`
+  1253→  1253→
+  1254→  1254→    return NextResponse.json({
+  1255→  1255→      content: mockContent,
+  1256→  1256→      model: model || 'mock',
+  1257→  1257→      provider: 'mock',
+  1258→  1258→      sessionId: sessionId || `session-${Date.now()}`,
+  1259→  1259→      kbResults: 'none',
+  1260→  1260→    })
+  1261→  1261→  } catch (err) {
+  1262→  1262→    return NextResponse.json(
+  1263→  1263→      { error: 'Invalid request body', details: err instanceof Error ? err.message : String(err) },
+  1264→  1264→      { status: 400 }
+  1265→  1265→    )
+  1266→  1266→  }
+  1267→  1267→}
+  1268→  1268→

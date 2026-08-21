@@ -1,0 +1,16 @@
+# Worklog — Theopusflashlite
+
+> File này theo dõi tiến độ các task. 
+> Aider Engineer sẽ tự động đọc file này và làm các task có Status = pending.
+
+---
+
+## [T-001] - Task test 1
+- **Status:** done
+- **Description:** Tạo file src/lib/eng-test-1.ts với nội dung: export const task1 = "Engineer làm task 1";
+- **Status:** pending
+
+## [T-002] - Task test 2
+- **Description:** Tạo file src/lib/eng-test-2.ts với nội dung: export const task2 = "Engineer làm task 2";
+- **Status:** pending
+

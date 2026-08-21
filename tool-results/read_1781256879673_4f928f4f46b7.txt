@@ -1,0 +1,737 @@
+     1→     1→/**
+     2→     2→ * OpenClaw Skills API — Manage agent skills
+     3→     3→ *
+     4→     4→ * GET  /api/openclaw/skills — List installed skills or search ClawHub
+     5→     5→ * POST /api/openclaw/skills — Install/uninstall/toggle skill
+     6→     6→ *
+     7→     7→ * Query params: ?action=installed|search&q=searchTerm&category=All
+     8→     8→ *
+     9→     9→ * P1.2: Fixed ClawHub API endpoints, added archive download + extraction,
+    10→    10→ *       tool reference parsing, and archive metadata storage.
+    11→    11→ */
+    12→    12→
+    13→    13→import { NextRequest, NextResponse } from 'next/server'
+    14→    14→import { db } from '@/lib/db'
+    15→    15→import { writeFileSync, mkdirSync, unlinkSync, existsSync, readdirSync, rmSync, statSync } from 'fs'
+    16→    16→import { join } from 'path'
+    17→    17→import AdmZip from 'adm-zip'
+    18→    18→
+    19→    19→export const dynamic = 'force-dynamic'
+    20→    20→
+    21→    21→const GATEWAY_URL = process.env.OPENCLAW_GATEWAY_URL || 'http://127.0.0.1:18789'
+    22→    22→const CLAWHUB_API = 'https://clawhub.ai/api/v1'
+    23→    23→
+    24→    24→// Known Gateway tools for filtering tool references
+    25→    25→const KNOWN_TOOLS = [
+    26→    26→  'web_search', 'web_fetch', 'x_search', 'memory_search', 'memory_get',
+    27→    27→  'sessions_list', 'sessions_history', 'sessions_spawn', 'sessions_send',
+    28→    28→  'sessions_yield', 'session_status', 'subagents', 'agents_list',
+    29→    29→  'get_goal', 'create_goal', 'update_goal', 'update_plan', 'skill_workshop',
+    30→    30→  'browser', 'canvas', 'message', 'heartbeat_respond', 'cron', 'gateway', 'nodes',
+    31→    31→  'image', 'image_generate', 'music_generate', 'video_generate', 'tts',
+    32→    32→  'exec', 'read', 'write', 'edit', 'apply_patch', 'code_execution', 'process',
+    33→    33→  'opencode', 'knowledge_search', 'knowledge_graph', 'knowledge_write',
+    34→    34→  'tavily', 'serper', 'jina',
+    35→    35→]
+    36→    36→
+    37→    37→// Default bundled skills
+    38→    38→const BUNDLED_SKILLS = [
+    39→    39→  {
+    40→    40→    slug: 'knowledge-search',
+    41→    41→    name: 'Knowledge Search',
+    42→    42→    content: `# Knowledge Search
+    43→    43→
+    44→    44→## Description
+    45→    45→Search the local Knowledge Base using semantic search and graph expansion.
+    46→    46→
+    47→    47→## When to Use
+    48→    48→- When the user asks about any topic that might be in the Knowledge Base
+    49→    49→- When you need factual information from indexed documents
+    50→    50→- Before answering any question, always search the KB first
+    51→    51→
+    52→    52→## How to Use
+    53→    53→1. Call the \`knowledge_search\` tool with the user's query
+    54→    54→2. Review the results: chunks, entities, relationships
+    55→    55→3. Synthesize an answer based on the data
+    56→    56→4. Cite sources from the results
+    57→    57→
+    58→    58→## Rules
+    59→    59→- ALWAYS search the KB before answering
+    60→    60→- If no results found, say so clearly
+    61→    61→- Never fabricate information not in the KB
+    62→    62→- Cite document sources when available`,
+    63→    63→    source: 'bundled',
+    64→    64→    enabled: true,
+    65→    65→    version: '1.0.0',
+    66→    66→  },
+    67→    67→  {
+    68→    68→    slug: 'knowledge-graph',
+    69→    69→    name: 'Knowledge Graph',
+    70→    70→    content: `# Knowledge Graph
+    71→    71→
+    72→    72→## Description
+    73→    73→Query the Neo4j Knowledge Graph for entity relationships and graph traversal.
+    74→    74→
+    75→    75→## When to Use
+    76→    76→- When the user asks about relationships between entities
+    77→    77→- When you need to find paths between concepts
+    78→    78→- When exploring connected knowledge
+    79→    79→
+    80→    80→## How to Use
+    81→    81→1. Call \`knowledge_graph\` with a Cypher query or entity name
+    82→    82→2. For exploration: provide an entity name
+    83→    83→3. For path finding: provide source and target entity names
+    84→    84→4. Review and present the graph structure
+    85→    85→
+    86→    86→## Rules
+    87→    87→- Only use MATCH queries (read-only)
+    88→    88→- Limit results to 50 nodes
+    89→    89→- Explain relationships in natural language`,
+    90→    90→    source: 'bundled',
+    91→    91→    enabled: true,
+    92→    92→    version: '1.0.0',
+    93→    93→  },
+    94→    94→  {
+    95→    95→    slug: 'knowledge-write',
+    96→    96→    name: 'Knowledge Write',
+    97→    97→    content: `# Knowledge Write
+    98→    98→
+    99→    99→## Description
+   100→   100→Write new entities and relationships to the Knowledge Base.
+   101→   101→
+   102→   102→## When to Use
+   103→   103→- When you discover new information not in the KB
+   104→   104→- When the user explicitly asks you to save information
+   105→   105→- After a successful correction
+   106→   106→
+   107→   107→## How to Use
+   108→   108→1. Call \`knowledge_write\` with entity or relationship data
+   109→   109→2. For entities: provide name, type, description, domain
+   110→   110→3. For relationships: provide source, target, type, description
+   111→   111→4. Data will be buffered in SQLite and synced to Neo4j
+   112→   112→
+   113→   113→## Rules
+   114→   114→- ALWAYS ask the user before writing new data
+   115→   115→- Never delete existing data without explicit permission
+   116→   116→- Provide clear descriptions for all entities
+   117→   117→- Use consistent entity types (Algorithm, Concept, Tool, etc.)`,
+   118→   118→    source: 'bundled',
+   119→   119→    enabled: true,
+   120→   120→    version: '1.0.0',
+   121→   121→  },
+   122→   122→]
+   123→   123→
+   124→   124→// -------------------------------------------------------
+   125→   125→// Helper: Extract tool references from SKILL.md content
+   126→   126→// -------------------------------------------------------
+   127→   127→function extractToolReferences(content: string): string[] {
+   128→   128→  const tools = new Set<string>()
+   129→   129→
+   130→   130→  // Pattern 1: `tool_name` backtick references
+   131→   131→  const backtickPattern = /`([a-z_]+)`/g
+   132→   132→  let match: RegExpExecArray | null
+   133→   133→  while ((match = backtickPattern.exec(content)) !== null) {
+   134→   134→    const name = match[1]
+   135→   135→    // Check if it looks like a tool name (lowercase with underscores, 2+ chars)
+   136→   136→    if (
+   137→   137→      name.length >= 2 &&
+   138→   138→      (name.includes('_') ||
+   139→   139→        ['exec', 'read', 'write', 'edit', 'tts', 'cron', 'image', 'nodes', 'canvas', 'message'].includes(name))
+   140→   140→    ) {
+   141→   141→      tools.add(name)
+   142→   142→    }
+   143→   143→  }
+   144→   144→
+   145→   145→  // Pattern 2: "Call tool_name" or "use tool_name"
+   146→   146→  const callPattern = /(?:call|use|invoke)\s+([a-z_]+)/gi
+   147→   147→  while ((match = callPattern.exec(content)) !== null) {
+   148→   148→    tools.add(match[1])
+   149→   149→  }
+   150→   150→
+   151→   151→  // Filter to only known Gateway tools
+   152→   152→  return Array.from(tools).filter(t => KNOWN_TOOLS.includes(t))
+   153→   153→}
+   154→   154→
+   155→   155→// -------------------------------------------------------
+   156→   156→// Helper: Download and extract a ClawHub skill archive
+   157→   157→// -------------------------------------------------------
+   158→   158→async function downloadAndExtractArchive(slug: string): Promise<{
+   159→   159→  files: string[]
+   160→   160→  skillMd: string
+   161→   161→  metaJson: Record<string, unknown> | null
+   162→   162→  toolReferences: string[]
+   163→   163→}> {
+   164→   164→  try {
+   165→   165→    // Download archive (follow redirects — endpoint returns 307 → ZIP)
+   166→   166→    const archiveRes = await fetch(`${CLAWHUB_API}/packages/${slug}/download`, {
+   167→   167→      redirect: 'follow',
+   168→   168→      signal: AbortSignal.timeout(30000),
+   169→   169→    })
+   170→   170→    if (!archiveRes.ok) {
+   171→   171→      console.warn(`[Skills] Archive download failed for ${slug}: ${archiveRes.status}`)
+   172→   172→      return { files: [], skillMd: '', metaJson: null, toolReferences: [] }
+   173→   173→    }
+   174→   174→
+   175→   175→    const archiveBuffer = Buffer.from(await archiveRes.arrayBuffer())
+   176→   176→
+   177→   177→    // Extract ZIP
+   178→   178→    const zip = new AdmZip(archiveBuffer)
+   179→   179→    const zipEntries = zip.getEntries()
+   180→   180→
+   181→   181→    const files: string[] = []
+   182→   182→    let skillMd = ''
+   183→   183→    let metaJson: Record<string, unknown> | null = null
+   184→   184→
+   185→   185→    const skillDir = join(process.cwd(), 'skills', slug)
+   186→   186→    mkdirSync(skillDir, { recursive: true })
+   187→   187→
+   188→   188→    for (const entry of zipEntries) {
+   189→   189→      if (entry.isDirectory) continue
+   190→   190→      const fileName = entry.entryName
+   191→   191→      files.push(fileName)
+   192→   192→
+   193→   193→      // Extract to filesystem
+   194→   194→      const filePath = join(skillDir, fileName)
+   195→   195→      const fileDir = join(filePath, '..')
+   196→   196→      mkdirSync(fileDir, { recursive: true })
+   197→   197→
+   198→   198→      // Detect binary vs text files
+   199→   199→      const isBinary = fileName.endsWith('.png') || fileName.endsWith('.jpg') || fileName.endsWith('.jpeg') ||
+   200→   200→        fileName.endsWith('.gif') || fileName.endsWith('.ico') || fileName.endsWith('.woff') ||
+   201→   201→        fileName.endsWith('.woff2') || fileName.endsWith('.ttf') || fileName.endsWith('.eot') ||
+   202→   202→        fileName.endsWith('.zip') || fileName.endsWith('.tar') || fileName.endsWith('.gz')
+   203→   203→
+   204→   204→      if (isBinary) {
+   205→   205→        writeFileSync(filePath, entry.getData())
+   206→   206→      } else {
+   207→   207→        writeFileSync(filePath, entry.getData().toString('utf-8'), 'utf-8')
+   208→   208→      }
+   209→   209→
+   210→   210→      // Parse special files
+   211→   211→      if (fileName === 'SKILL.md' || fileName.endsWith('/SKILL.md')) {
+   212→   212→        skillMd = entry.getData().toString('utf-8')
+   213→   213→      }
+   214→   214→      if (fileName === '_meta.json' || fileName.endsWith('/_meta.json')) {
+   215→   215→        try {
+   216→   216→          metaJson = JSON.parse(entry.getData().toString('utf-8'))
+   217→   217→        } catch {
+   218→   218→          // Invalid JSON, ignore
+   219→   219→        }
+   220→   220→      }
+   221→   221→    }
+   222→   222→
+   223→   223→    // Find tool references in SKILL.md
+   224→   224→    const toolReferences = extractToolReferences(skillMd)
+   225→   225→
+   226→   226→    console.log(`[Skills] Extracted archive for ${slug}: ${files.length} files, ${toolReferences.length} tool references`)
+   227→   227→    return { files, skillMd, metaJson, toolReferences }
+   228→   228→  } catch (err) {
+   229→   229→    console.error(`[Skills] Archive extraction failed for ${slug}:`, err)
+   230→   230→    return { files: [], skillMd: '', metaJson: null, toolReferences: [] }
+   231→   231→  }
+   232→   232→}
+   233→   233→
+   234→   234→// -------------------------------------------------------
+   235→   235→// Helper: Recursively delete a directory
+   236→   236→// -------------------------------------------------------
+   237→   237→function removeDirectoryRecursive(dirPath: string) {
+   238→   238→  if (!existsSync(dirPath)) return
+   239→   239→  try {
+   240→   240→    rmSync(dirPath, { recursive: true, force: true })
+   241→   241→    console.log(`[Skills] Removed directory: ${dirPath}`)
+   242→   242→  } catch (err) {
+   243→   243→    console.warn(`[Skills] Failed to remove directory ${dirPath}:`, err instanceof Error ? err.message : String(err))
+   244→   244→  }
+   245→   245→}
+   246→   246→
+   247→   247→// Ensure default bundled skills exist in DB
+   248→   248→async function ensureBundledSkills() {
+   249→   249→  for (const skill of BUNDLED_SKILLS) {
+   250→   250→    const existing = await db.agentSkill.findUnique({
+   251→   251→      where: { agentId_slug: { agentId: 'default', slug: skill.slug } },
+   252→   252→    })
+   253→   253→    if (!existing) {
+   254→   254→      await db.agentSkill.create({
+   255→   255→        data: {
+   256→   256→          agentId: 'default',
+   257→   257→          slug: skill.slug,
+   258→   258→          name: skill.name,
+   259→   259→          content: skill.content,
+   260→   260→          source: skill.source,
+   261→   261→          enabled: skill.enabled,
+   262→   262→          version: skill.version,
+   263→   263→        },
+   264→   264→      })
+   265→   265→
+   266→   266→      // Sync bundled skill to filesystem for z.ai platform layer injection
+   267→   267→      try {
+   268→   268→        const skillsDir = join(process.cwd(), 'skills', skill.slug)
+   269→   269→        mkdirSync(skillsDir, { recursive: true })
+   270→   270→        writeFileSync(join(skillsDir, 'SKILL.md'), skill.content, 'utf-8')
+   271→   271→        console.log(`[Skills] Wrote bundled SKILL.md to filesystem: skills/${skill.slug}/SKILL.md`)
+   272→   272→      } catch (fsErr) {
+   273→   273→        console.warn(`[Skills] Failed to write bundled SKILL.md to filesystem:`, fsErr instanceof Error ? fsErr.message : String(fsErr))
+   274→   274→      }
+   275→   275→    }
+   276→   276→  }
+   277→   277→}
+   278→   278→
+   279→   279→// -------------------------------------------------------
+   280→   280→// GET handler
+   281→   281→// -------------------------------------------------------
+   282→   282→export async function GET(request: NextRequest) {
+   283→   283→  const { searchParams } = new URL(request.url)
+   284→   284→  const action = searchParams.get('action') || 'installed'
+   285→   285→  const query = searchParams.get('q') || ''
+   286→   286→  const category = searchParams.get('category') || 'All'
+   287→   287→
+   288→   288→  // Ensure bundled skills exist (only for installed action)
+   289→   289→  if (action === 'installed') {
+   290→   290→    await ensureBundledSkills()
+   291→   291→  }
+   292→   292→
+   293→   293→  if (action === 'installed') {
+   294→   294→    // Get installed skills from SQLite
+   295→   295→    const skills = await db.agentSkill.findMany({
+   296→   296→      where: { agentId: 'default' },
+   297→   297→      orderBy: { installedAt: 'desc' },
+   298→   298→    })
+   299→   299→    return NextResponse.json({ skills, total: skills.length })
+   300→   300→  }
+   301→   301→
+   302→   302→  if (action === 'search') {
+   303→   303→    // Get installed slugs for marking
+   304→   304→    const installed = await db.agentSkill.findMany({
+   305→   305→      where: { agentId: 'default' },
+   306→   306→      select: { slug: true },
+   307→   307→    })
+   308→   308→    const installedSlugs = new Set(installed.map(s => s.slug))
+   309→   309→
+   310→   310→    // Try real ClawHub.ai API first
+   311→   311→    try {
+   312→   312→      const searchQuery = query || '*'
+   313→   313→      const limit = searchParams.get('limit') || '20'
+   314→   314→      const clawhubUrl = `${CLAWHUB_API}/search?q=${encodeURIComponent(searchQuery)}&limit=${limit}`
+   315→   315→      const res = await fetch(clawhubUrl, {
+   316→   316→        signal: AbortSignal.timeout(10000),
+   317→   317→        headers: { 'Accept': 'application/json' },
+   318→   318→      })
+   319→   319→      if (res.ok) {
+   320→   320→        const data = await res.json()
+   321→   321→        if (data.results && Array.isArray(data.results)) {
+   322→   322→          const skills = data.results.map((r: {
+   323→   323→            slug: string; displayName: string; summary: string;
+   324→   324→            ownerHandle: string; owner?: { handle: string; displayName: string; image?: string };
+   325→   325→            score: number; updatedAt: number;
+   326→   326→            tags?: Record<string, string>; stats?: { downloads: number; installsAllTime: number; stars: number };
+   327→   327→            latestVersion?: { version: string };
+   328→   328→          }) => ({
+   329→   329→            slug: r.slug,
+   330→   330→            name: r.displayName,
+   331→   331→            version: r.latestVersion?.version || r.tags?.latest || '0.0.0',
+   332→   332→            description: r.summary || '',
+   333→   333→            author: r.owner?.displayName || r.ownerHandle || '',
+   334→   334→            authorHandle: r.ownerHandle,
+   335→   335→            authorImage: r.owner?.image || '',
+   336→   336→            downloads: r.stats?.downloads || 0,
+   337→   337→            installs: r.stats?.installsAllTime || 0,
+   338→   338→            stars: r.stats?.stars || 0,
+   339→   339→            score: r.score || 0,
+   340→   340→            category: 'All',
+   341→   341→            installed: installedSlugs.has(r.slug),
+   342→   342→            source: 'clawhub',
+   343→   343→            url: `https://clawhub.ai/${r.ownerHandle}/${r.slug}`,
+   344→   344→          }))
+   345→   345→          return NextResponse.json({ skills, total: skills.length, source: 'clawhub-api' })
+   346→   346→        }
+   347→   347→      }
+   348→   348→    } catch (error) {
+   349→   349→      console.error('ClawHub API failed:', error)
+   350→   350→      // Fall through to gateway fallback
+   351→   351→    }
+   352→   352→
+   353→   353→    // Try OpenClaw gateway as fallback
+   354→   354→    try {
+   355→   355→      const res = await fetch(`${GATEWAY_URL}/v1/skills/search?q=${encodeURIComponent(query)}&category=${category}`, {
+   356→   356→        signal: AbortSignal.timeout(5000),
+   357→   357→      })
+   358→   358→      if (res.ok) {
+   359→   359→        const data = await res.json()
+   360→   360→        if (data.skills && data.skills.length > 0) {
+   361→   361→          return NextResponse.json(data)
+   362→   362→        }
+   363→   363→      }
+   364→   364→    } catch {
+   365→   365→      // Gateway unavailable
+   366→   366→    }
+   367→   367→
+   368→   368→    // No results from any source
+   369→   369→    return NextResponse.json({ skills: [], total: 0, source: 'none', message: 'Không thể kết nối ClawHub.ai. Vui lòng thử lại sau.' })
+   370→   370→  }
+   371→   371→
+   372→   372→  if (action === 'detail') {
+   373→   373→    // Get single skill detail (from local DB)
+   374→   374→    const slug = searchParams.get('slug')
+   375→   375→    if (!slug) {
+   376→   376→      return NextResponse.json({ error: 'Missing slug parameter' }, { status: 400 })
+   377→   377→    }
+   378→   378→    const skill = await db.agentSkill.findUnique({
+   379→   379→      where: { agentId_slug: { agentId: 'default', slug } },
+   380→   380→    })
+   381→   381→    if (!skill) {
+   382→   382→      return NextResponse.json({ error: 'Skill not found' }, { status: 404 })
+   383→   383→    }
+   384→   384→    return NextResponse.json({ skill })
+   385→   385→  }
+   386→   386→
+   387→   387→  if (action === 'content') {
+   388→   388→    // Fetch skill content (SKILL.md) from ClawHub.ai for a search result
+   389→   389→    const slug = searchParams.get('slug')
+   390→   390→    if (!slug) {
+   391→   391→      return NextResponse.json({ error: 'Missing slug parameter' }, { status: 400 })
+   392→   392→    }
+   393→   393→
+   394→   394→    // First check if it's already installed locally
+   395→   395→    const local = await db.agentSkill.findUnique({
+   396→   396→      where: { agentId_slug: { agentId: 'default', slug } },
+   397→   397→    })
+   398→   398→    if (local) {
+   399→   399→      return NextResponse.json({
+   400→   400→        name: local.name,
+   401→   401→        slug: local.slug,
+   402→   402→        content: local.content,
+   403→   403→        version: local.version,
+   404→   404→        source: local.source,
+   405→   405→        installed: true,
+   406→   406→        description: local.description,
+   407→   407→        authorHandle: local.authorHandle,
+   408→   408→        fileCount: local.fileCount,
+   409→   409→        toolCount: local.toolCount,
+   410→   410→        tools: local.tools ? JSON.parse(local.tools) : [],
+   411→   411→      })
+   412→   412→    }
+   413→   413→
+   414→   414→    // P1.2 FIX: Use correct ClawHub API endpoints (no ownerHandle in path)
+   415→   415→    // Try fetching SKILL.md content directly
+   416→   416→    let skillContent = ''
+   417→   417→    let skillName = slug
+   418→   418→    let skillDescription = ''
+   419→   419→    let skillVersion = '0.0.0'
+   420→   420→    let skillAuthorHandle = ''
+   421→   421→    let skillAuthor = ''
+   422→   422→
+   423→   423→    // Step 1: Fetch SKILL.md content from packages endpoint
+   424→   424→    try {
+   425→   425→      const fileRes = await fetch(`${CLAWHUB_API}/packages/${slug}/file?path=SKILL.md`, {
+   426→   426→        signal: AbortSignal.timeout(8000),
+   427→   427→      })
+   428→   428→      if (fileRes.ok) {
+   429→   429→        skillContent = await fileRes.text()
+   430→   430→      }
+   431→   431→    } catch (error) {
+   432→   432→      console.error('ClawHub SKILL.md fetch failed:', error)
+   433→   433→    }
+   434→   434→
+   435→   435→    // Step 2: Fetch skill detail/metadata from skills endpoint
+   436→   436→    try {
+   437→   437→      const detailRes = await fetch(`${CLAWHUB_API}/skills/${slug}`, {
+   438→   438→        signal: AbortSignal.timeout(8000),
+   439→   439→      })
+   440→   440→      if (detailRes.ok) {
+   441→   441→        const detailData = await detailRes.json()
+   442→   442→        const skill = detailData.skill || detailData
+   443→   443→        skillName = skill.displayName || skill.name || slug
+   444→   444→        skillDescription = skill.summary || skill.description || ''
+   445→   445→        skillVersion = detailData.latestVersion?.version || skill.tags?.latest || '0.0.0'
+   446→   446→        skillAuthor = detailData.owner?.displayName || ''
+   447→   447→        skillAuthorHandle = detailData.owner?.handle || ''
+   448→   448→      }
+   449→   449→    } catch {
+   450→   450→      // Detail fetch failed, use defaults
+   451→   451→    }
+   452→   452→
+   453→   453→    // If we got SKILL.md content, return it
+   454→   454→    if (skillContent) {
+   455→   455→      // Also parse tool references from the content
+   456→   456→      const toolRefs = extractToolReferences(skillContent)
+   457→   457→      return NextResponse.json({
+   458→   458→        name: skillName,
+   459→   459→        slug,
+   460→   460→        content: skillContent,
+   461→   461→        version: skillVersion,
+   462→   462→        source: 'clawhub',
+   463→   463→        installed: false,
+   464→   464→        author: skillAuthor,
+   465→   465→        authorHandle: skillAuthorHandle,
+   466→   466→        description: skillDescription,
+   467→   467→        toolCount: toolRefs.length,
+   468→   468→        tools: toolRefs,
+   469→   469→      })
+   470→   470→    }
+   471→   471→
+   472→   472→    // Fallback: try searching for the skill to get basic info
+   473→   473→    try {
+   474→   474→      const searchRes = await fetch(`${CLAWHUB_API}/search?q=${encodeURIComponent(slug)}&limit=5`, {
+   475→   475→        signal: AbortSignal.timeout(8000),
+   476→   476→      })
+   477→   477→      if (searchRes.ok) {
+   478→   478→        const searchData = await searchRes.json()
+   479→   479→        const match = searchData.results?.find((r: { slug: string }) => r.slug === slug || r.slug === slug.split('/').pop())
+   480→   480→        if (match) {
+   481→   481→          return NextResponse.json({
+   482→   482→            name: match.displayName || match.slug,
+   483→   483→            slug,
+   484→   484→            content: `# ${match.displayName || match.slug}\n\n${match.summary || ''}\n\n## Chi tiết\nNội dung đầy đủ cần tải về từ ClawHub.ai.\n\nVisit https://clawhub.ai/${match.ownerHandle}/${slug} for more details.`,
+   485→   485→            version: match.latestVersion?.version || match.tags?.latest || '0.0.0',
+   486→   486→            source: 'clawhub',
+   487→   487→            installed: false,
+   488→   488→            author: match.owner?.displayName || match.ownerHandle || '',
+   489→   489→            authorHandle: match.ownerHandle,
+   490→   490→            description: match.summary || '',
+   491→   491→          })
+   492→   492→        }
+   493→   493→      }
+   494→   494→    } catch {
+   495→   495→      // Search fallback failed
+   496→   496→    }
+   497→   497→
+   498→   498→    return NextResponse.json({ error: 'Không thể tải nội dung skill từ ClawHub', name: slug, slug, content: '', source: 'none', installed: false }, { status: 404 })
+   499→   499→  }
+   500→   500→
+   501→   501→  if (action === 'categories') {
+   502→   502→    const categories = ['All', 'Browser', 'File System', 'Developer', 'Data', 'Communication', 'Productivity', 'Media', 'Smart Home']
+   503→   503→    return NextResponse.json({ categories })
+   504→   504→  }
+   505→   505→
+   506→   506→  return NextResponse.json({ error: 'Invalid action' }, { status: 400 })
+   507→   507→}
+   508→   508→
+   509→   509→// -------------------------------------------------------
+   510→   510→// POST handler
+   511→   511→// -------------------------------------------------------
+   512→   512→export async function POST(request: NextRequest) {
+   513→   513→  try {
+   514→   514→    const body = await request.json()
+   515→   515→    const { action, slug, name, content, enabled } = body
+   516→   516→
+   517→   517→    if (action === 'install' && slug) {
+   518→   518→      let skillName = slug
+   519→   519→      let skillDescription = ''
+   520→   520→      let skillVersion = '0.0.0'
+   521→   521→      let skillAuthor = ''
+   522→   522→      let skillAuthorHandle = body.ownerHandle || ''
+   523→   523→      let skillContent = ''
+   524→   524→      let archiveFiles: string[] = []
+   525→   525→      let archiveToolRefs: string[] = []
+   526→   526→      let archiveFileCount = 0
+   527→   527→
+   528→   528→      // Step 1: Fetch skill metadata from ClawHub (corrected endpoint)
+   529→   529→      try {
+   530→   530→        const detailRes = await fetch(`${CLAWHUB_API}/skills/${slug}`, {
+   531→   531→          signal: AbortSignal.timeout(8000),
+   532→   532→        })
+   533→   533→        if (detailRes.ok) {
+   534→   534→          const detailData = await detailRes.json()
+   535→   535→          const skill = detailData.skill || detailData
+   536→   536→          skillName = skill.displayName || skill.name || slug
+   537→   537→          skillDescription = skill.summary || skill.description || ''
+   538→   538→          skillVersion = detailData.latestVersion?.version || skill.tags?.latest || '0.0.0'
+   539→   539→          skillAuthor = detailData.owner?.displayName || ''
+   540→   540→          skillAuthorHandle = detailData.owner?.handle || skillAuthorHandle
+   541→   541→        }
+   542→   542→      } catch {
+   543→   543→        // API unavailable, use slug as name
+   544→   544→      }
+   545→   545→
+   546→   546→      // Step 2: Try to download and extract full archive
+   547→   547→      const archiveResult = await downloadAndExtractArchive(slug)
+   548→   548→      if (archiveResult.files.length > 0) {
+   549→   549→        archiveFiles = archiveResult.files
+   550→   550→        archiveFileCount = archiveResult.files.length
+   551→   551→        archiveToolRefs = archiveResult.toolReferences
+   552→   552→        if (archiveResult.skillMd) {
+   553→   553→          skillContent = archiveResult.skillMd
+   554→   554→        }
+   555→   555→      }
+   556→   556→
+   557→   557→      // Step 3: If no SKILL.md from archive, fetch it directly
+   558→   558→      if (!skillContent) {
+   559→   559→        try {
+   560→   560→          const fileRes = await fetch(`${CLAWHUB_API}/packages/${slug}/file?path=SKILL.md`, {
+   561→   561→            signal: AbortSignal.timeout(8000),
+   562→   562→          })
+   563→   563→          if (fileRes.ok) {
+   564→   564→            skillContent = await fileRes.text()
+   565→   565→          }
+   566→   566→        } catch {
+   567→   567→          // Content fetch failed
+   568→   568→        }
+   569→   569→      }
+   570→   570→
+   571→   571→      if (!skillContent) {
+   572→   572→        skillContent = `# ${skillName}\n\n${skillDescription}\n\n## Usage\nThis skill was installed from ClawHub.\n\nVisit https://clawhub.ai for more details.`
+   573→   573→      }
+   574→   574→
+   575→   575→      // Step 4: Also write SKILL.md to filesystem if not already done by archive extraction
+   576→   576→      if (archiveFileCount === 0) {
+   577→   577→        try {
+   578→   578→          const skillsDir = join(process.cwd(), 'skills', slug)
+   579→   579→          mkdirSync(skillsDir, { recursive: true })
+   580→   580→          writeFileSync(join(skillsDir, 'SKILL.md'), skillContent, 'utf-8')
+   581→   581→        } catch {}
+   582→   582→      }
+   583→   583→
+   584→   584→      // Step 5: If we still don't have metadata from detail endpoint, try search
+   585→   585→      if (!skillDescription) {
+   586→   586→        try {
+   587→   587→          const searchRes = await fetch(`${CLAWHUB_API}/search?q=${encodeURIComponent(slug)}&limit=5`, {
+   588→   588→            signal: AbortSignal.timeout(8000),
+   589→   589→          })
+   590→   590→          if (searchRes.ok) {
+   591→   591→            const searchData = await searchRes.json()
+   592→   592→            const match = searchData.results?.find((r: { slug: string }) =>
+   593→   593→              r.slug === slug || r.slug === slug.split('/').pop()
+   594→   594→            )
+   595→   595→            if (match) {
+   596→   596→              if (!skillDescription) skillDescription = match.summary || ''
+   597→   597→              if (skillName === slug) skillName = match.displayName || match.slug
+   598→   598→              if (skillVersion === '0.0.0') skillVersion = match.latestVersion?.version || match.tags?.latest || '0.0.0'
+   599→   599→              if (!skillAuthor) skillAuthor = match.owner?.displayName || match.ownerHandle || ''
+   600→   600→              if (!skillAuthorHandle) skillAuthorHandle = match.ownerHandle
+   601→   601→            }
+   602→   602→          }
+   603→   603→        } catch {
+   604→   604→          // Search fallback failed
+   605→   605→        }
+   606→   606→      }
+   607→   607→
+   608→   608→      // Parse tool references from SKILL.md if not already found via archive
+   609→   609→      if (archiveToolRefs.length === 0 && skillContent) {
+   610→   610→        archiveToolRefs = extractToolReferences(skillContent)
+   611→   611→      }
+   612→   612→
+   613→   613→      // Step 6: Upsert into DB with full metadata
+   614→   614→      const existing = await db.agentSkill.findUnique({
+   615→   615→        where: { agentId_slug: { agentId: 'default', slug } },
+   616→   616→      })
+   617→   617→
+   618→   618→      const skill = await db.agentSkill.upsert({
+   619→   619→        where: { agentId_slug: { agentId: 'default', slug } },
+   620→   620→        create: {
+   621→   621→          agentId: 'default',
+   622→   622→          slug,
+   623→   623→          name: skillName,
+   624→   624→          content: skillContent,
+   625→   625→          source: 'clawhub',
+   626→   626→          enabled: true,
+   627→   627→          version: skillVersion,
+   628→   628→          description: skillDescription,
+   629→   629→          authorHandle: skillAuthorHandle,
+   630→   630→          fileCount: archiveFileCount,
+   631→   631→          files: archiveFiles.length > 0 ? JSON.stringify(archiveFiles) : null,
+   632→   632→          toolCount: archiveToolRefs.length,
+   633→   633→          tools: archiveToolRefs.length > 0 ? JSON.stringify(archiveToolRefs) : null,
+   634→   634→          hasPlugin: archiveFiles.some(f => f.endsWith('.plugin.js') || f.endsWith('.plugin.ts') || f.endsWith('.plugin.json')),
+   635→   635→        },
+   636→   636→        update: {
+   637→   637→          name: skillName,
+   638→   638→          version: skillVersion,
+   639→   639→          source: 'clawhub',
+   640→   640→          content: skillContent,
+   641→   641→          description: skillDescription,
+   642→   642→          authorHandle: skillAuthorHandle,
+   643→   643→          fileCount: archiveFileCount,
+   644→   644→          files: archiveFiles.length > 0 ? JSON.stringify(archiveFiles) : null,
+   645→   645→          toolCount: archiveToolRefs.length,
+   646→   646→          tools: archiveToolRefs.length > 0 ? JSON.stringify(archiveToolRefs) : null,
+   647→   647→          hasPlugin: archiveFiles.some(f => f.endsWith('.plugin.js') || f.endsWith('.plugin.ts') || f.endsWith('.plugin.json')),
+   648→   648→        },
+   649→   649→      })
+   650→   650→
+   651→   651→      const message = existing
+   652→   652→        ? `Skill "${skillName}" đã cập nhật lên v${skillVersion} (${archiveFileCount} files, ${archiveToolRefs.length} tools)`
+   653→   653→        : `Skill "${skillName}" v${skillVersion} đã cài đặt thành công (${archiveFileCount} files, ${archiveToolRefs.length} tools)`
+   654→   654→
+   655→   655→      return NextResponse.json({
+   656→   656→        success: true,
+   657→   657→        skill,
+   658→   658→        message,
+   659→   659→        archiveFileCount,
+   660→   660→        toolReferences: archiveToolRefs,
+   661→   661→      })
+   662→   662→    }
+   663→   663→
+   664→   664→    if (action === 'uninstall' && slug) {
+   665→   665→      const skill = await db.agentSkill.findUnique({
+   666→   666→        where: { agentId_slug: { agentId: 'default', slug } },
+   667→   667→      })
+   668→   668→      if (!skill) {
+   669→   669→        return NextResponse.json({ error: 'Skill not found' }, { status: 404 })
+   670→   670→      }
+   671→   671→      if (skill.source === 'bundled') {
+   672→   672→        return NextResponse.json({ error: 'Không thể gỡ skill mặc định' }, { status: 400 })
+   673→   673→      }
+   674→   674→      // Allow uninstall for clawhub, custom, and template sources
+   675→   675→      await db.agentSkill.delete({
+   676→   676→        where: { agentId_slug: { agentId: 'default', slug } },
+   677→   677→      })
+   678→   678→
+   679→   679→      // P1.2: Clean up ALL extracted archive files from skills/{slug}/ directory
+   680→   680→      try {
+   681→   681→        const skillDir = join(process.cwd(), 'skills', slug)
+   682→   682→        if (existsSync(skillDir)) {
+   683→   683→          const isDir = statSync(skillDir).isDirectory()
+   684→   684→          if (isDir) {
+   685→   685→            removeDirectoryRecursive(skillDir)
+   686→   686→          } else {
+   687→   687→            // Shouldn't happen, but handle gracefully
+   688→   688→            unlinkSync(skillDir)
+   689→   689→          }
+   690→   690→        }
+   691→   691→      } catch (fsErr) {
+   692→   692→        console.warn(`[Skills] Failed to remove skill directory:`, fsErr instanceof Error ? fsErr.message : String(fsErr))
+   693→   693→      }
+   694→   694→
+   695→   695→      return NextResponse.json({ success: true, message: `Skill "${skill.name}" đã gỡ cài đặt` })
+   696→   696→    }
+   697→   697→
+   698→   698→    if (action === 'toggle' && slug) {
+   699→   699→      const skill = await db.agentSkill.findUnique({
+   700→   700→        where: { agentId_slug: { agentId: 'default', slug } },
+   701→   701→      })
+   702→   702→      if (!skill) {
+   703→   703→        return NextResponse.json({ error: 'Skill not found' }, { status: 404 })
+   704→   704→      }
+   705→   705→      const newEnabled = enabled !== undefined ? enabled : !skill.enabled
+   706→   706→      await db.agentSkill.update({
+   707→   707→        where: { agentId_slug: { agentId: 'default', slug } },
+   708→   708→        data: { enabled: newEnabled },
+   709→   709→      })
+   710→   710→
+   711→   711→      // Sync filesystem with enabled state
+   712→   712→      try {
+   713→   713→        const skillFilePath = join(process.cwd(), 'skills', slug, 'SKILL.md')
+   714→   714→        if (newEnabled) {
+   715→   715→          const skillsDir = join(process.cwd(), 'skills', slug)
+   716→   716→          mkdirSync(skillsDir, { recursive: true })
+   717→   717→          writeFileSync(skillFilePath, skill.content, 'utf-8')
+   718→   718→          console.log(`[Skills] Synced SKILL.md to filesystem (enabled): skills/${slug}/SKILL.md`)
+   719→   719→        } else {
+   720→   720→          if (existsSync(skillFilePath)) {
+   721→   721→            unlinkSync(skillFilePath)
+   722→   722→            console.log(`[Skills] Removed SKILL.md from filesystem (disabled): skills/${slug}/SKILL.md`)
+   723→   723→          }
+   724→   724→        }
+   725→   725→      } catch (fsErr) {
+   726→   726→        console.warn(`[Skills] Failed to sync filesystem for toggle:`, fsErr instanceof Error ? fsErr.message : String(fsErr))
+   727→   727→      }
+   728→   728→
+   729→   729→      return NextResponse.json({ success: true, enabled: newEnabled, message: `Skill "${skill.name}" ${newEnabled ? 'đã bật' : 'đã tắt'}` })
+   730→   730→    }
+   731→   731→
+   732→   732→    return NextResponse.json({ error: 'Invalid action' }, { status: 400 })
+   733→   733→  } catch {
+   734→   734→    return NextResponse.json({ error: 'Invalid request body' }, { status: 400 })
+   735→   735→  }
+   736→   736→}
+   737→   737→

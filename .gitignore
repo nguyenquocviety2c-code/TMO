@@ -1,0 +1,96 @@
+# See https://help.github.com/articles/ignoring-files/ for more about ignoring files.
+
+# dependencies
+node_modules
+/.pnp
+.pnp.*
+.yarn/*
+!.yarn/patches
+!.yarn/plugins
+!.yarn/releases
+!.yarn/versions
+
+# testing
+/coverage
+
+# next.js
+/.next/
+/out/
+
+# production
+/build
+
+# misc
+.DS_Store
+*.pem
+
+# debug
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+
+# env files (can opt-in for committing if needed)
+.env*
+
+# vercel
+.vercel
+
+
+# typescript
+*.tsbuildinfo
+next-env.d.ts
+local-*
+.claude
+.z-ai-config
+*.log
+dev.log
+dev.out.log
+test
+prompt
+
+server.log
+# Skills directory
+/skills/
+
+# Database files — local SQLite + Qdrant storage (Phase 4+ deployment)
+/db/
+/qdrant-storage/
+/qdrant-snapshots/
+
+# PM2 process files
+.pm2/
+
+# Mini-service runtime artifacts
+mini-services/*/.pid
+mini-services/*/.gateway.pid
+mini-services/*/node_modules/
+
+# Downloaded TMO repo (for reference only — not committed)
+/download/
+
+# Upload directory (PDFs stored here)
+/tmp/
+/upload/
+
+# Worklog (internal tracking — not committed to GitHub)
+worklog.md
+
+# Scripts (development/testing only — not part of app)
+/scripts/
+
+# Tool results (dev artifacts)
+/tool-results/
+
+# Public design doc (regenerated on demand)
+/public/database-architecture-design.md
+# Design docs and analysis files (regenerated, may contain example secrets)
+OPENCLAW_INTEGRATION_ANALYSIS.md
+OPENCLAW_IMPLEMENTATION_PLAN.md
+SMOLAB_IMPLEMENTATION_PLAN.md
+KE_HOACH_TRIEN_KHAI_XU_LY_LOI.md
+TONG_HOP_VAN_DE_THIET_KE_XU_LY.md
+TONG_HOP_VAN_DE_TRICH_XUAT_TAI_LIEU.md
+*.bak
+tsc-output.txt
+tsc-check-output.txt

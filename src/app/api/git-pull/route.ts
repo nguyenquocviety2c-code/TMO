@@ -1,0 +1,819 @@
+/**
+ * Git Pull API — Pull latest code from GitHub repository
+ *
+ * GET  /api/git-pull — Return current git config (remote URL, branch, commit)
+ * POST /api/git-pull — Execute git pull with custom remote URL and token
+ *
+ * Strategy: AGGRESSIVE CHECKOUT — overwrite all files except database data.
+ *   - Fetch remote → list changed files → checkout each non-protected file from FETCH_HEAD
+ *   - Protected dirs (db/, upload/, qdrant-storage/, agent-ctx/) are NEVER touched
+ *   - .env is smart-merged: local values preserved, new keys from remote added
+ *   - No "would be overwritten" errors — we force-checkout each file individually
+ *   - Token safety: never stores token in .git/config
+ *   - Shell-safe: uses execFile to avoid shell injection
+ *   - Mutex: prevents concurrent pull operations
+ */
+
+import { NextRequest, NextResponse } from 'next/server'
+import { execFile } from 'child_process'
+import { promisify } from 'util'
+import { readFileSync, writeFileSync, appendFileSync, existsSync, mkdirSync, rmSync, cpSync } from 'fs'
+import { join } from 'path'
+
+const execFileAsync = promisify(execFile)
+
+export const dynamic = 'force-dynamic'
+
+/** Protected directories that must never be affected by a git pull — database data lives here */
+const PROTECTED_DIRS = ['db/', 'upload/', 'qdrant-storage/', 'agent-ctx/']
+/** Files to smart-merge (not force-overwrite) after pull */
+const SMART_MERGE_FILES = ['.env']
+
+// ─── MUTEX: Prevent concurrent pull operations ─────────────────────────────────
+let pullInProgress = false
+
+/** Mask a token for safe logging — show first 4 and last 4 chars */
+function maskToken(token: string): string {
+  if (token.length <= 8) return '****'
+  return token.slice(0, 4) + '****' + token.slice(-4)
+}
+
+/** Mask a token value that may appear in an error/log string */
+function maskTokenInString(str: string, token: string): string {
+  if (!token) return str
+  return str.split(token).join(maskToken(token))
+}
+
+/**
+ * Sanitize API token: trim whitespace, strip common prefixes/labels.
+ * Handles: "API Token: ghp_xxx" → "ghp_xxx", "ghp_xxx " → "ghp_xxx"
+ */
+function sanitizeToken(token: string): string {
+  let cleaned = token.trim()
+  const labelPatterns = [
+    /^api\s*token\s*[:=]\s*/i,
+    /^token\s*[:=]\s*/i,
+    /^github\s*token\s*[:=]\s*/i,
+    /^pat\s*[:=]\s*/i,
+    /^password\s*[:=]\s*/i,
+    /^key\s*[:=]\s*/i,
+  ]
+  for (const pattern of labelPatterns) {
+    cleaned = cleaned.replace(pattern, '')
+  }
+  cleaned = cleaned.replace(/^["']|["']$/g, '')
+  cleaned = cleaned.trim()
+  cleaned = cleaned.replace(/[\s\r\n]+/g, '')
+  return cleaned
+}
+
+/**
+ * Parse a remote URL and strip any embedded token.
+ * Supports HTTPS and SSH formats.
+ */
+function parseRemoteUrl(url: string): {
+  cleanUrl: string
+  embeddedToken: string | null
+  host: string
+  path: string
+  isSSH: boolean
+} {
+  let embeddedToken: string | null = null
+  let cleanUrl = url
+  let isSSH = false
+
+  const sshMatch = url.match(/^git@([^:]+):(.+?)(?:\.git)?$/)
+  if (sshMatch) {
+    isSSH = true
+    return { cleanUrl: `https://${sshMatch[1]}/${sshMatch[2]}`, embeddedToken: null, host: sshMatch[1], path: sshMatch[2], isSSH }
+  }
+
+  const tokenMatch = url.match(/^https?:\/\/([^@]+)@(.+)$/)
+  if (tokenMatch) {
+    embeddedToken = tokenMatch[1]
+    cleanUrl = url.replace(/^(https?:\/\/)[^@]+@/, '$1')
+  }
+
+  cleanUrl = cleanUrl.replace(/\.git$/, '')
+
+  try {
+    const urlObj = new URL(cleanUrl)
+    return { cleanUrl, embeddedToken, host: urlObj.host, path: urlObj.pathname.replace(/^\/+/, ''), isSSH }
+  } catch {
+    const parts = cleanUrl.replace(/^https?:\/\//, '').split('/')
+    return { cleanUrl, embeddedToken, host: parts[0] || '', path: parts.slice(1).join('/'), isSSH }
+  }
+}
+
+/** Build an authenticated URL: https://{token}@{host}/{path} */
+function buildAuthUrl(repoUrl: string, token: string): string {
+  const { host, path: repoPath } = parseRemoteUrl(repoUrl)
+  if (!host || !host.includes('.')) {
+    throw new Error(`URL repository không hợp lệ: host "${host}" không phải là domain hợp lệ. Vui lòng nhập URL dạng https://github.com/user/repo`)
+  }
+  return token ? `https://${token}@${host}/${repoPath}` : `https://${host}/${repoPath}`
+}
+
+/** Strip token from a URL for safe display */
+function stripTokenFromUrl(url: string): string {
+  return url.replace(/^(https?:\/\/)[^@]+@/, '$1')
+}
+
+/** Check if a file path falls within protected directories */
+function isProtectedFile(file: string): boolean {
+  for (const dir of PROTECTED_DIRS) {
+    if (file.startsWith(dir) || file === dir.slice(0, -1)) return true
+  }
+  return false
+}
+
+/** Check if a file should be smart-merged instead of force-overwritten */
+function isSmartMergeFile(file: string): boolean {
+  return SMART_MERGE_FILES.includes(file)
+}
+
+/** Sanitize branch name to prevent command injection */
+function sanitizeBranch(branch: string): string {
+  const sanitized = branch.replace(/[^a-zA-Z0-9\-_\/\.]/g, '')
+  if (sanitized !== branch) {
+    console.log(`[GitPull] Branch name sanitized: "${branch}" → "${sanitized}"`)
+  }
+  return sanitized || 'main'
+}
+
+/**
+ * Smart-merge .env files: keep local values for existing keys,
+ * but add new keys from the remote version.
+ */
+function mergeEnvFile(localContent: string, remoteContent: string): string {
+  const localLines = localContent.split('\n')
+  const remoteLines = remoteContent.split('\n')
+
+  const localMap = new Map<string, string>()
+  for (const line of localLines) {
+    const trimmed = line.trim()
+    if (!trimmed || trimmed.startsWith('#')) continue
+    const eqIndex = trimmed.indexOf('=')
+    if (eqIndex > 0) {
+      const key = trimmed.substring(0, eqIndex).trim()
+      const value = trimmed.substring(eqIndex + 1).trim()
+      localMap.set(key, value)
+    }
+  }
+
+  const remoteMap = new Map<string, { key: string; value: string; line: string }>()
+  for (const line of remoteLines) {
+    const trimmed = line.trim()
+    if (!trimmed || trimmed.startsWith('#')) continue
+    const eqIndex = trimmed.indexOf('=')
+    if (eqIndex > 0) {
+      const key = trimmed.substring(0, eqIndex).trim()
+      const value = trimmed.substring(eqIndex + 1).trim()
+      remoteMap.set(key, { key, value, line })
+    }
+  }
+
+  const newKeys: string[] = []
+  for (const [, entry] of remoteMap) {
+    if (!localMap.has(entry.key)) {
+      newKeys.push(entry.line)
+    }
+  }
+
+  if (newKeys.length === 0) return localContent
+
+  const merged = localContent.trimEnd() + '\n\n# === New keys from remote (auto-merged) ===\n' + newKeys.join('\n') + '\n'
+  console.log(`[GitPull] .env merged: added ${newKeys.length} new key(s) from remote, preserved all local values`)
+  return merged
+}
+
+/**
+ * Backup config files before pull so they can be smart-merged after.
+ * Returns a map of filename → local content.
+ */
+function backupConfigFiles(projectRoot: string): Map<string, string | null> {
+  const backups = new Map<string, string | null>()
+  for (const file of SMART_MERGE_FILES) {
+    const filePath = join(projectRoot, file)
+    try {
+      const content = readFileSync(filePath, 'utf-8')
+      backups.set(file, content)
+      console.log(`[GitPull] Backed up ${file} (${content.length} bytes)`)
+    } catch {
+      backups.set(file, null)
+    }
+  }
+  return backups
+}
+
+/**
+ * Smart-restore config files after pull: merge new keys from remote
+ * while preserving local values for existing keys.
+ */
+function smartRestoreConfigFiles(projectRoot: string, backups: Map<string, string | null>): void {
+  for (const [file, localContent] of backups.entries()) {
+    if (localContent === null) continue
+    const filePath = join(projectRoot, file)
+    try {
+      const remoteContent = readFileSync(filePath, 'utf-8')
+      if (remoteContent !== localContent) {
+        const merged = mergeEnvFile(localContent, remoteContent)
+        writeFileSync(filePath, merged, 'utf-8')
+        console.log(`[GitPull] Smart-merged ${file} — local values preserved, new remote keys added`)
+      }
+    } catch {
+      writeFileSync(filePath, localContent, 'utf-8')
+      console.log(`[GitPull] Restored ${file} — file was removed by pull`)
+    }
+  }
+}
+
+/**
+ * Ensure the project directory is a valid git repository.
+ * If not, auto-initialize git, add protected dirs to .gitignore,
+ * and create an initial commit so we have a HEAD to diff against.
+ */
+async function ensureGitRepo(
+  projectRoot: string
+): Promise<{ isNewRepo: boolean; hadNoCommits: boolean }> {
+  let isGitRepo = false
+  try {
+    const { stdout } = await execFileAsync('git', ['rev-parse', '--is-inside-work-tree'], { cwd: projectRoot })
+    isGitRepo = stdout.trim() === 'true'
+  } catch {
+    isGitRepo = false
+  }
+
+  let isNewRepo = false
+  let hadNoCommits = false
+
+  if (!isGitRepo) {
+    console.log('[GitPull] Directory is not a git repo — initializing...')
+    await execFileAsync('git', ['init'], { cwd: projectRoot })
+    isNewRepo = true
+
+    const gitignorePath = join(projectRoot, '.gitignore')
+    let gitignoreContent = ''
+    try {
+      gitignoreContent = readFileSync(gitignorePath, 'utf-8')
+    } catch {
+      gitignoreContent = ''
+    }
+
+    const dirsToAdd = PROTECTED_DIRS.filter(
+      (dir) => !gitignoreContent.split('\n').some((line) => line.trim() === dir || line.trim() === '/' + dir)
+    )
+    if (dirsToAdd.length > 0) {
+      const appendBlock = '\n# Protected directories (auto-added by git-pull)\n' + dirsToAdd.join('\n') + '\n'
+      appendFileSync(gitignorePath, appendBlock, 'utf-8')
+      console.log(`[GitPull] Added to .gitignore: ${dirsToAdd.join(', ')}`)
+    }
+  }
+
+  let hasCommits = false
+  try {
+    await execFileAsync('git', ['rev-parse', 'HEAD'], { cwd: projectRoot })
+    hasCommits = true
+  } catch {
+    hasCommits = false
+  }
+
+  if (!hasCommits) {
+    hadNoCommits = true
+    console.log('[GitPull] No commits yet — creating initial commit from current files...')
+
+    try {
+      await execFileAsync('git', ['add', '-A'], { cwd: projectRoot, timeout: 30000 })
+    } catch { /* May fail if no files */ }
+
+    try {
+      const { stdout: statusOutput } = await execFileAsync('git', ['status', '--porcelain'], { cwd: projectRoot, timeout: 10000 })
+      if (statusOutput.trim()) {
+        await execFileAsync('git', ['commit', '-m', 'Initial commit (auto-created before first pull)'], {
+          cwd: projectRoot, timeout: 30000,
+        })
+      } else {
+        await execFileAsync('git', ['commit', '--allow-empty', '-m', 'Initial empty commit'], {
+          cwd: projectRoot, timeout: 15000,
+        })
+      }
+    } catch {
+      try {
+        await execFileAsync('git', ['commit', '--allow-empty', '-m', 'Initial empty commit'], {
+          cwd: projectRoot, timeout: 15000,
+        })
+      } catch { /* Last resort */ }
+    }
+  }
+
+  return { isNewRepo, hadNoCommits }
+}
+
+// ─── GET ────────────────────────────────────────────────────────────────────────
+
+export async function GET() {
+  try {
+    const projectRoot = process.cwd()
+
+    let isGitRepo = false
+    try {
+      const { stdout } = await execFileAsync('git', ['rev-parse', '--is-inside-work-tree'], { cwd: projectRoot })
+      isGitRepo = stdout.trim() === 'true'
+    } catch {
+      isGitRepo = false
+    }
+
+    if (!isGitRepo) {
+      return NextResponse.json({
+        currentRemote: null,
+        currentBranch: null,
+        currentCommit: null,
+        repoUrl: null,
+        hasToken: false,
+        isGitRepo: false,
+      })
+    }
+
+    let currentRemote = ''
+    try {
+      const { stdout } = await execFileAsync('git', ['remote', 'get-url', 'origin'], { cwd: projectRoot })
+      currentRemote = stdout.trim()
+    } catch { /* No remote */ }
+
+    let currentBranch = ''
+    try {
+      const { stdout } = await execFileAsync('git', ['rev-parse', '--abbrev-ref', 'HEAD'], { cwd: projectRoot })
+      currentBranch = stdout.trim()
+    } catch { /* Not a git repo */ }
+
+    let currentCommit = ''
+    try {
+      const { stdout } = await execFileAsync('git', ['rev-parse', '--short', 'HEAD'], { cwd: projectRoot })
+      currentCommit = stdout.trim()
+    } catch { /* Not a git repo */ }
+
+    const parsed = currentRemote ? parseRemoteUrl(currentRemote) : null
+
+    // SECURITY: Auto-clean token from .git/config
+    if (parsed?.embeddedToken && parsed.cleanUrl) {
+      console.log('[GitPull GET] Token found in remote URL — cleaning .git/config')
+      try {
+        await execFileAsync('git', ['remote', 'set-url', 'origin', parsed.cleanUrl], { cwd: projectRoot })
+        console.log(`[GitPull GET] Cleaned remote URL: ${parsed.cleanUrl}`)
+      } catch {
+        console.error('[GitPull GET] Failed to clean remote URL')
+      }
+    }
+
+    // SECURITY: Never send raw token to client
+    return NextResponse.json({
+      currentRemote: parsed ? parsed.cleanUrl : (currentRemote || null),
+      currentBranch: currentBranch || null,
+      currentCommit: currentCommit || null,
+      repoUrl: parsed ? parsed.cleanUrl : null,
+      hasToken: parsed ? !!parsed.embeddedToken : false,
+      isGitRepo: true,
+    })
+  } catch (err) {
+    const errorMsg = err instanceof Error ? err.message : String(err)
+    console.error('[GitPull GET] Error:', errorMsg)
+    return NextResponse.json({ success: false, error: errorMsg }, { status: 500 })
+  }
+}
+
+// ─── POST ───────────────────────────────────────────────────────────────────────
+
+export async function POST(request: NextRequest) {
+  // Mutex check
+  if (pullInProgress) {
+    return NextResponse.json(
+      { success: false, error: 'Đang có thao tác Pull code khác đang thực hiện. Vui lòng đợi hoàn tất rồi thử lại.' },
+      { status: 429 }
+    )
+  }
+  pullInProgress = true
+
+  try {
+    const projectRoot = process.cwd()
+    const body = await request.json()
+
+    const {
+      repoUrl: bodyRepoUrl,
+      apiToken: bodyApiToken,
+      branch: bodyBranch = 'main',
+      dryRun = false,
+    }: {
+      repoUrl?: string
+      apiToken?: string
+      branch?: string
+      dryRun?: boolean
+    } = body
+
+    const branch = sanitizeBranch(bodyBranch)
+    const effectiveToken = bodyApiToken ? sanitizeToken(bodyApiToken) : ''
+
+    // ── Resolve current remote config ──
+    let currentRemote = ''
+    try {
+      const { stdout } = await execFileAsync('git', ['remote', 'get-url', 'origin'], { cwd: projectRoot })
+      currentRemote = stdout.trim()
+    } catch { /* No remote */ }
+
+    const parsedCurrent = currentRemote ? parseRemoteUrl(currentRemote) : null
+
+    // ── Determine effective repoUrl ──
+    let effectiveRepoUrl = bodyRepoUrl?.trim() || (parsedCurrent?.cleanUrl ?? '')
+    if (!effectiveRepoUrl) {
+      return NextResponse.json(
+        { success: false, error: 'Chưa cung cấp địa chỉ kho lưu trữ (Repo URL). Vui lòng nhập URL của repository GitHub.' },
+        { status: 400 }
+      )
+    }
+
+    if (!effectiveRepoUrl.match(/^https?:\/\//)) {
+      effectiveRepoUrl = 'https://' + effectiveRepoUrl
+    }
+
+    const parsedRepo = parseRemoteUrl(effectiveRepoUrl)
+    if (parsedRepo.isSSH) {
+      effectiveRepoUrl = parsedRepo.cleanUrl
+      console.log(`[GitPull] Converted SSH URL to HTTPS: ${effectiveRepoUrl}`)
+    }
+
+    let finalToken = effectiveToken || parsedRepo.embeddedToken || (parsedCurrent?.embeddedToken ?? '') || ''
+    if (parsedRepo.embeddedToken) {
+      effectiveRepoUrl = parsedRepo.cleanUrl
+    }
+
+    // ── Validate repo URL ──
+    const parsedEffective = parseRemoteUrl(effectiveRepoUrl)
+    if (!parsedEffective.host || !parsedEffective.host.includes('.')) {
+      return NextResponse.json(
+        { success: false, error: `Địa chỉ repository không hợp lệ: "${effectiveRepoUrl}". Vui lòng nhập URL đúng định dạng, ví dụ: https://github.com/user/repo` },
+        { status: 400 }
+      )
+    }
+
+    // ── Build authenticated URL ──
+    let authUrl: string
+    try {
+      authUrl = finalToken ? buildAuthUrl(effectiveRepoUrl, finalToken) : effectiveRepoUrl
+    } catch (urlErr) {
+      return NextResponse.json(
+        { success: false, error: urlErr instanceof Error ? urlErr.message : String(urlErr) },
+        { status: 400 }
+      )
+    }
+
+    try {
+      const validatedUrl = new URL(authUrl)
+      if (!validatedUrl.host.includes('.')) throw new Error(`Host không hợp lệ: ${validatedUrl.host}`)
+    } catch {
+      return NextResponse.json(
+        { success: false, error: `URL không hợp lệ sau khi xây dựng: ${stripTokenFromUrl(authUrl)}. Vui lòng kiểm tra lại Repo URL và API Token.` },
+        { status: 400 }
+      )
+    }
+
+    console.log(`[GitPull] Using remote: ${stripTokenFromUrl(authUrl)} token: ${finalToken ? maskToken(finalToken) : '(none)'} branch: ${branch}`)
+
+    // ── Ensure git repo ──
+    const { isNewRepo, hadNoCommits } = await ensureGitRepo(projectRoot)
+
+    // ── Set remote origin to CLEAN URL ──
+    try {
+      await execFileAsync('git', ['remote', 'set-url', 'origin', effectiveRepoUrl], { cwd: projectRoot })
+      console.log(`[GitPull] Updated remote origin to ${effectiveRepoUrl} (no token stored)`)
+    } catch {
+      try {
+        await execFileAsync('git', ['remote', 'add', 'origin', effectiveRepoUrl], { cwd: projectRoot })
+      } catch { /* ignore */ }
+    }
+
+    // ── Backup config files for smart-merge ──
+    const configBackups = backupConfigFiles(projectRoot)
+
+    // ── Get current commit ──
+    let beforeCommit = ''
+    try {
+      const { stdout } = await execFileAsync('git', ['rev-parse', '--short', 'HEAD'], { cwd: projectRoot })
+      beforeCommit = stdout.trim()
+    } catch { /* fresh repo */ }
+
+    // ── Fetch from remote ──
+    try {
+      console.log(`[GitPull] Fetching from ${stripTokenFromUrl(authUrl)} branch=${branch}`)
+      await execFileAsync('git', ['fetch', authUrl, branch, '--force'], {
+        cwd: projectRoot,
+        timeout: 120000,
+      })
+    } catch (fetchErr) {
+      const fetchMsg = fetchErr instanceof Error ? fetchErr.message : String(fetchErr)
+      const safeMsg = maskTokenInString(fetchMsg, finalToken)
+      console.error(`[GitPull] Fetch failed: ${safeMsg}`)
+
+      let userError = `Không thể fetch từ repository. ${safeMsg}`
+      if (fetchMsg.includes('not a git repository')) {
+        userError = 'Thư mục hiện tại không phải là Git repository. Vui lòng đảm bảo project được clone bằng git hoặc thử lại (hệ thống đã tự khởi tạo git).'
+      } else if (fetchMsg.includes('Authentication failed') || fetchMsg.includes('could not read Username') || fetchMsg.includes('could not read Password')) {
+        userError = 'Xác thực thất bại. Vui lòng kiểm tra lại API Token (GitHub PAT) và đảm bảo token có quyền truy cập repository.'
+      } else if (fetchMsg.includes('Repository not found') || fetchMsg.includes('not found')) {
+        userError = `Không tìm thấy repository. Vui lòng kiểm tra lại địa chỉ: ${stripTokenFromUrl(effectiveRepoUrl)}`
+      } else if (fetchMsg.includes('timed out') || fetchMsg.includes('timeout')) {
+        userError = 'Kết nối tới GitHub bị timeout. Vui lòng kiểm tra mạng và thử lại.'
+      } else if (fetchMsg.includes('could not resolve host') || fetchMsg.includes('Could not resolve')) {
+        userError = `Không thể kết nối đến server. Vui lòng kiểm tra lại địa chỉ repository: ${stripTokenFromUrl(effectiveRepoUrl)}. Đảm bảo URL đúng định dạng.`
+      }
+
+      return NextResponse.json({ success: false, error: userError }, { status: 500 })
+    }
+
+    // ── List files that differ between HEAD and FETCH_HEAD ──
+    let changedFiles: string[] = []
+    try {
+      const { stdout: diffOutput } = await execFileAsync('git', ['diff', '--name-only', 'HEAD..FETCH_HEAD'], { cwd: projectRoot })
+      changedFiles = diffOutput.split('\n').map((f) => f.trim()).filter(Boolean)
+    } catch {
+      // diff may fail if no common ancestor — try alternative
+      try {
+        const { stdout: listOutput } = await execFileAsync('git', ['diff-tree', '--no-commit-id', '--name-only', '-r', 'FETCH_HEAD'], { cwd: projectRoot })
+        changedFiles = listOutput.split('\n').map((f) => f.trim()).filter(Boolean)
+      } catch {
+        console.log('[GitPull] Cannot preview changes — will proceed with checkout')
+      }
+    }
+
+    // ── Also check for files that exist in FETCH_HEAD but not in changed list (new files) ──
+    // git diff --name-only HEAD..FETCH_HEAD only shows changes, not new files from unrelated histories
+    // For full coverage, also list all files in FETCH_HEAD if this is a fresh repo
+    if (hadNoCommits || isNewRepo) {
+      try {
+        const { stdout: allFilesOutput } = await execFileAsync('git', ['ls-tree', '-r', '--name-only', 'FETCH_HEAD'], { cwd: projectRoot })
+        const allRemoteFiles = allFilesOutput.split('\n').map((f) => f.trim()).filter(Boolean)
+        // Merge with changedFiles (deduplicate)
+        const existingSet = new Set(changedFiles)
+        for (const f of allRemoteFiles) {
+          if (!existingSet.has(f)) changedFiles.push(f)
+        }
+      } catch {
+        console.log('[GitPull] Could not list all remote files — continuing with diff list')
+      }
+    }
+
+    // ── Separate files into categories ──
+    const protectedFiles = changedFiles.filter(f => isProtectedFile(f))
+    const smartMergeFiles = changedFiles.filter(f => isSmartMergeFile(f))
+    const forceOverwriteFiles = changedFiles.filter(f => !isProtectedFile(f) && !isSmartMergeFile(f))
+
+    // ── Safety check — protected directories ──
+    if (protectedFiles.length > 0) {
+      console.error(`[GitPull] Blocked: protected directories affected: ${protectedFiles.join(', ')}`)
+      return NextResponse.json(
+        {
+          success: false,
+          error: `Pull bị chặn: các file sau trong thư mục dữ liệu được bảo vệ sẽ bị thay đổi: ${protectedFiles.join(', ')}. Thư mục bảo vệ (chứa database): ${PROTECTED_DIRS.join(', ')}. Dữ liệu database sẽ KHÔNG bao giờ bị ghi đè.`,
+          protectedFiles,
+          changedFiles,
+          beforeCommit,
+        },
+        { status: 403 }
+      )
+    }
+
+    // ── Dry-run mode ──
+    if (dryRun) {
+      const depsChanged = changedFiles.some(f => f === 'package.json' || f === 'bun.lock' || f === 'bun.lockb')
+      return NextResponse.json({
+        success: true,
+        dryRun: true,
+        changedFiles,
+        beforeCommit,
+        branch,
+        repoUrl: stripTokenFromUrl(effectiveRepoUrl),
+        isNewRepo,
+        schemaChanged: changedFiles.some(f => f === 'prisma/schema.prisma' || f.startsWith('prisma/')),
+        depsChanged,
+        forceOverwriteCount: forceOverwriteFiles.length,
+        smartMergeCount: smartMergeFiles.length,
+        protectedCount: protectedFiles.length,
+        message:
+          changedFiles.length > 0
+            ? `${changedFiles.length} file sẽ cập nhật (${forceOverwriteFiles.length} ghi đè, ${smartMergeFiles.length} smart-merge, ${protectedFiles.length} bảo vệ)`
+            : 'Đã là phiên bản mới nhất — không có thay đổi',
+      })
+    }
+
+    // ── No changes — skip pull ──
+    if (changedFiles.length === 0 && !hadNoCommits) {
+      return NextResponse.json({
+        success: true,
+        hasChanges: false,
+        isUpToDate: true,
+        beforeCommit,
+        afterCommit: beforeCommit,
+        changedFiles: [],
+        isNewRepo,
+        message: 'Đã là phiên bản mới nhất',
+      })
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // ── AGGRESSIVE CHECKOUT STRATEGY ──────────────────────────────────────
+    //
+    // Instead of "git merge" (which fails on untracked files, conflicts, etc.),
+    // we force-checkout each file individually from FETCH_HEAD.
+    // This guarantees:
+    //   ✅ No "would be overwritten" errors
+    //   ✅ No merge conflicts (remote version always wins)
+    //   ✅ Protected directories are never touched
+    //   ✅ .env is smart-merged after checkout
+    // ═══════════════════════════════════════════════════════════════════════
+
+    console.log(`[GitPull] Aggressive checkout: ${forceOverwriteFiles.length} files to force-overwrite, ${smartMergeFiles.length} to smart-merge`)
+
+    let checkoutSuccess = 0
+    let checkoutFailed = 0
+    const failedFiles: string[] = []
+
+    // Force-checkout each non-protected, non-smart-merge file from FETCH_HEAD
+    for (const file of forceOverwriteFiles) {
+      try {
+        await execFileAsync('git', ['checkout', 'FETCH_HEAD', '--', file], {
+          cwd: projectRoot,
+          timeout: 30000,
+        })
+        checkoutSuccess++
+      } catch (err) {
+        const errMsg = err instanceof Error ? err.message : String(err)
+        // If checkout fails (file might have been deleted in remote), try removing it locally
+        try {
+          await execFileAsync('git', ['rm', '--force', file], { cwd: projectRoot, timeout: 10000 })
+          checkoutSuccess++
+          console.log(`[GitPull] Removed deleted file: ${file}`)
+        } catch {
+          checkoutFailed++
+          failedFiles.push(file)
+          console.error(`[GitPull] Failed to checkout ${file}: ${errMsg}`)
+        }
+      }
+    }
+
+    // Also checkout smart-merge files from FETCH_HEAD (will be merged after)
+    for (const file of smartMergeFiles) {
+      try {
+        await execFileAsync('git', ['checkout', 'FETCH_HEAD', '--', file], {
+          cwd: projectRoot,
+          timeout: 30000,
+        })
+        checkoutSuccess++
+      } catch (err) {
+        const errMsg = err instanceof Error ? err.message : String(err)
+        try {
+          await execFileAsync('git', ['rm', '--force', file], { cwd: projectRoot, timeout: 10000 })
+          checkoutSuccess++
+        } catch {
+          checkoutFailed++
+          failedFiles.push(file)
+          console.error(`[GitPull] Failed to checkout ${file}: ${errMsg}`)
+        }
+      }
+    }
+
+    // ── Update git index: stage all checked-out files and update HEAD ──
+    try {
+      await execFileAsync('git', ['add', '-A'], { cwd: projectRoot, timeout: 30000 })
+    } catch { /* May fail if nothing to add */ }
+
+    // Commit the checkout result so HEAD points to the right state
+    // We use the FETCH_HEAD commit as the new HEAD (fast-forward if possible)
+    let afterCommit = ''
+    let pullOutput = ''
+
+    // Try fast-forward first (if no divergence)
+    try {
+      await execFileAsync('git', ['reset', '--soft', 'FETCH_HEAD'], { cwd: projectRoot, timeout: 30000 })
+      const { stdout } = await execFileAsync('git', ['rev-parse', '--short', 'HEAD'], { cwd: projectRoot })
+      afterCommit = stdout.trim()
+      pullOutput = `Updated to remote version (fast-forward)`
+      console.log(`[GitPull] Fast-forwarded to FETCH_HEAD: ${afterCommit}`)
+    } catch {
+      // If fast-forward fails, just commit what we have
+      try {
+        // Reset index to match FETCH_HEAD but keep working tree
+        await execFileAsync('git', ['read-tree', '-u', '-m', 'FETCH_HEAD'], { cwd: projectRoot, timeout: 60000 })
+        await execFileAsync('git', ['reset', 'HEAD'], { cwd: projectRoot, timeout: 10000 }) // unstage
+        await execFileAsync('git', ['add', '-A'], { cwd: projectRoot, timeout: 30000 })
+
+        const { stdout: statusOut } = await execFileAsync('git', ['status', '--porcelain'], { cwd: projectRoot, timeout: 10000 })
+        if (statusOut.trim()) {
+          await execFileAsync('git', ['commit', '-m', `Pull code từ ${stripTokenFromUrl(effectiveRepoUrl)}`], {
+            cwd: projectRoot, timeout: 30000,
+          })
+        }
+
+        const { stdout } = await execFileAsync('git', ['rev-parse', '--short', 'HEAD'], { cwd: projectRoot })
+        afterCommit = stdout.trim()
+        pullOutput = `Checkout ${checkoutSuccess} files from remote`
+      } catch (commitErr) {
+        console.error(`[GitPull] Commit after checkout failed: ${commitErr instanceof Error ? commitErr.message : String(commitErr)}`)
+        // Still continue — files are updated in working tree even if commit failed
+        try {
+          const { stdout } = await execFileAsync('git', ['rev-parse', '--short', 'HEAD'], { cwd: projectRoot })
+          afterCommit = stdout.trim()
+        } catch { /* ignore */ }
+        pullOutput = `Checkout ${checkoutSuccess} files (commit pending)`
+      }
+    }
+
+    // ── Smart-restore .env: local values preserved, new keys added ──
+    smartRestoreConfigFiles(projectRoot, configBackups)
+
+    // ── Re-compute changed files after pull ──
+    try {
+      if (beforeCommit && afterCommit && beforeCommit !== afterCommit) {
+        const { stdout: diffOutput } = await execFileAsync('git', ['diff', '--name-only', `${beforeCommit}..${afterCommit}`], { cwd: projectRoot })
+        const postPullFiles = diffOutput.split('\n').map((f) => f.trim()).filter(Boolean)
+        if (postPullFiles.length > 0) changedFiles = postPullFiles
+      }
+    } catch { /* fall back to pre-pull list */ }
+
+    // ── Post-pull automation ──
+
+    // Run bun install if deps changed
+    let installResult: string | null = null
+    const depsChanged = changedFiles.some(f => f === 'package.json' || f === 'bun.lock' || f === 'bun.lockb')
+
+    if (depsChanged) {
+      console.log('[GitPull] Dependencies changed — running bun install')
+      try {
+        const { stdout: installOutput } = await execFileAsync('bun', ['install'], { cwd: projectRoot, timeout: 120000 })
+        installResult = 'bun install completed successfully'
+        console.log(`[GitPull] bun install done: ${installOutput.substring(0, 200)}`)
+      } catch (installErr) {
+        const installMsg = installErr instanceof Error ? installErr.message : String(installErr)
+        console.error(`[GitPull] bun install failed: ${installMsg}`)
+        installResult = `bun install failed: ${installMsg}`
+      }
+    }
+
+    // Run prisma generate + db push if schema changed
+    let prismaResult: string | null = null
+    const schemaChanged = changedFiles.some(f => f === 'prisma/schema.prisma' || f.startsWith('prisma/'))
+
+    if (schemaChanged) {
+      console.log('[GitPull] Prisma schema changed — running generate and db push')
+      try {
+        await execFileAsync('bunx', ['prisma', 'generate'], { cwd: projectRoot, timeout: 120000 })
+        console.log('[GitPull] prisma generate done')
+        await execFileAsync('bunx', ['prisma', 'db', 'push'], { cwd: projectRoot, timeout: 120000 })
+        console.log('[GitPull] prisma db push done')
+        prismaResult = 'prisma generate + db push completed successfully'
+      } catch (prismaErr) {
+        const prismaMsg = prismaErr instanceof Error ? prismaErr.message : String(prismaErr)
+        console.error(`[GitPull] Prisma automation failed: ${prismaMsg}`)
+        prismaResult = `Prisma automation failed: ${prismaMsg}`
+      }
+    }
+
+    // ── Build and return result ──
+    const hasChanges = beforeCommit !== afterCommit || checkoutSuccess > 0
+    const output = pullOutput || 'OK'
+
+    return NextResponse.json({
+      success: true,
+      beforeCommit,
+      afterCommit,
+      hasChanges,
+      changedFiles,
+      schemaChanged,
+      depsChanged,
+      installResult,
+      prismaResult,
+      output,
+      branch,
+      repoUrl: stripTokenFromUrl(effectiveRepoUrl),
+      isNewRepo,
+      checkoutStats: {
+        success: checkoutSuccess,
+        failed: checkoutFailed,
+        failedFiles,
+      },
+    })
+  } catch (err) {
+    const errorMsg = err instanceof Error ? err.message : String(err)
+    console.error('[GitPull POST] Error:', errorMsg)
+
+    // Try to clean up git state
+    try {
+      await execFileAsync('git', ['merge', '--abort'], { cwd: process.cwd(), timeout: 10000 })
+    } catch { /* ignore */ }
+
+    return NextResponse.json(
+      { success: false, error: `Lỗi hệ thống: ${errorMsg}` },
+      { status: 500 }
+    )
+  } finally {
+    // Always release the mutex
+    pullInProgress = false
+  }
+}

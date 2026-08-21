@@ -1,0 +1,2297 @@
+/**
+ * Neo4j Enhanced Client Module for GraphRAG Knowledge Base
+ *
+ * Architecture: SQLite (buffer) → Qdrant (vector+document) + Neo4j (graph)
+ *
+ * Neo4j handles:
+ *   - Entity nodes (Concept, Algorithm, Language, Tool, System, Technique,
+ *     Vulnerability, Principle, Domain, Document, Person)
+ *   - Typed relationships (PART_OF, IMPLEMENTED_IN, USES, EXPLOITS, etc.)
+ *   - Document nodes (link documents to their entities)
+ *   - Community detection & graph traversal for RAG queries
+ *
+ * Key design decisions:
+ *   - Properties use BOTH camelCase AND snake_case aliases for backward
+ *     compatibility (e.g., `n.name` AND `n.entity_name`, `n.documentId` AND `n.document_id`)
+ *   - `entity_type` is stored as both a Neo4j label AND a property
+ *   - All nodes get `created_at` and `updated_at` timestamps
+ *   - Relationships carry full metadata (description, confidence_score, source)
+ *
+ * Works with: Neo4j Desktop (neo4j://, bolt://) and AuraDB (neo4j+s://)
+ */
+
+import type { Driver, Session } from 'neo4j-driver'
+
+// ==================== TYPES ====================
+
+type Neo4jDriver = Driver
+
+/** Supported entity type labels — also used as Neo4j node labels
+ *  Redesigned 2026-08-21: 11 → 7 labels (gộp Concept+Algorithm+Technique → Concept,
+ *  gộp Tool+System → Technology, tách thêm Framework từ Tool)
+ *  LLM extraction prompt sẽ cung cấp mô tả + ví dụ cho mỗi label.
+ */
+export const ENTITY_LABELS = [
+  'Concept', 'Technology', 'Framework', 'Vulnerability',
+  'Principle', 'Domain', 'Document', 'Person',
+] as const
+export type EntityLabel = (typeof ENTITY_LABELS)[number]
+
+/** Supported relationship types
+ *  Redesigned 2026-08-21: 14 → 15 rel types
+ *  Removed (2): RELATED_TO (catch-all, no semantics), SUPPORTS (too vague)
+ *  Added (3): CREATED_BY (Person → Entity), DOCUMENTED_IN (Entity → Document),
+ *             ALTERNATIVE_TO (Tech ↔ Tech, positive comparison)
+ *  Net: 14 - 2 + 3 = 15 relationship types
+ */
+export const RELATIONSHIP_TYPES = [
+  'PART_OF', 'IMPLEMENTED_IN', 'USES', 'EXPLOITS', 'MITIGATES',
+  'RUNS_ON', 'DEPENDS_ON', 'CONTRASTS_WITH',
+  'ENABLES', 'CONTAINS', 'EXTENDS', 'APPLIES_TO',
+  // New relationships (added 2026-08-21)
+  'CREATED_BY', 'DOCUMENTED_IN', 'ALTERNATIVE_TO',
+] as const
+export type RelationshipType = (typeof RELATIONSHIP_TYPES)[number]
+
+/** Entity node payload — all properties written to Neo4j */
+export interface EntityNode {
+  id: string
+  name: string
+  entity_type: EntityLabel
+  domain: string
+  description: string
+  confidence: number
+  documentId: string
+  source?: string
+  chunk_id?: string
+  created_at: string
+  updated_at: string
+}
+
+/** Relationship edge payload — all properties written to Neo4j */
+export interface RelationshipEdge {
+  sourceId: string
+  targetId: string
+  relationship_type: RelationshipType | string
+  description?: string
+  confidence?: number
+  documentId: string
+  source?: string
+  created_at: string
+}
+
+/** Document node payload */
+export interface DocumentNode {
+  id: string
+  title: string
+  domain: string
+  status: string
+  page_count?: number
+  created_at: string
+  updated_at: string
+}
+
+/** Community detection result */
+export interface Community {
+  communityId: number
+  label: string
+  members: Array<{ id: string; name: string; type: string; domain: string }>
+  size: number
+  domains: string[]
+}
+
+/** Graph neighborhood result */
+export interface EntityNeighborhood {
+  center: { id: string; name: string; type: string; domain: string; description: string }
+  neighbors: Array<{
+    id: string; name: string; type: string; domain: string
+    direction: 'outgoing' | 'incoming'
+    relType: string
+  }>
+}
+
+/** Shortest path result */
+export interface PathResult {
+  nodes: Array<{ name: string; type: string }>
+  edges: Array<{ source: string; type: string; target: string }>
+  length: number
+}
+
+// ==================== LABEL/TYPE SANITIZATION ====================
+
+/**
+ * Sanitize a label or relationship type for safe Cypher interpolation.
+ * Only allows alphanumeric + underscore characters.
+ */
+function sanitizeLabel(label: string): string {
+  return label.replace(/[^a-zA-Z0-9_]/g, '_')
+}
+
+/**
+ * Validate that a label is in the allowed set.
+ */
+function isValidLabel(label: string): label is EntityLabel {
+  return ENTITY_LABELS.includes(label as EntityLabel)
+}
+
+// ==================== ERROR DETECTION & RETRY ====================
+
+/**
+ * Check if an error indicates a transient/recoverable Neo4j connection issue.
+ * These errors suggest the driver's connection pool is stale and needs reset.
+ */
+export function isTransientError(error: any): boolean {
+  const msg = error?.message?.toLowerCase() || ''
+  return (
+    msg.includes('connection refused') ||
+    msg.includes('service unavailable') ||
+    msg.includes('session expired') ||
+    msg.includes('connection pool closed') ||
+    msg.includes('broken pipe') ||
+    msg.includes('econnreset') ||
+    msg.includes('econnrefused') ||
+    msg.includes('connection acquisition timed out') ||
+    msg.includes('connection timed out') ||
+    msg.includes('failed to acquire connection') ||
+    msg.includes('no longer available') ||
+    msg.includes('transient error') ||
+    (msg.includes('neo4jerror') && msg.includes('transient')) ||
+    error?.code === 'ServiceUnavailable' ||
+    error?.code === 'SessionExpired'
+  )
+}
+
+/**
+ * Check if a Neo4j error is retryable (transient + additional cases).
+ * Broader than isTransientError — also includes deadlocks and general timeouts.
+ */
+export function isNeo4jRetryableError(error: any): boolean {
+  if (isTransientError(error)) return true
+  const msg = error?.message?.toLowerCase() || ''
+  return (
+    msg.includes('deadlock') ||
+    msg.includes('timeout') ||
+    msg.includes('transaction failed')
+  )
+}
+
+/**
+ * Execute a Neo4j operation with automatic retry on transient errors.
+ * Resets the driver on connection-level failures before retrying,
+ * so zombie drivers (dead connections in pool) are automatically recovered.
+ *
+ * Usage:
+ *   const result = await withNeo4jRetry(async () => {
+ *     const session = await getSession()
+ *     try { return await session.run('MATCH (n) RETURN n') }
+ *     finally { await session.close() }
+ *   })
+ */
+export async function withNeo4jRetry<T>(
+  fn: () => Promise<T>,
+  maxRetries: number = 3,
+  baseDelay: number = 1000
+): Promise<T> {
+  let lastError: any
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    try {
+      return await fn()
+    } catch (error: any) {
+      lastError = error
+      if (!isNeo4jRetryableError(error) || attempt === maxRetries) throw error
+
+      // Reset driver on transient connection errors — clears zombie connections
+      if (isTransientError(error)) {
+        console.warn('[Neo4j] Transient connection error detected, resetting driver before retry...')
+        await resetNeo4jDriver()
+      }
+
+      const delay = baseDelay * Math.pow(2, attempt) // exponential backoff: 1s, 2s, 4s
+      console.warn(`[Neo4j] Retry ${attempt + 1}/${maxRetries} after ${delay}ms...`)
+      await new Promise(r => setTimeout(r, delay))
+    }
+  }
+  throw lastError
+}
+
+// ==================== LAZY DRIVER INITIALIZATION ====================
+
+const globalForNeo4j = globalThis as unknown as {
+  neo4jDriver: Driver | undefined
+}
+
+/** Mutex to prevent race condition: two concurrent getNeo4jDriver() calls
+ *  both seeing globalForNeo4j.neo4jDriver === undefined and creating
+ *  two drivers — the first driver would be orphaned (never closed, leaking connections).
+ */
+let driverInitPromise: Promise<Neo4jDriver | null> | null = null
+
+/**
+ * Get or lazily create the Neo4j driver.
+ * Returns null if env vars are missing or connection fails.
+ *
+ * Auto-detects: Desktop (bolt://, neo4j://) uses 10s timeout, AuraDB (neo4j+s://) uses 30s.
+ *
+ * THREAD SAFETY: Uses a mutex promise so that concurrent callers share the
+ * same initialization — prevents orphaned driver leak on race conditions.
+ */
+export async function getNeo4jDriver(): Promise<Neo4jDriver | null> {
+  // Fast path: driver already exists
+  if (globalForNeo4j.neo4jDriver) return globalForNeo4j.neo4jDriver
+
+  // Slow path: deduplicate concurrent initialization attempts
+  if (driverInitPromise) return driverInitPromise
+
+  driverInitPromise = (async () => {
+    // Double-check after acquiring "lock" — another caller may have completed
+    if (globalForNeo4j.neo4jDriver) return globalForNeo4j.neo4jDriver
+
+    const uri = process.env.NEO4J_URI
+    const user = process.env.NEO4J_USER
+    const password = process.env.NEO4J_PASSWORD
+
+    if (!uri || !user || !password) {
+      console.error('[Neo4j] Missing NEO4J_URI, NEO4J_USER, or NEO4J_PASSWORD env vars')
+      driverInitPromise = null
+      return null
+    }
+
+    try {
+      const neo4j = await import('neo4j-driver')
+
+      const isLocalDesktop = uri.startsWith('bolt://') || uri.startsWith('neo4j://')
+      const timeout = isLocalDesktop ? 10000 : 30000
+
+      const driver = neo4j.default.driver(uri, neo4j.default.auth.basic(user, password), {
+        maxConnectionPoolSize: isLocalDesktop ? 10 : 5,
+        connectionAcquisitionTimeout: timeout,
+        connectionTimeout: timeout,
+        maxTransactionRetryTime: timeout,
+        connectionLivenessCheckTimeout: 30_000, // Fixed 30s — independent of other timeouts
+        maxConnectionLifetime: isLocalDesktop ? 3600_000 : 7200_000, // 1h local, 2h cloud — rotate connections to prevent stale sockets after sleep/hibernate
+      })
+
+      // Verify connectivity
+      const session = driver.session({ database: process.env.NEO4J_DATABASE || undefined })
+      try {
+        await session.run('RETURN 1 AS test')
+        console.log('[Neo4j] Connected successfully to', uri.replace(/\/\/[^@]+@/, '//***@'))
+      } finally {
+        await session.close()
+      }
+
+      globalForNeo4j.neo4jDriver = driver
+      return driver
+    } catch (err) {
+      console.error('[Neo4j] Failed to connect:', err instanceof Error ? err.message : String(err))
+      driverInitPromise = null
+      return null
+    } finally {
+      // Clear mutex after completion (success or failure) so future calls can retry
+      driverInitPromise = null
+    }
+  })()
+
+  return driverInitPromise
+}
+
+// ==================== HELPER: GET SESSION ====================
+
+/**
+ * Get a Neo4j session from the driver.
+ *
+ * Note: This function creates a session object but does NOT verify connectivity.
+ * For automatic reconnection on transient errors, wrap your operations with
+ * `withNeo4jRetry()` which will reset the driver and retry if the connection
+ * is dead (zombie driver pattern).
+ *
+ * Pattern:
+ *   const result = await withNeo4jRetry(async () => {
+ *     const session = await getSession()
+ *     try { return await session.run(...) }
+ *     finally { await session.close() }
+ *   })
+ */
+async function getSession(): Promise<Session> {
+  const driver = await getNeo4jDriver()
+  if (!driver) throw new Error('Neo4j driver not available')
+  return driver.session({ database: process.env.NEO4j_DATABASE || undefined })
+}
+
+/**
+ * Safe session helper — creates a Neo4j session with zombie driver recovery.
+ *
+ * This is the RECOMMENDED way to get a session from outside neo4j.ts.
+ * It wraps the raw `driver.session()` pattern with:
+ *   1. Automatic driver reset if the session creation fails with a transient error
+ *   2. Liveness ping on first use to detect stale connections
+ *   3. Proper error propagation with actionable error messages
+ *
+ * Usage (replaces raw `driver.session()` in API routes):
+ *   const session = await safeSession()
+ *   try {
+ *     const result = await session.executeRead(tx => tx.run(cypher, params))
+ *     return result
+ *   } finally {
+ *     await session.close()
+ *   }
+ *
+ * @param options - Optional session config (e.g., { database: 'neo4j' })
+ * @returns Neo4j Session, or throws if Neo4j is unreachable
+ */
+export async function safeSession(options?: { database?: string }): Promise<Session> {
+  const driver = await getNeo4jDriver()
+  if (!driver) throw new Error('Neo4j driver not available — check if Neo4j Desktop is running')
+
+  const dbParam = { database: options?.database || process.env.NEO4J_DATABASE || undefined }
+  const session = driver.session(dbParam)
+
+  // Quick liveness ping — detect zombie connections immediately
+  // instead of letting the first real query fail after potentially long processing
+  try {
+    await session.run('RETURN 1 AS __ping__')
+  } catch (pingError: any) {
+    await session.close().catch(() => {})
+    // Ping failed — driver pool may have stale connections (e.g., after laptop sleep)
+    console.warn('[Neo4j] safeSession ping failed, resetting driver...', pingError instanceof Error ? pingError.message : String(pingError))
+    await resetNeo4jDriver()
+    const freshDriver = await getNeo4jDriver()
+    if (!freshDriver) throw new Error('Neo4j driver not available after reset')
+    const freshSession = freshDriver.session(dbParam)
+    // Verify the fresh session works
+    try {
+      await freshSession.run('RETURN 1 AS __ping__')
+    } catch (retryPingError: any) {
+      await freshSession.close().catch(() => {})
+      throw new Error('Neo4j unreachable after driver reset: ' + (retryPingError instanceof Error ? retryPingError.message : String(retryPingError)))
+    }
+    return freshSession
+  }
+
+  return session
+}
+
+// ==================== HELPER: CONVERT NEO4J VALUES ====================
+
+/**
+ * Convert Neo4j Integer/Node/Path values to plain JS objects.
+ * Handles neo4j-driver Integer objects by calling .toNumber() or .toString().
+ */
+export function toNative(val: unknown): unknown {
+  if (val === null || val === undefined) return val
+  if (typeof val === 'object' && val !== null) {
+    // Neo4j Integer
+    if (typeof (val as { toNumber?: unknown }).toNumber === 'function') {
+      return (val as { toNumber: () => number }).toNumber()
+    }
+    // Neo4j Node
+    if (typeof (val as { properties?: unknown; labels?: unknown }).properties === 'object') {
+      const node = val as { properties: Record<string, unknown>; labels: string[] }
+      return { ...toNative(node.properties), _labels: node.labels }
+    }
+    // Neo4j Relationship
+    if (typeof (val as { properties?: unknown; type?: unknown }).properties === 'object' && typeof (val as { type?: unknown }).type === 'string') {
+      const rel = val as { properties: Record<string, unknown>; type: string }
+      return { ...toNative(rel.properties), _type: rel.type }
+    }
+    // Neo4j Path
+    if (typeof (val as { segments?: unknown }).segments === 'object') {
+      return val
+    }
+    // Plain object — recurse
+    if (!Array.isArray(val)) {
+      const result: Record<string, unknown> = {}
+      for (const [k, v] of Object.entries(val as Record<string, unknown>)) {
+        result[k] = toNative(v)
+      }
+      return result
+    }
+  }
+  if (Array.isArray(val)) {
+    return val.map(toNative)
+  }
+  return val
+}
+
+// ==================== HEALTH CHECK ====================
+
+export async function checkNeo4jHealth(): Promise<{
+  connected: boolean
+  uri?: string
+  nodeCount?: number
+  relationshipCount?: number
+  labels?: string[]
+  entityCounts?: Record<string, number>
+  error?: string
+}> {
+  try {
+    const uri = process.env.NEO4J_URI
+    const user = process.env.NEO4J_USER
+    const password = process.env.NEO4J_PASSWORD
+
+    if (!uri || !user || !password) {
+      return {
+        connected: false,
+        error: 'Missing NEO4J_URI, NEO4J_USER, or NEO4J_PASSWORD env vars',
+      }
+    }
+
+    let driver = await getNeo4jDriver()
+    if (!driver) {
+      await resetNeo4jDriver()
+      driver = await getNeo4jDriver()
+    }
+    if (!driver) {
+      return {
+        connected: false,
+        error: 'Neo4j unreachable (DNS resolution failed or connection refused). Check if instance is running — AuraDB may be paused, or Desktop may not be started.',
+      }
+    }
+
+    // 1. Basic connectivity test — with zombie driver recovery
+    // If ping fails but driver object exists (non-null), the driver's
+    // connection pool is stale. Reset the driver and retry once.
+    // OPTIMIZATION (Phase 5.1): Use a SINGLE session for all health check queries
+    // instead of creating 5 separate sessions (ping + node count + rel count + labels + entity counts).
+    // This reduces pool consumption from 50% to ~10% of the max pool size.
+    const dbParam = { database: process.env.NEO4J_DATABASE || undefined }
+    let session = driver.session(dbParam)
+    try {
+      await session.run('RETURN 1 AS test')
+    } catch (pingError: any) {
+      await session.close().catch(() => {})
+      // Driver object exists but connections are dead — RESET DRIVER
+      console.warn('[Neo4j] Health check ping failed (driver may be zombie), resetting driver...', pingError instanceof Error ? pingError.message : String(pingError))
+      await resetNeo4jDriver()
+      driver = await getNeo4jDriver()
+      if (!driver) {
+        return {
+          connected: false,
+          error: 'Neo4j unreachable after driver reset: ' + (pingError instanceof Error ? pingError.message : String(pingError)),
+        }
+      }
+      // Retry ping with fresh driver
+      try {
+        session = driver.session(dbParam)
+        await session.run('RETURN 1 AS test')
+        console.log('[Neo4j] Driver reset successful — reconnected')
+      } catch (retryError: any) {
+        await session.close().catch(() => {})
+        return {
+          connected: false,
+          error: 'Neo4j unreachable after driver reset: ' + (retryError instanceof Error ? retryError.message : String(retryError)),
+        }
+      }
+    }
+
+    const maskedUri = (process.env.NEO4J_URI || '').replace(/\/\/[^@]+@/, '//***@')
+    const result: {
+      connected: boolean
+      uri: string
+      nodeCount: number
+      relationshipCount: number
+      labels: string[]
+      entityCounts: Record<string, number>
+    } = {
+      connected: true,
+      uri: maskedUri,
+      nodeCount: 0,
+      relationshipCount: 0,
+      labels: [],
+      entityCounts: {},
+    }
+
+    // All remaining queries reuse the same session — avoids creating 4 extra sessions
+    try {
+      // 2. Node count
+      const nodeResult = await session.executeRead((tx) =>
+        tx.run('MATCH (n) RETURN count(n) AS nodeCount')
+      )
+      const nodeVal = nodeResult.records[0]?.get('nodeCount')
+      result.nodeCount = typeof nodeVal?.toNumber === 'function' ? nodeVal.toNumber() : (nodeVal ?? 0)
+    } catch (err) {
+      console.warn('[Neo4j] Node count query failed:', err instanceof Error ? err.message : String(err))
+    }
+
+    try {
+      // 3. Relationship count
+      const relResult = await session.executeRead((tx) =>
+        tx.run('MATCH ()-[r]->() RETURN count(r) AS relCount')
+      )
+      const relVal = relResult.records[0]?.get('relCount')
+      result.relationshipCount = typeof relVal?.toNumber === 'function' ? relVal.toNumber() : (relVal ?? 0)
+    } catch (err) {
+      console.warn('[Neo4j] Relationship count query failed:', err instanceof Error ? err.message : String(err))
+    }
+
+    try {
+      // 4. Labels
+      const labelResult = await session.executeRead((tx) =>
+        tx.run('CALL db.labels() YIELD label RETURN collect(label) AS labels')
+      )
+      result.labels = labelResult.records[0]?.get('labels') ?? []
+    } catch (err) {
+      console.warn('[Neo4j] Labels query failed (non-critical):', err instanceof Error ? err.message : String(err))
+    }
+
+    try {
+      // 5. Per-label entity counts (enhanced health info)
+      const countResult = await session.executeRead((tx) =>
+        tx.run(
+          `MATCH (n) WHERE size(labels(n)) > 0
+           WITH labels(n) AS lbls UNWIND lbls AS lbl
+           RETURN lbl AS label, count(*) AS cnt
+           ORDER BY cnt DESC`
+        )
+      )
+      for (const record of countResult.records) {
+        const label = record.get('label')
+        const cnt = record.get('cnt')
+        result.entityCounts[label] = typeof cnt?.toNumber === 'function' ? cnt.toNumber() : (cnt ?? 0)
+      }
+    } catch (err) {
+      console.warn('[Neo4j] Entity count query failed (non-critical):', err instanceof Error ? err.message : String(err))
+    }
+
+    // Close the single shared session
+    await session.close()
+
+    return result
+  } catch (err) {
+    const errorMessage = err instanceof Error ? err.message : String(err)
+    return { connected: false, error: errorMessage }
+  }
+}
+
+// ==================== SCHEMA INITIALIZATION ====================
+
+/**
+ * Initialize Neo4j constraints and indexes for the GraphRAG schema.
+ *
+ * Enhanced schema includes:
+ *   - UNIQUE constraint on `id` for all entity labels + Document
+ *   - Indexes on `name` for ALL entity labels (not just some)
+ *   - Indexes on `domain` for ALL entity labels
+ *   - Index on `documentId` for fast document-scoped queries
+ *   - Index on `entity_type` for filtering by type (redundant with labels but useful for queries)
+ *   - Full-text index on entity names for CONTAINS searches
+ *
+ * @returns Object with count of constraints and indexes created
+ */
+export async function initializeNeo4jSchema(): Promise<{
+  constraints: number
+  indexes: number
+}> {
+  const constraintQueries = ENTITY_LABELS.map(
+    (label) => `CREATE CONSTRAINT IF NOT EXISTS FOR (n:${label}) REQUIRE n.id IS UNIQUE`
+  )
+
+  const indexQueries: string[] = []
+
+  // Name indexes for ALL entity labels (previously missing for Language, System, Principle, Document, Person)
+  for (const label of ENTITY_LABELS) {
+    indexQueries.push(`CREATE INDEX IF NOT EXISTS FOR (n:${label}) ON (n.name)`)
+  }
+
+  // Domain indexes for ALL entity labels
+  for (const label of ENTITY_LABELS) {
+    indexQueries.push(`CREATE INDEX IF NOT EXISTS FOR (n:${label}) ON (n.domain)`)
+  }
+
+  // documentId index for fast document-scoped deletion/querying
+  for (const label of ENTITY_LABELS) {
+    indexQueries.push(`CREATE INDEX IF NOT EXISTS FOR (n:${label}) ON (n.documentId)`)
+  }
+
+  // entity_type index on generic base (useful for mixed-label queries)
+  indexQueries.push(`CREATE INDEX IF NOT EXISTS FOR (n:Concept) ON (n.entity_type)`)
+  indexQueries.push(`CREATE INDEX IF NOT EXISTS FOR (n:Document) ON (n.status)`)
+
+  // Full-text index on entity names for CONTAINS / fuzzy search
+  // This is MUCH faster than per-label CONTAINS scans
+  indexQueries.push(
+    `CREATE FULLTEXT INDEX entity_name_search IF NOT EXISTS FOR (n:Concept|Algorithm|Language|Tool|System|Technique|Vulnerability|Principle|Domain|Document|Person) ON EACH [n.name]`
+  )
+
+  let constraints = 0
+  let indexes = 0
+
+  // Run constraint queries
+  for (const query of constraintQueries) {
+    try {
+      const session = await getSession()
+      try {
+        await session.executeWrite((tx) => tx.run(query))
+        constraints++
+      } finally {
+        await session.close()
+      }
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err)
+      if (msg.includes('already exists')) {
+        constraints++
+      } else {
+        console.error(`[Neo4j] Constraint failed: ${msg}`)
+      }
+    }
+    await new Promise((r) => setTimeout(r, 100))
+  }
+
+  // Run index queries
+  for (const query of indexQueries) {
+    try {
+      const session = await getSession()
+      try {
+        await session.executeWrite((tx) => tx.run(query))
+        indexes++
+      } finally {
+        await session.close()
+      }
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err)
+      if (msg.includes('already exists') || msg.includes('EquivalentIndex')) {
+        indexes++
+      } else {
+        console.warn(`[Neo4j] Index warning: ${msg}`)
+      }
+    }
+    await new Promise((r) => setTimeout(r, 100))
+  }
+
+  console.log(`[Neo4j] Schema initialized: ${constraints} constraints, ${indexes} indexes`)
+  return { constraints, indexes }
+}
+
+// ==================== DRIVER CLEANUP ====================
+
+export async function resetNeo4jDriver(): Promise<void> {
+  if (globalForNeo4j.neo4jDriver) {
+    try {
+      await globalForNeo4j.neo4jDriver.close()
+    } catch {
+      // Ignore close errors
+    }
+    globalForNeo4j.neo4jDriver = undefined
+    console.log('[Neo4j] Driver reset — next operation will create a fresh connection')
+  }
+}
+
+export async function closeNeo4jDriver(): Promise<void> {
+  if (globalForNeo4j.neo4jDriver) {
+    try {
+      await globalForNeo4j.neo4jDriver.close()
+      globalForNeo4j.neo4jDriver = undefined
+      console.log('[Neo4j] Driver closed successfully')
+    } catch (err) {
+      console.error('[Neo4j] Error closing driver:', err instanceof Error ? err.message : String(err))
+    }
+  }
+}
+
+// ==================== CYPHER EXECUTION (backward compat) ====================
+
+/**
+ * Execute a write Cypher query and return results
+ */
+export async function executeCypher<T = Record<string, unknown>>(
+  query: string,
+  params: Record<string, unknown> = {}
+): Promise<T[]> {
+  return withNeo4jRetry(async () => {
+    const session = await getSession()
+    try {
+      const result = await session.executeWrite((tx) => tx.run(query, params))
+      return result.records.map((record) => {
+        const obj: Record<string, unknown> = {}
+        for (const key of record.keys as string[]) {
+          obj[key] = toNative(record.get(key))
+        }
+        return obj as T
+      })
+    } finally {
+      await session.close()
+    }
+  })
+}
+
+/**
+ * Execute a read-only Cypher query
+ */
+export async function readCypher<T = Record<string, unknown>>(
+  query: string,
+  params: Record<string, unknown> = {}
+): Promise<T[]> {
+  return withNeo4jRetry(async () => {
+    const session = await getSession()
+    try {
+      const result = await session.executeRead((tx) => tx.run(query, params))
+      return result.records.map((record) => {
+        const obj: Record<string, unknown> = {}
+        for (const key of record.keys as string[]) {
+          obj[key] = toNative(record.get(key))
+        }
+        return obj as T
+      })
+    } finally {
+      await session.close()
+    }
+  })
+}
+
+// ==================== ENTITY OPERATIONS ====================
+
+/**
+ * Upsert a single entity node into Neo4j.
+ *
+ * Sets BOTH camelCase and snake_case property aliases for backward compatibility:
+ *   - n.name AND n.entity_name
+ *   - n.documentId AND n.document_id
+ *   - n.confidence AND n.confidence_score
+ *   - n.entity_type (as property, redundant with label but needed for API reads)
+ */
+export async function upsertEntity(entity: EntityNode): Promise<boolean> {
+  return withNeo4jRetry(async () => {
+    const label = sanitizeLabel(entity.entity_type)
+    const now = new Date().toISOString()
+
+    const session = await getSession()
+    try {
+      await session.executeWrite((tx) =>
+        tx.run(
+          `MERGE (n:${label} {id: $id})
+           ON CREATE SET n.name = $name, n.entity_name = $name, n.entity_type = $entityType,
+                         n.domain = $domain, n.description = $description,
+                         n.confidence = $confidence, n.confidence_score = $confidence,
+                         n.source = $source, n.occurrence_count = 1,
+                         n.created_at = $createdAt, n.updated_at = $updatedAt
+           ON MATCH SET  n.name = $name, n.entity_name = $name, n.entity_type = $entityType,
+                         n.domain = CASE WHEN $domain <> '' THEN $domain ELSE n.domain END,
+                         n.description = CASE WHEN $description <> '' AND size($description) > size(COALESCE(n.description, '')) THEN $description ELSE n.description END,
+                         n.confidence = CASE WHEN $confidence > COALESCE(n.confidence, 0) THEN $confidence ELSE n.confidence END,
+                         n.confidence_score = CASE WHEN $confidence > COALESCE(n.confidence_score, 0) THEN $confidence ELSE n.confidence_score END,
+                         n.occurrence_count = COALESCE(n.occurrence_count, 1) + 1,
+                         n.updated_at = $updatedAt`,
+          {
+            id: entity.id,
+            name: entity.name,
+            entityType: entity.entity_type,
+            domain: entity.domain,
+            description: entity.description,
+            confidence: entity.confidence,
+            documentId: entity.documentId,
+            source: entity.source || 'llm',
+            createdAt: entity.created_at || now,
+            updatedAt: now,
+          }
+        )
+      )
+      return true
+    } finally {
+      await session.close()
+    }
+  }).catch((err) => {
+    console.error('[Neo4j] Entity upsert error:', err instanceof Error ? err.message : String(err))
+    return false
+  })
+}
+
+/**
+ * Batch upsert entities by label.
+ * Groups entities by their label for efficient UNWIND batching.
+ *
+ * @param entities Array of entity nodes to upsert
+ * @param documentId Document ID for batch operations
+ * @returns Number of entities successfully upserted
+ */
+export async function upsertEntitiesBatch(
+  entities: EntityNode[],
+  documentId: string
+): Promise<number> {
+  if (entities.length === 0) return 0
+
+  let upserted = 0
+  const now = new Date().toISOString()
+
+  // Group by label for efficient batching
+  const byLabel = new Map<string, EntityNode[]>()
+  for (const entity of entities) {
+    const label = sanitizeLabel(entity.entity_type)
+    if (!byLabel.has(label)) byLabel.set(label, [])
+    byLabel.get(label)!.push(entity)
+  }
+
+  // Batch upsert per label (500 per batch)
+  // Each batch is wrapped with withNeo4jRetry for transient error recovery
+  const BATCH_SIZE = 500
+  for (const [label, labelEntities] of byLabel) {
+    for (let i = 0; i < labelEntities.length; i += BATCH_SIZE) {
+      const batch = labelEntities.slice(i, i + BATCH_SIZE)
+      try {
+        await withNeo4jRetry(async () => {
+          const session = await getSession()
+          try {
+            await session.executeWrite((tx) =>
+              tx.run(
+                `UNWIND $entities AS e
+                 MERGE (n:${label} {id: e.id})
+                 ON CREATE SET n.name = e.name, n.entity_name = e.name, n.entity_type = e.entityType,
+                               n.domain = e.domain, n.description = e.description,
+                               n.confidence = e.confidence, n.confidence_score = e.confidence,
+                               n.source = e.source, n.occurrence_count = 1,
+                               n.created_at = e.createdAt, n.updated_at = $updatedAt
+                 ON MATCH SET  n.name = e.name, n.entity_name = e.name, n.entity_type = e.entityType,
+                               n.domain = CASE WHEN e.domain <> '' THEN e.domain ELSE n.domain END,
+                               n.description = CASE WHEN e.description <> '' AND size(e.description) > size(COALESCE(n.description, '')) THEN e.description ELSE n.description END,
+                               n.confidence = CASE WHEN e.confidence > COALESCE(n.confidence, 0) THEN e.confidence ELSE n.confidence END,
+                               n.confidence_score = CASE WHEN e.confidence > COALESCE(n.confidence_score, 0) THEN e.confidence ELSE n.confidence_score END,
+                               n.occurrence_count = COALESCE(n.occurrence_count, 1) + 1,
+                               n.updated_at = $updatedAt`,
+                {
+                  entities: batch.map(e => ({
+                    id: e.id,
+                    name: e.name,
+                    entityType: e.entity_type,
+                    domain: e.domain,
+                    description: e.description,
+                    confidence: e.confidence,
+                    documentId: e.documentId,
+                    source: e.source || 'llm',
+                    createdAt: e.created_at || now,
+                  })),
+                  updatedAt: now,
+                }
+              )
+            )
+          } finally {
+            await session.close()
+          }
+        })
+        upserted += batch.length
+      } catch (err) {
+        console.error(`[Neo4j] Batch entity upsert error (${label}):`, err instanceof Error ? err.message : String(err))
+        // Fallback: try individual upserts for this batch
+        for (const entity of batch) {
+          const success = await upsertEntity(entity)
+          if (success) upserted++
+        }
+      }
+    }
+  }
+
+  return upserted
+}
+
+/**
+ * Get a single entity by ID.
+ * Uses label-based query to leverage the UNIQUE constraint index on (Label, id).
+ */
+export async function getEntity(id: string): Promise<EntityNode | null> {
+  return withNeo4jRetry(async () => {
+    // Try each known label — UNIQUE constraint indexes require label-specific MATCH
+    for (const label of ENTITY_LABELS) {
+      const session = await getSession()
+      try {
+        const result = await session.executeRead((tx) =>
+          tx.run(
+            `MATCH (n:${label} {id: $id}) RETURN n LIMIT 1`,
+            { id }
+          )
+        )
+        if (result.records.length === 0) {
+          await session.close()
+          continue
+        }
+        const node = result.records[0].get('n')
+        const props = toNative(node.properties) as Record<string, unknown>
+        const labels = node.labels as string[]
+        return {
+          id: props.id as string,
+          name: (props.entity_name as string) || (props.name as string) || '',
+          entity_type: (props.entity_type as EntityLabel) || labels.find(l => isValidLabel(l)) as EntityLabel || 'Concept',
+          domain: (props.domain as string) || '',
+          description: (props.description as string) || '',
+          confidence: (props.confidence_score as number) ?? (props.confidence as number) ?? 0,
+          documentId: (props.document_id as string) || (props.documentId as string) || '',
+          source: props.source as string | undefined,
+          chunk_id: props.chunk_id as string | undefined,
+          created_at: (props.created_at as string) || '',
+          updated_at: (props.updated_at as string) || '',
+        }
+      } finally {
+        await session.close()
+      }
+    }
+    return null
+  }).catch((err) => {
+    console.error('[Neo4j] Get entity error:', err instanceof Error ? err.message : String(err))
+    return null
+  })
+}
+
+/**
+ * Get all entities for a document.
+ * Uses CONTAINS relationships (Document→Entity) for cross-document entity dedup.
+ * With global entity IDs, entities are shared across documents, so we find them
+ * via the CONTAINS relationship rather than by documentId property on the entity.
+ * Returns entities ordered by name.
+ */
+export async function getEntitiesByDocument(documentId: string): Promise<EntityNode[]> {
+  return withNeo4jRetry(async () => {
+    const session = await getSession()
+    try {
+      const result = await session.executeRead((tx) =>
+        tx.run(
+          `MATCH (d:Document {id: $documentId})-[:CONTAINS]->(n)
+           WHERE n.entity_type IS NOT NULL
+           RETURN n ORDER BY n.name`,
+          { documentId }
+        )
+      )
+      return result.records.map((record) => {
+        const node = record.get('n')
+        const props = toNative(node.properties) as Record<string, unknown>
+        const labels = node.labels as string[]
+        return {
+          id: props.id as string,
+          name: (props.entity_name as string) || (props.name as string) || '',
+          entity_type: (props.entity_type as EntityLabel) || labels.find(l => isValidLabel(l)) as EntityLabel || 'Concept',
+          domain: (props.domain as string) || '',
+          description: (props.description as string) || '',
+          confidence: (props.confidence_score as number) ?? (props.confidence as number) ?? 0,
+          documentId: (props.document_id as string) || (props.documentId as string) || '',
+          source: props.source as string | undefined,
+          chunk_id: props.chunk_id as string | undefined,
+          created_at: (props.created_at as string) || '',
+          updated_at: (props.updated_at as string) || '',
+        }
+      })
+    } finally {
+      await session.close()
+    }
+  }).catch((err) => {
+    console.error('[Neo4j] Get entities by document error:', err instanceof Error ? err.message : String(err))
+    return []
+  })
+}
+
+/**
+ * Search entities by name (text search).
+ * Uses the full-text index `entity_name_search` for fast fuzzy matching,
+ * falls back to CONTAINS scan if the fulltext index is unavailable.
+ */
+export async function searchEntities(
+  query: string,
+  options?: {
+    limit?: number
+    domain?: string
+    entityType?: string
+  }
+): Promise<Array<{ name: string; type: string; domain: string; description: string }>> {
+  const limit = Math.floor(options?.limit || 20)
+  return withNeo4jRetry(async () => {
+    const session = await getSession()
+    try {
+      // Try fulltext index first — much faster than CONTAINS scan
+      try {
+        const ftParams: Record<string, unknown> = { term: `${query}*`, limit }
+        let ftCypher = `CALL db.index.fulltext.queryNodes('entity_name_search', $term) YIELD node AS n, score
+                        WHERE n.entity_type IS NOT NULL`
+        if (options?.domain) {
+          ftCypher += ` AND n.domain = $domain`
+          ftParams.domain = options.domain
+        }
+        if (options?.entityType && isValidLabel(options.entityType)) {
+          ftCypher += ` AND $entityType IN labels(n)`
+          ftParams.entityType = options.entityType
+        }
+        ftCypher += ` RETURN n.name AS name, n.entity_type AS type, n.domain AS domain, n.description AS description
+                      ORDER BY score DESC LIMIT $limit`
+
+        const ftResult = await session.executeRead((tx) => tx.run(ftCypher, ftParams))
+        if (ftResult.records.length > 0) {
+          return ftResult.records.map((record) => ({
+            name: (toNative(record.get('name')) as string) || '',
+            type: (toNative(record.get('type')) as string) || '',
+            domain: (toNative(record.get('domain')) as string) || '',
+            description: (toNative(record.get('description')) as string) || '',
+          }))
+        }
+      } catch (ftErr) {
+        // Fulltext index not available — fall through to CONTAINS scan
+        const msg = ftErr instanceof Error ? ftErr.message : String(ftErr)
+        if (!msg.includes('index does not exist') && !msg.includes('Unknown index')) {
+          console.warn('[Neo4j] Fulltext search failed, falling back to CONTAINS:', msg)
+        }
+      }
+
+      // Fallback: CONTAINS scan (slower but always works)
+      let cypher: string
+      let params: Record<string, unknown>
+
+      if (options?.entityType && isValidLabel(options.entityType)) {
+        const label = sanitizeLabel(options.entityType)
+        if (options.domain) {
+          cypher = `MATCH (n:${label}) WHERE n.name CONTAINS $term AND n.domain = $domain
+                    RETURN n.name AS name, n.entity_type AS type, n.domain AS domain, n.description AS description
+                    ORDER BY n.name LIMIT $limit`
+          params = { term: query, domain: options.domain, limit }
+        } else {
+          cypher = `MATCH (n:${label}) WHERE n.name CONTAINS $term
+                    RETURN n.name AS name, n.entity_type AS type, n.domain AS domain, n.description AS description
+                    ORDER BY n.name LIMIT $limit`
+          params = { term: query, limit }
+        }
+      } else if (options?.domain) {
+        cypher = `MATCH (n) WHERE n.name CONTAINS $term AND n.domain = $domain AND n.entity_type IS NOT NULL
+                  RETURN n.name AS name, n.entity_type AS type, n.domain AS domain, n.description AS description
+                  ORDER BY n.name LIMIT $limit`
+        params = { term: query, domain: options.domain, limit }
+      } else {
+        cypher = `MATCH (n) WHERE n.name CONTAINS $term AND n.entity_type IS NOT NULL
+                  RETURN n.name AS name, n.entity_type AS type, n.domain AS domain, n.description AS description
+                  ORDER BY n.name LIMIT $limit`
+        params = { term: query, limit }
+      }
+
+      const result = await session.executeRead((tx) => tx.run(cypher, params))
+      return result.records.map((record) => ({
+        name: (toNative(record.get('name')) as string) || '',
+        type: (toNative(record.get('type')) as string) || '',
+        domain: (toNative(record.get('domain')) as string) || '',
+        description: (toNative(record.get('description')) as string) || '',
+      }))
+    } finally {
+      await session.close()
+    }
+  }).catch((err) => {
+    console.error('[Neo4j] Search entities error:', err instanceof Error ? err.message : String(err))
+    return []
+  })
+}
+
+/**
+ * Delete entities associated with a document — cross-document safe.
+ *
+ * With global entity IDs, entities are shared across documents. We CANNOT
+ * simply delete all nodes with a documentId property. Instead:
+ * 1. Delete CONTAINS relationships from this Document to its entities
+ * 2. Delete entity-to-entity relationships that originated from this document
+ * 3. Delete orphaned entity nodes (no CONTAINS from ANY document)
+ *
+ * This preserves entities that are also referenced by other documents.
+ */
+export async function deleteEntitiesByDocument(documentId: string): Promise<number> {
+  return withNeo4jRetry(async () => {
+    let totalDeleted = 0
+    const session = await getSession()
+    try {
+      // Step 1: Delete CONTAINS relationships for this document
+      await session.executeWrite((tx) =>
+        tx.run(
+          `MATCH (d:Document {id: $documentId})-[r:CONTAINS]->(e) DELETE r`,
+          { documentId }
+        )
+      )
+
+      // Step 2: Delete entity-to-entity relationships from this document
+      const relResult = await session.executeWrite((tx) =>
+        tx.run(
+          `MATCH ()-[r]->() WHERE (r.documentId = $documentId OR r.document_id = $documentId) AND NOT type(r) = 'CONTAINS' DELETE r RETURN count(r) AS deleted`,
+          { documentId }
+        )
+      )
+      const relsDeleted = relResult.records[0]?.get('deleted')
+      totalDeleted += typeof relsDeleted?.toNumber === 'function' ? relsDeleted.toNumber() : (relsDeleted ?? 0) as number
+
+      // Step 3: Delete legacy per-document nodes (old `docId__name__type` ID scheme)
+      const idPrefix = `${documentId}__`
+      let hasMore = true
+      let maxBatches = 50
+      while (hasMore && maxBatches > 0) {
+        const result = await session.executeWrite((tx) =>
+          tx.run(
+            `MATCH (n) WHERE n.id STARTS WITH $idPrefix WITH n LIMIT 5000 DETACH DELETE n RETURN count(n) AS deleted`,
+            { idPrefix }
+          )
+        )
+        const deleted = result.records[0]?.get('deleted')
+        const num = typeof deleted?.toNumber === 'function' ? deleted.toNumber() : (deleted ?? 0) as number
+        totalDeleted += num
+        hasMore = num >= 5000
+        maxBatches--
+      }
+
+      // Step 4: Delete orphaned entity nodes (no CONTAINS from any document)
+      // These are entities that were only referenced by this document and now have no references.
+      let orphanBatches = 10
+      let hasOrphans = true
+      while (hasOrphans && orphanBatches > 0) {
+        const orphanResult = await session.executeWrite((tx) =>
+          tx.run(
+            `MATCH (n) WHERE n.entity_type IS NOT NULL AND NOT (n)<-[:CONTAINS]-(:Document) WITH n LIMIT 5000 DETACH DELETE n RETURN count(n) AS deleted`
+          )
+        )
+        const orphanDeleted = orphanResult.records[0]?.get('deleted')
+        const orphanNum = typeof orphanDeleted?.toNumber === 'function' ? orphanDeleted.toNumber() : (orphanDeleted ?? 0) as number
+        totalDeleted += orphanNum
+        hasOrphans = orphanNum >= 5000
+        orphanBatches--
+      }
+
+      console.log(`[Neo4j] deleteEntitiesByDocument(${documentId.slice(0, 8)}...): deleted ${totalDeleted} total (rels + legacy nodes + orphans)`)
+    } finally {
+      await session.close()
+    }
+    return totalDeleted
+  }).catch((err) => {
+    console.error('[Neo4j] Delete entities by document error:', err instanceof Error ? err.message : String(err))
+    return 0
+  })
+}
+
+// ==================== CROSS-DOCUMENT MERGE UTILITY ====================
+
+/**
+ * Merge existing per-document entity nodes into global entity nodes.
+ *
+ * This is a MIGRATION UTILITY for converting the old per-document ID scheme
+ * (`docId__name__type`) to the new global ID scheme (`global__name__type`).
+ *
+ * Process:
+ * 1. Find all nodes with per-document IDs (matching `___` pattern or `documentId__` prefix)
+ * 2. Group them by (name, type) across all documents
+ * 3. For each group, create ONE global node with merged properties
+ * 4. Re-point all relationships from old node IDs to the new global node ID
+ * 5. Create CONTAINS relationships from Document nodes to the global entity
+ * 6. Delete the old per-document nodes
+ *
+ * Returns merge statistics.
+ */
+export async function mergePerDocumentNodesToGlobal(): Promise<{
+  totalScanned: number
+  groupsMerged: number
+  globalNodesCreated: number
+  relationshipsRepointed: number
+  oldNodesDeleted: number
+  errors: string[]
+}> {
+  const errors: string[] = []
+  let totalScanned = 0
+  let groupsMerged = 0
+  let globalNodesCreated = 0
+  let relationshipsRepointed = 0
+  let oldNodesDeleted = 0
+
+  const driver = await getNeo4jDriver()
+  if (!driver) {
+    errors.push('Neo4j driver not available')
+    return { totalScanned, groupsMerged, globalNodesCreated, relationshipsRepointed, oldNodesDeleted, errors }
+  }
+
+  const session = driver.session({ database: process.env.NEO4J_DATABASE || undefined })
+  try {
+    // Step 1: Find all per-document entity nodes (old ID scheme)
+    // These have IDs matching the pattern: `docId__name__type` (at least 2 double underscores)
+    // but NOT `global__name__type` (new scheme) or `resolved__name__type`
+    const scanResult = await session.executeRead(tx =>
+      tx.run(
+        `MATCH (n) WHERE n.entity_type IS NOT NULL AND n.id IS NOT NULL
+         AND NOT n.id STARTS WITH 'global__'
+         AND NOT n.id STARTS WITH 'resolved__'
+         AND NOT n.id STARTS WITH 'orphan__'
+         AND NOT n.entity_type = 'Document'
+         RETURN n.id AS id, n.name AS name, n.entity_name AS entityName, n.entity_type AS entityType,
+                n.domain AS domain, n.description AS description,
+                n.confidence AS confidence, n.confidence_score AS confidenceScore,
+                n.documentId AS documentId, n.document_id AS documentId2,
+                n.occurrence_count AS occurrenceCount,
+                n.created_at AS createdAt, n.updated_at AS updatedAt,
+                labels(n) AS labels`
+      )
+    )
+
+    const oldNodes = scanResult.records.map(r => ({
+      id: r.get('id') as string,
+      name: (r.get('entityName') as string) || (r.get('name') as string) || '',
+      entityType: (r.get('entityType') as string) || 'Concept',
+      domain: (r.get('domain') as string) || '',
+      description: (r.get('description') as string) || '',
+      confidence: (r.get('confidenceScore') as number) ?? (r.get('confidence') as number) ?? 0,
+      documentId: (r.get('documentId') as string) || (r.get('documentId2') as string) || '',
+      occurrenceCount: (r.get('occurrenceCount') as number) || 1,
+      createdAt: (r.get('createdAt') as string) || '',
+      updatedAt: (r.get('updatedAt') as string) || '',
+      labels: r.get('labels') as string[],
+    }))
+
+    totalScanned = oldNodes.length
+    if (totalScanned === 0) {
+      console.log('[Neo4j Merge] No per-document nodes found — already migrated or empty database')
+      return { totalScanned, groupsMerged, globalNodesCreated, relationshipsRepointed, oldNodesDeleted, errors }
+    }
+
+    console.log(`[Neo4j Merge] Found ${totalScanned} per-document entity nodes to merge`)
+
+    // Step 2: Group by (name, type) — case-insensitive
+    const groups = new Map<string, Array<typeof oldNodes[0]>>()
+    for (const node of oldNodes) {
+      const key = `${node.name.toLowerCase().trim()}||${node.entityType.toLowerCase().trim()}`
+      if (!groups.has(key)) groups.set(key, [])
+      groups.get(key)!.push(node)
+    }
+
+    console.log(`[Neo4j Merge] ${totalScanned} nodes → ${groups.size} unique entity groups`)
+
+    // Step 3: For each group, create a global node and re-point relationships
+    let batchCount = 0
+    for (const [key, group] of groups) {
+      const [normalizedName, normalizedType] = key.split('||')
+      const globalId = `global__${normalizedName.replace(/[^a-z0-9]/g, '_')}__${normalizedType}`
+
+      // Pick best properties from the group
+      const bestName = group.reduce((best, n) => n.name.length > best.name.length ? n : best, group[0]).name
+      const bestDesc = group.reduce((best, n) => (n.description || '').length > (best.description || '').length ? n : best, group[0]).description || ''
+      const bestConf = Math.max(...group.map(n => n.confidence || 0))
+      const bestDomain = group.find(n => n.domain && n.domain !== 'mixed')?.domain || group[0].domain || 'mixed'
+      const totalOccurrence = group.reduce((sum, n) => sum + (n.occurrenceCount || 1), 0)
+      const safeLabel = normalizedType.replace(/[^a-zA-Z0-9_]/g, '_') || 'Concept'
+
+      try {
+        // Create/update the global node
+        await session.executeWrite(tx =>
+          tx.run(
+            `MERGE (n:${safeLabel} {id: $id})
+             ON CREATE SET n.name = $name, n.entity_name = $name, n.entity_type = $entityType,
+                           n.domain = $domain, n.description = $description,
+                           n.confidence = $confidence, n.confidence_score = $confidence,
+                           n.source = 'merge', n.occurrence_count = $occurrenceCount,
+                           n.created_at = $createdAt, n.updated_at = $updatedAt
+             ON MATCH SET  n.name = $name, n.entity_name = $name, n.entity_type = $entityType,
+                           n.domain = CASE WHEN $domain <> '' AND $domain <> 'mixed' THEN $domain ELSE n.domain END,
+                           n.description = CASE WHEN $description <> '' AND size($description) > size(COALESCE(n.description, '')) THEN $description ELSE n.description END,
+                           n.confidence = CASE WHEN $confidence > COALESCE(n.confidence, 0) THEN $confidence ELSE n.confidence END,
+                           n.confidence_score = CASE WHEN $confidence > COALESCE(n.confidence_score, 0) THEN $confidence ELSE n.confidence_score END,
+                           n.occurrence_count = COALESCE(n.occurrence_count, 1) + $occurrenceCount,
+                           n.updated_at = $updatedAt`,
+            {
+              id: globalId,
+              name: bestName,
+              entityType: normalizedType,
+              domain: bestDomain,
+              description: bestDesc,
+              confidence: bestConf,
+              occurrenceCount: totalOccurrence,
+              createdAt: group[0].createdAt || new Date().toISOString(),
+              updatedAt: new Date().toISOString(),
+            }
+          )
+        )
+        globalNodesCreated++
+      } catch (err) {
+        errors.push(`Failed to create global node "${globalId}": ${err instanceof Error ? err.message : String(err)}`)
+        continue
+      }
+
+      // Re-point relationships and create CONTAINS for each old node
+      for (const oldNode of group) {
+        try {
+          // Create CONTAINS relationship from Document to global entity
+          if (oldNode.documentId) {
+            await session.executeWrite(tx =>
+              tx.run(
+                `MATCH (d:Document {id: $documentId}), (e {id: $globalId})
+                 MERGE (d)-[r:CONTAINS]->(e)
+                 SET r.documentId = $documentId, r.document_id = $documentId`,
+                { documentId: oldNode.documentId, globalId }
+              )
+            )
+          }
+
+          // Re-point incoming relationships to the global node
+          const inResult = await session.executeWrite(tx =>
+            tx.run(
+              `MATCH (src)-[r]->(old {id: $oldId})
+               WHERE NOT type(r) = 'CONTAINS'
+               WITH src, r, old, type(r) AS relType, properties(r) AS relProps
+               MATCH (target:${safeLabel} {id: $globalId})
+               MERGE (src)-[newR:RELATED_TO]->(target)
+               SET newR += relProps, newR.merged_from = $oldId
+               DELETE r
+               RETURN count(newR) AS repointed`,
+              { oldId: oldNode.id, globalId }
+            )
+          )
+          const inRepointed = inResult.records[0]?.get('repointed')?.toNumber?.() || 0
+          relationshipsRepointed += inRepointed
+
+          // Re-point outgoing relationships
+          const outResult = await session.executeWrite(tx =>
+            tx.run(
+              `MATCH (old {id: $oldId})-[r]->(tgt)
+               WHERE NOT type(r) = 'CONTAINS'
+               WITH old, r, tgt, type(r) AS relType, properties(r) AS relProps
+               MATCH (source:${safeLabel} {id: $globalId})
+               MERGE (source)-[newR:RELATED_TO]->(tgt)
+               SET newR += relProps, newR.merged_from = $oldId
+               DELETE r
+               RETURN count(newR) AS repointed`,
+              { oldId: oldNode.id, globalId }
+            )
+          )
+          const outRepointed = outResult.records[0]?.get('repointed')?.toNumber?.() || 0
+          relationshipsRepointed += outRepointed
+
+          // Delete the old node
+          await session.executeWrite(tx =>
+            tx.run(
+              `MATCH (old {id: $oldId}) DETACH DELETE old RETURN count(old) AS deleted`,
+              { oldId: oldNode.id }
+            )
+          )
+          oldNodesDeleted++
+        } catch (err) {
+          errors.push(`Failed to merge old node "${oldNode.id}": ${err instanceof Error ? err.message : String(err)}`)
+        }
+      }
+
+      groupsMerged++
+      batchCount++
+      if (batchCount % 100 === 0) {
+        console.log(`[Neo4j Merge] Progress: ${batchCount}/${groups.size} groups processed, ${globalNodesCreated} global nodes, ${oldNodesDeleted} old nodes deleted`)
+      }
+    }
+
+    console.log(`[Neo4j Merge] Complete: ${groupsMerged} groups merged, ${globalNodesCreated} global nodes, ${relationshipsRepointed} rels repointed, ${oldNodesDeleted} old nodes deleted`)
+  } catch (err) {
+    errors.push(`Fatal merge error: ${err instanceof Error ? err.message : String(err)}`)
+  } finally {
+    await session.close()
+  }
+
+  return { totalScanned, groupsMerged, globalNodesCreated, relationshipsRepointed, oldNodesDeleted, errors }
+}
+
+// ==================== RELATIONSHIP OPERATIONS ====================
+
+/**
+ * Upsert a single relationship with full metadata.
+ *
+ * Sets BOTH camelCase and snake_case property aliases:
+ *   - rel.documentId AND rel.document_id
+ *   - rel.confidence AND rel.confidence_score
+ *   - rel.relationship_type (as property, redundant with Neo4j type but needed for API reads)
+ */
+export async function upsertRelationship(rel: RelationshipEdge): Promise<boolean> {
+  return withNeo4jRetry(async () => {
+    const relType = sanitizeLabel(rel.relationship_type)
+    const now = new Date().toISOString()
+
+    const session = await getSession()
+    try {
+      await session.executeWrite((tx) =>
+        tx.run(
+          `MATCH (a {id: $sourceId}), (b {id: $targetId})
+           MERGE (a)-[r:${relType}]->(b)
+           SET r.documentId = $documentId,
+               r.document_id = $documentId,
+               r.description = $description,
+               r.confidence = $confidence,
+               r.confidence_score = $confidence,
+               r.source = $source,
+               r.relationship_type = $relType,
+               r.source_entity_id = $sourceId,
+               r.target_entity_id = $targetId,
+               r.created_at = $createdAt`,
+          {
+            sourceId: rel.sourceId,
+            targetId: rel.targetId,
+            documentId: rel.documentId,
+            description: rel.description || '',
+            confidence: rel.confidence || 0,
+            source: rel.source || 'llm',
+            relType: rel.relationship_type,
+            createdAt: rel.created_at || now,
+          }
+        )
+      )
+      return true
+    } finally {
+      await session.close()
+    }
+  }).catch((err) => {
+    console.error('[Neo4j] Relationship upsert error:', err instanceof Error ? err.message : String(err))
+    return false
+  })
+}
+
+/**
+ * Batch upsert relationships by type.
+ * Groups relationships by their type for efficient UNWIND batching.
+ *
+ * @param relationships Array of relationship edges to upsert
+ * @param documentId Document ID for batch operations
+ * @returns Number of relationships successfully upserted
+ */
+export async function upsertRelationshipsBatch(
+  relationships: RelationshipEdge[],
+  documentId: string
+): Promise<number> {
+  if (relationships.length === 0) return 0
+
+  let upserted = 0
+  const now = new Date().toISOString()
+
+  // Group by relationship type for efficient batching
+  const byType = new Map<string, RelationshipEdge[]>()
+  for (const rel of relationships) {
+    const relType = sanitizeLabel(rel.relationship_type)
+    if (!byType.has(relType)) byType.set(relType, [])
+    byType.get(relType)!.push(rel)
+  }
+
+  // Batch upsert per type (500 per batch)
+  // Each batch is wrapped with withNeo4jRetry for transient error recovery
+  const BATCH_SIZE = 500
+  for (const [relType, typeRels] of byType) {
+    for (let i = 0; i < typeRels.length; i += BATCH_SIZE) {
+      const batch = typeRels.slice(i, i + BATCH_SIZE)
+      try {
+        await withNeo4jRetry(async () => {
+          const session = await getSession()
+          try {
+            await session.executeWrite((tx) =>
+              tx.run(
+                `UNWIND $rels AS r
+                 MATCH (a {id: r.sourceId}), (b {id: r.targetId})
+                 MERGE (a)-[rel:${relType}]->(b)
+                 SET rel.documentId = $documentId,
+                     rel.document_id = $documentId,
+                     rel.description = r.description,
+                     rel.confidence = r.confidence,
+                     rel.confidence_score = r.confidence,
+                     rel.source = r.source,
+                     rel.relationship_type = $relType,
+                     rel.source_entity_id = r.sourceId,
+                     rel.target_entity_id = r.targetId,
+                     rel.created_at = $createdAt`,
+                {
+                  rels: batch.map(r => ({
+                    sourceId: r.sourceId,
+                    targetId: r.targetId,
+                    description: r.description || '',
+                    confidence: r.confidence || 0,
+                    source: r.source || 'llm',
+                  })),
+                  documentId,
+                  relType,
+                  createdAt: now,
+                }
+              )
+            )
+          } finally {
+            await session.close()
+          }
+        })
+        upserted += batch.length
+      } catch (err) {
+        console.error(`[Neo4j] Batch relationship upsert error (${relType}):`, err instanceof Error ? err.message : String(err))
+        // Fallback: try individual upserts
+        for (const rel of batch) {
+          const success = await upsertRelationship(rel)
+          if (success) upserted++
+        }
+      }
+    }
+  }
+
+  return upserted
+}
+
+/**
+ * Get all relationships for a document.
+ * Returns relationships with source and target entity names.
+ */
+export async function getRelationshipsByDocument(documentId: string): Promise<
+  Array<{
+    id: string; sourceId: string; targetId: string; relType: string
+    description: string; confidence: number; sourceName: string; targetName: string
+  }>
+> {
+  return withNeo4jRetry(async () => {
+    const session = await getSession()
+    try {
+      const result = await session.executeRead((tx) =>
+        tx.run(
+          `MATCH (a)-[r {documentId: $documentId}]->(b)
+           RETURN r.source_entity_id AS sourceId, r.target_entity_id AS targetId,
+                  type(r) AS relType, r.description AS description,
+                  r.confidence_score AS confidence,
+                  a.name AS sourceName, b.name AS targetName`,
+          { documentId }
+        )
+      )
+      return result.records.map((record) => ({
+        id: `${toNative(record.get('sourceId'))}-${toNative(record.get('relType'))}-${toNative(record.get('targetId'))}`,
+        sourceId: (toNative(record.get('sourceId')) as string) || '',
+        targetId: (toNative(record.get('targetId')) as string) || '',
+        relType: (toNative(record.get('relType')) as string) || '',
+        description: (toNative(record.get('description')) as string) || '',
+        confidence: (toNative(record.get('confidence')) as number) ?? 0,
+        sourceName: (toNative(record.get('sourceName')) as string) || '',
+        targetName: (toNative(record.get('targetName')) as string) || '',
+      }))
+    } finally {
+      await session.close()
+    }
+  }).catch((err) => {
+    console.error('[Neo4j] Get relationships by document error:', err instanceof Error ? err.message : String(err))
+    return []
+  })
+}
+
+/**
+ * Get all relationships connected to a specific entity (by entity ID).
+ * Returns both incoming and outgoing relationships.
+ */
+export async function getRelationshipsByEntity(entityId: string): Promise<
+  Array<{
+    relType: string; direction: 'outgoing' | 'incoming'
+    otherId: string; otherName: string; otherType: string
+    description: string; confidence: number
+  }>
+> {
+  return withNeo4jRetry(async () => {
+    const session = await getSession()
+    try {
+      const result = await session.executeRead((tx) =>
+        tx.run(
+          `MATCH (center {id: $entityId})-[r]-(other)
+           RETURN type(r) AS relType,
+                  CASE WHEN startNode(r).id = $entityId THEN 'outgoing' ELSE 'incoming' END AS direction,
+                  other.id AS otherId, other.name AS otherName, other.entity_type AS otherType,
+                  r.description AS description, r.confidence_score AS confidence`,
+          { entityId }
+        )
+      )
+      return result.records.map((record) => ({
+        relType: (toNative(record.get('relType')) as string) || '',
+        direction: toNative(record.get('direction')) as 'outgoing' | 'incoming',
+        otherId: (toNative(record.get('otherId')) as string) || '',
+        otherName: (toNative(record.get('otherName')) as string) || '',
+        otherType: (toNative(record.get('otherType')) as string) || '',
+        description: (toNative(record.get('description')) as string) || '',
+        confidence: (toNative(record.get('confidence')) as number) ?? 0,
+      }))
+    } finally {
+      await session.close()
+    }
+  }).catch((err) => {
+    console.error('[Neo4j] Get relationships by entity error:', err instanceof Error ? err.message : String(err))
+    return []
+  })
+}
+
+/**
+ * Delete all relationships for a document (keeps entity nodes).
+ */
+export async function deleteRelationshipsByDocument(documentId: string): Promise<number> {
+  return withNeo4jRetry(async () => {
+    const session = await getSession()
+    try {
+      const result = await session.executeWrite((tx) =>
+        tx.run(
+          `MATCH ()-[r {documentId: $documentId}]->()
+           DELETE r
+           RETURN count(r) AS deleted`,
+          { documentId }
+        )
+      )
+      const val = result.records[0]?.get('deleted')
+      return typeof val?.toNumber === 'function' ? val.toNumber() : (val ?? 0) as number
+    } finally {
+      await session.close()
+    }
+  }).catch((err) => {
+    console.error('[Neo4j] Delete relationships by document error:', err instanceof Error ? err.message : String(err))
+    return 0
+  })
+}
+
+// ==================== DOCUMENT GRAPH OPERATIONS ====================
+
+/**
+ * Create or update a Document node in the graph.
+ * This represents the document itself as a node that can be linked to entities.
+ */
+export async function upsertDocumentNode(doc: DocumentNode): Promise<boolean> {
+  return withNeo4jRetry(async () => {
+    const now = new Date().toISOString()
+    const session = await getSession()
+    try {
+      await session.executeWrite((tx) =>
+        tx.run(
+          `MERGE (d:Document {id: $id})
+           SET d.title = $title,
+               d.domain = $domain,
+               d.entity_type = 'Document',
+               d.name = $title,
+               d.entity_name = $title,
+               d.status = $status,
+               d.page_count = $pageCount,
+               d.documentId = $id,
+               d.document_id = $id,
+               d.created_at = $createdAt,
+               d.updated_at = $updatedAt`,
+          {
+            id: doc.id,
+            title: doc.title,
+            domain: doc.domain,
+            status: doc.status,
+            pageCount: doc.page_count || 0,
+            createdAt: doc.created_at || now,
+            updatedAt: now,
+          }
+        )
+      )
+      return true
+    } finally {
+      await session.close()
+    }
+  }).catch((err) => {
+    console.error('[Neo4j] Document node upsert error:', err instanceof Error ? err.message : String(err))
+    return false
+  })
+}
+
+/**
+ * Link a Document node to all entities extracted from it.
+ * Creates CONTAINS relationships from Document → Entity.
+ */
+export async function linkDocumentToEntities(
+  documentId: string,
+  entityIds: string[]
+): Promise<number> {
+  if (entityIds.length === 0) return 0
+
+  let linked = 0
+  const BATCH_SIZE = 500
+
+  for (let i = 0; i < entityIds.length; i += BATCH_SIZE) {
+    const batch = entityIds.slice(i, i + BATCH_SIZE)
+    try {
+      const session = await getSession()
+      try {
+        await session.executeWrite((tx) =>
+          tx.run(
+            `UNWIND $entityIds AS eid
+             MATCH (d:Document {id: $documentId}), (e {id: eid})
+             MERGE (d)-[r:CONTAINS]->(e)
+             SET r.documentId = $documentId, r.document_id = $documentId`,
+            { documentId, entityIds: batch }
+          )
+        )
+        linked += batch.length
+      } finally {
+        await session.close()
+      }
+    } catch (err) {
+      console.error('[Neo4j] Link document to entities error:', err instanceof Error ? err.message : String(err))
+    }
+  }
+
+  return linked
+}
+
+/**
+ * Get the complete subgraph for a document:
+ *   - Document node
+ *   - All entities connected to it
+ *   - All relationships between those entities
+ */
+export async function getDocumentGraph(documentId: string): Promise<{
+  document: DocumentNode | null
+  entities: EntityNode[]
+  relationships: Array<{ sourceId: string; targetId: string; relType: string; description: string }>
+}> {
+  return withNeo4jRetry(async () => {
+    const result = {
+      document: null as DocumentNode | null,
+      entities: [] as EntityNode[],
+      relationships: [] as Array<{ sourceId: string; targetId: string; relType: string; description: string }>,
+    }
+
+    // Get document node
+    const docSession = await getSession()
+    try {
+      const docResult = await docSession.executeRead((tx) =>
+        tx.run(
+          `MATCH (d:Document {id: $documentId}) RETURN d LIMIT 1`,
+          { documentId }
+        )
+      )
+      if (docResult.records.length > 0) {
+        const props = toNative(docResult.records[0].get('d').properties) as Record<string, unknown>
+        result.document = {
+          id: props.id as string,
+          title: (props.title as string) || (props.name as string) || '',
+          domain: (props.domain as string) || '',
+          status: (props.status as string) || '',
+          page_count: props.page_count as number | undefined,
+          created_at: (props.created_at as string) || '',
+          updated_at: (props.updated_at as string) || '',
+        }
+      }
+    } finally {
+      await docSession.close()
+    }
+
+    // Get entities
+    result.entities = await getEntitiesByDocument(documentId)
+
+    // Get relationships between those entities
+    const relSession = await getSession()
+    try {
+      const relResult = await relSession.executeRead((tx) =>
+        tx.run(
+          `MATCH (a)-[r]->(b) WHERE a.documentId = $documentId AND b.documentId = $documentId
+           RETURN a.id AS sourceId, b.id AS targetId, type(r) AS relType, r.description AS description`,
+          { documentId }
+        )
+      )
+      result.relationships = relResult.records.map((record) => ({
+        sourceId: (toNative(record.get('sourceId')) as string) || '',
+        targetId: (toNative(record.get('targetId')) as string) || '',
+        relType: (toNative(record.get('relType')) as string) || '',
+        description: (toNative(record.get('description')) as string) || '',
+      }))
+    } finally {
+      await relSession.close()
+    }
+
+    return result
+  }).catch((err) => {
+    console.error('[Neo4j] Get document graph error:', err instanceof Error ? err.message : String(err))
+    return { document: null, entities: [], relationships: [] }
+  })
+}
+
+/**
+ * Delete a Document node and all its connected entities from the graph.
+ * Uses DETACH DELETE to remove relationships.
+ */
+export async function deleteDocumentGraph(documentId: string): Promise<{
+  nodesDeleted: number
+  relsDeleted: number
+}> {
+  return withNeo4jRetry(async () => {
+    const result = { nodesDeleted: 0, relsDeleted: 0 }
+
+    // Delete document node
+    const docSession = await getSession()
+    try {
+      const docResult = await docSession.executeWrite((tx) =>
+        tx.run(
+          `MATCH (d:Document {id: $documentId})
+           DETACH DELETE d
+           RETURN count(d) AS deleted`,
+          { documentId }
+        )
+      )
+      const val = docResult.records[0]?.get('deleted')
+      result.nodesDeleted += typeof val?.toNumber === 'function' ? val.toNumber() : (val ?? 0) as number
+    } finally {
+      await docSession.close()
+    }
+
+    // Delete all entities for this document
+    const entityResult = await deleteEntitiesByDocument(documentId)
+    result.nodesDeleted += entityResult
+
+    return result
+  }).catch((err) => {
+    console.error('[Neo4j] Delete document graph error:', err instanceof Error ? err.message : String(err))
+    return { nodesDeleted: 0, relsDeleted: 0 }
+  })
+}
+
+// ==================== COMMUNITY DETECTION ====================
+
+/**
+ * Detect communities using Neo4j's built-in Label Propagation algorithm.
+ * Requires Neo4j Graph Data Science (GDS) library.
+ *
+ * If GDS is not available, falls back to a simple domain-based grouping.
+ *
+ * @returns Array of communities with their members
+ */
+export async function detectCommunities(options?: {
+  maxIterations?: number
+  minCommunitySize?: number
+}): Promise<Community[]> {
+  const maxIterations = options?.maxIterations || 10
+  const minCommunitySize = options?.minCommunitySize || 2
+
+  try {
+    // Try GDS Label Propagation
+    const session = await getSession()
+    try {
+      // Check if GDS is available
+      const gdsCheck = await session.executeRead((tx) =>
+        tx.run('CALL gds.list() YIELD name RETURN count(name) AS cnt')
+      )
+      const gdsCount = gdsCheck.records[0]?.get('cnt')
+      const hasGds = typeof gdsCount?.toNumber === 'function' ? gdsCount.toNumber() > 0 : (gdsCount ?? 0) > 0
+
+      if (hasGds) {
+        // Use GDS Label Propagation
+        // Project ALL node labels and relationship types (using * wildcard)
+        await session.executeWrite((tx) =>
+          tx.run(
+            `CALL gds.graph.project('community_graph', '*', '*')`
+          )
+        ).catch(() => {/* Graph may already exist */})
+
+        const communityResult = await session.executeRead((tx) =>
+          tx.run(
+            `CALL gds.labelPropagation.stream('community_graph', {maxIterations: $maxIter})
+             YIELD nodeId, communityId
+             WITH communityId, collect(gds.util.asNode(nodeId)) AS members
+             WHERE size(members) >= $minSize
+             RETURN communityId, members`,
+            { maxIter: maxIterations, minSize: minCommunitySize }
+          )
+        )
+
+        const communities: Community[] = communityResult.records.map((record, idx) => {
+          const members = record.get('members') as Array<{ properties: Record<string, unknown>; labels: string[] }>
+          const memberList = members.map(m => {
+            const props = toNative(m.properties) as Record<string, unknown>
+            const labels = m.labels as string[]
+            return {
+              id: (props.id as string) || '',
+              name: (props.entity_name as string) || (props.name as string) || '',
+              type: (props.entity_type as string) || labels.find(l => isValidLabel(l)) || 'Concept',
+              domain: (props.domain as string) || '',
+            }
+          })
+          const domains = [...new Set(memberList.map(m => m.domain).filter(Boolean))]
+          return {
+            communityId: idx,
+            label: domains.length > 0 ? domains.join('+') : `Community ${idx + 1}`,
+            members: memberList,
+            size: memberList.length,
+            domains,
+          }
+        })
+
+        // Clean up projected graph
+        await session.executeWrite((tx) =>
+          tx.run(`CALL gds.graph.drop('community_graph')`)
+        ).catch(() => {/* Ignore */})
+
+        return communities
+      }
+    } finally {
+      await session.close()
+    }
+  } catch (err) {
+    console.warn('[Neo4j] GDS community detection failed, falling back to domain grouping:', err instanceof Error ? err.message : String(err))
+  }
+
+  // Fallback: domain-based community detection (no GDS required)
+  return await detectCommunitiesByDomain(minCommunitySize)
+}
+
+/**
+ * Fallback community detection: group entities by domain.
+ * This works without GDS and provides meaningful groupings
+ * since entities in the same domain tend to be related.
+ */
+async function detectCommunitiesByDomain(minSize: number): Promise<Community[]> {
+  try {
+    const session = await getSession()
+    try {
+      const result = await session.executeRead((tx) =>
+        tx.run(
+          `MATCH (n) WHERE n.domain IS NOT NULL AND n.entity_type IS NOT NULL AND n.entity_type <> 'Document'
+           WITH n.domain AS domain, collect(n) AS members
+           WHERE size(members) >= $minSize
+           RETURN domain, members
+           ORDER BY size(members) DESC`,
+          { minSize }
+        )
+      )
+
+      return result.records.map((record, idx) => {
+        const domain = (toNative(record.get('domain')) as string) || `Group ${idx + 1}`
+        const members = (record.get('members') as Array<{ properties: Record<string, unknown>; labels: string[] }>).map(m => {
+          const props = toNative(m.properties) as Record<string, unknown>
+          const labels = m.labels as string[]
+          return {
+            id: (props.id as string) || '',
+            name: (props.entity_name as string) || (props.name as string) || '',
+            type: (props.entity_type as string) || labels.find(l => isValidLabel(l)) || 'Concept',
+            domain: (props.domain as string) || '',
+          }
+        })
+        return {
+          communityId: idx,
+          label: domain,
+          members,
+          size: members.length,
+          domains: [domain],
+        }
+      })
+    } finally {
+      await session.close()
+    }
+  } catch (err) {
+    console.error('[Neo4j] Domain-based community detection error:', err instanceof Error ? err.message : String(err))
+    return []
+  }
+}
+
+/**
+ * Detect communities using connected components.
+ * Groups entities that are reachable from each other via relationships.
+ * Works without GDS library — uses pure Cypher.
+ */
+export async function detectConnectedCommunities(options?: {
+  maxDepth?: number
+  minSize?: number
+}): Promise<Community[]> {
+  const maxDepth = options?.maxDepth || 3
+  const minSize = options?.minSize || 2
+
+  try {
+    const session = await getSession()
+    try {
+      // Find clusters of closely connected entities using variable-length paths
+      const result = await session.executeRead((tx) =>
+        tx.run(
+          `MATCH (n) WHERE n.entity_type IS NOT NULL AND n.entity_type <> 'Document'
+           WITH collect(DISTINCT n) AS allNodes
+           UNWIND range(0, size(allNodes)-1) AS i
+           WITH allNodes, allNodes[i] AS start
+           MATCH path = (start)-[*1..${maxDepth}]-(connected)
+           WHERE connected.entity_type IS NOT NULL AND connected.entity_type <> 'Document'
+           WITH start, collect(DISTINCT connected) AS cluster
+           WITH start.id AS seedId, [start] + cluster AS cluster
+           WITH seedId, cluster, size(cluster) AS clusterSize
+           WHERE clusterSize >= $minSize
+           RETURN seedId, cluster, clusterSize
+           ORDER BY clusterSize DESC
+           LIMIT 20`,
+          { minSize }
+        )
+      )
+
+      // Deduplicate overlapping clusters (keep largest)
+      const seen = new Set<string>()
+      const communities: Community[] = []
+
+      for (const record of result.records) {
+        const cluster = (record.get('cluster') as Array<{ properties: Record<string, unknown>; labels: string[] }>)
+        const memberIds = cluster.map(m => (toNative(m.properties) as Record<string, unknown>).id as string)
+
+        // Skip if majority of members already in a community
+        const overlap = memberIds.filter(id => seen.has(id)).length
+        if (overlap > memberIds.length * 0.5) continue
+
+        const members = cluster.map(m => {
+          const props = toNative(m.properties) as Record<string, unknown>
+          const labels = m.labels as string[]
+          return {
+            id: (props.id as string) || '',
+            name: (props.entity_name as string) || (props.name as string) || '',
+            type: (props.entity_type as string) || labels.find(l => isValidLabel(l)) || 'Concept',
+            domain: (props.domain as string) || '',
+          }
+        })
+
+        const domains = [...new Set(members.map(m => m.domain).filter(Boolean))]
+        communities.push({
+          communityId: communities.length,
+          label: domains.length > 0 ? domains.join('+') : `Cluster ${communities.length + 1}`,
+          members,
+          size: members.length,
+          domains,
+        })
+
+        memberIds.forEach(id => seen.add(id))
+      }
+
+      return communities
+    } finally {
+      await session.close()
+    }
+  } catch (err) {
+    console.error('[Neo4j] Connected community detection error:', err instanceof Error ? err.message : String(err))
+    return []
+  }
+}
+
+// ==================== GRAPH TRAVERSAL ====================
+
+/**
+ * Get the neighborhood of an entity — all directly connected entities
+ * and the relationships between them.
+ */
+export async function getEntityNeighborhood(
+  entityName: string,
+  options?: { limit?: number }
+): Promise<EntityNeighborhood | null> {
+  const limit = options?.limit || 30
+  try {
+    const session = await getSession()
+    try {
+      // Get center entity
+      const centerResult = await session.executeRead((tx) =>
+        tx.run(
+          `MATCH (n {name: $name}) RETURN n.name AS name, n.entity_type AS type, n.domain AS domain, n.description AS description LIMIT 1`,
+          { name: entityName }
+        )
+      )
+      if (centerResult.records.length === 0) return null
+
+      const center = {
+        id: '',
+        name: (toNative(centerResult.records[0].get('name')) as string) || '',
+        type: (toNative(centerResult.records[0].get('type')) as string) || '',
+        domain: (toNative(centerResult.records[0].get('domain')) as string) || '',
+        description: (toNative(centerResult.records[0].get('description')) as string) || '',
+      }
+
+      // Get neighbors
+      const neighborResult = await session.executeRead((tx) =>
+        tx.run(
+          `MATCH (center {name: $name})-[r]-(neighbor)
+           RETURN neighbor.name AS name, neighbor.entity_type AS type, neighbor.domain AS domain,
+                  CASE WHEN startNode(r).name = $name THEN 'outgoing' ELSE 'incoming' END AS direction,
+                  type(r) AS relType
+           LIMIT $limit`,
+          { name: entityName, limit }
+        )
+      )
+
+      const neighbors = neighborResult.records.map((record) => ({
+        id: '',
+        name: (toNative(record.get('name')) as string) || '',
+        type: (toNative(record.get('type')) as string) || '',
+        domain: (toNative(record.get('domain')) as string) || '',
+        direction: toNative(record.get('direction')) as 'outgoing' | 'incoming',
+        relType: (toNative(record.get('relType')) as string) || '',
+      }))
+
+      return { center, neighbors }
+    } finally {
+      await session.close()
+    }
+  } catch (err) {
+    console.error('[Neo4j] Get entity neighborhood error:', err instanceof Error ? err.message : String(err))
+    return null
+  }
+}
+
+/**
+ * Find the shortest path between two entities by name.
+ */
+export async function findShortestPath(
+  fromName: string,
+  toName: string,
+  options?: { maxHops?: number }
+): Promise<PathResult | null> {
+  const maxHops = options?.maxHops || 5
+  try {
+    const session = await getSession()
+    try {
+      const result = await session.executeRead((tx) =>
+        tx.run(
+          `MATCH path = shortestPath((a {name: $from})-[*..${maxHops}]-(b {name: $to}))
+           RETURN [n IN nodes(path) | {name: n.name, type: n.entity_type}] AS nodes,
+                  [r IN relationships(path) | {source: startNode(r).name, type: type(r), target: endNode(r).name}] AS edges,
+                  length(path) AS pathLength
+           LIMIT 3`,
+          { from: fromName, to: toName }
+        )
+      )
+
+      if (result.records.length === 0) return null
+
+      const record = result.records[0]
+      return {
+        nodes: toNative(record.get('nodes')) as Array<{ name: string; type: string }>,
+        edges: toNative(record.get('edges')) as Array<{ source: string; type: string; target: string }>,
+        length: (toNative(record.get('pathLength')) as number) || 0,
+      }
+    } finally {
+      await session.close()
+    }
+  } catch (err) {
+    console.error('[Neo4j] Find shortest path error:', err instanceof Error ? err.message : String(err))
+    return null
+  }
+}
+
+/**
+ * Get aggregate graph statistics.
+ */
+export async function getGraphStats(): Promise<{
+  totalNodes: number
+  totalRelationships: number
+  nodesByLabel: Record<string, number>
+  relsByType: Record<string, number>
+  nodesByDomain: Record<string, number>
+  avgDegree: number
+}> {
+  try {
+    const stats = {
+      totalNodes: 0,
+      totalRelationships: 0,
+      nodesByLabel: {} as Record<string, number>,
+      relsByType: {} as Record<string, number>,
+      nodesByDomain: {} as Record<string, number>,
+      avgDegree: 0,
+    }
+
+    const session = await getSession()
+    try {
+      // Total nodes
+      const nodeResult = await session.executeRead((tx) =>
+        tx.run('MATCH (n) RETURN count(n) AS cnt')
+      )
+      stats.totalNodes = toNative(nodeResult.records[0]?.get('cnt')) as number || 0
+
+      // Total relationships
+      const relResult = await session.executeRead((tx) =>
+        tx.run('MATCH ()-[r]->() RETURN count(r) AS cnt')
+      )
+      stats.totalRelationships = toNative(relResult.records[0]?.get('cnt')) as number || 0
+
+      // Nodes by label
+      const labelResult = await session.executeRead((tx) =>
+        tx.run(
+          `MATCH (n) WHERE size(labels(n)) > 0
+           WITH labels(n) AS lbls UNWIND lbls AS lbl
+           RETURN lbl AS label, count(*) AS cnt ORDER BY cnt DESC`
+        )
+      )
+      for (const record of labelResult.records) {
+        stats.nodesByLabel[toNative(record.get('label')) as string] = toNative(record.get('cnt')) as number
+      }
+
+      // Relationships by type
+      const typeResult = await session.executeRead((tx) =>
+        tx.run(
+          `MATCH ()-[r]->() RETURN type(r) AS relType, count(r) AS cnt ORDER BY cnt DESC`
+        )
+      )
+      for (const record of typeResult.records) {
+        stats.relsByType[toNative(record.get('relType')) as string] = toNative(record.get('cnt')) as number
+      }
+
+      // Nodes by domain
+      const domainResult = await session.executeRead((tx) =>
+        tx.run(
+          `MATCH (n) WHERE n.domain IS NOT NULL RETURN n.domain AS domain, count(n) AS cnt ORDER BY cnt DESC`
+        )
+      )
+      for (const record of domainResult.records) {
+        stats.nodesByDomain[toNative(record.get('domain')) as string] = toNative(record.get('cnt')) as number
+      }
+
+      // Average degree
+      if (stats.totalNodes > 0) {
+        const degreeResult = await session.executeRead((tx) =>
+          tx.run(
+            `MATCH (n)-[r]-() WITH n, count(r) AS degree RETURN avg(degree) AS avgDeg`
+          )
+        )
+        stats.avgDegree = Math.round((toNative(degreeResult.records[0]?.get('avgDeg')) as number || 0) * 100) / 100
+      }
+    } finally {
+      await session.close()
+    }
+
+    return stats
+  } catch (err) {
+    console.error('[Neo4j] Get graph stats error:', err instanceof Error ? err.message : String(err))
+    return { totalNodes: 0, totalRelationships: 0, nodesByLabel: {}, relsByType: {}, nodesByDomain: {}, avgDegree: 0 }
+  }
+}
+
+// ==================== BACKGROUND HEALTH MONITOR ====================
+
+/**
+ * Periodic background health check for Neo4j.
+ *
+ * Problem: When running locally with Neo4j Desktop, the laptop may go to
+ * sleep/hibernate. When it wakes up, the Neo4j driver's connection pool
+ * contains stale/dead connections. The first request after wake-up will
+ * fail with "connection refused" or "session expired" errors.
+ *
+ * Solution: A background timer pings Neo4j every 60 seconds. If the ping
+ * fails, it proactively resets the driver so that the next real request
+ * gets a fresh connection immediately — instead of failing and retrying.
+ *
+ * This timer is only started when:
+ *   1. The app is NOT in test mode
+ *   2. NEO4J_URI is configured
+ *   3. A driver has been successfully created at least once
+ */
+let healthCheckInterval: ReturnType<typeof setInterval> | null = null
+const HEALTH_CHECK_INTERVAL_MS = 60_000 // 60 seconds
+let healthCheckStarted = false
+
+export function startNeo4jHealthMonitor(): void {
+  if (healthCheckStarted) return
+  healthCheckStarted = true
+
+  // Lazy start: only begin the interval after the driver is first created
+  const originalGetDriver = getNeo4jDriver
+  let monitorStarted = false
+
+  const tryStart = () => {
+    if (monitorStarted) return
+    if (!process.env.NEO4J_URI) return
+
+    monitorStarted = true
+    console.log('[Neo4j] Background health monitor started (60s interval)')
+
+    healthCheckInterval = setInterval(async () => {
+      if (!globalForNeo4j.neo4jDriver) return // No driver to check
+
+      try {
+        const session = globalForNeo4j.neo4jDriver.session({ database: process.env.NEO4J_DATABASE || undefined })
+        try {
+          await session.run('RETURN 1 AS __health_ping__')
+          // Connection is alive — no action needed
+        } finally {
+          await session.close()
+        }
+      } catch (err: any) {
+        const msg = err instanceof Error ? err.message : String(err)
+        console.warn(`[Neo4j] Background health check FAILED — resetting driver. Error: ${msg}`)
+        // Proactively reset the driver so the next real request succeeds immediately
+        await resetNeo4jDriver()
+      }
+    }, HEALTH_CHECK_INTERVAL_MS)
+
+    // Don't let the interval prevent process exit
+    if (healthCheckInterval && typeof healthCheckInterval === 'object' && 'unref' in healthCheckInterval) {
+      healthCheckInterval.unref()
+    }
+  }
+
+  // Start on next tick (after env vars are loaded)
+  process.nextTick(() => {
+    if (process.env.NEO4J_URI) {
+      tryStart()
+    }
+  })
+}
+
+// Auto-start the health monitor when this module is imported (non-test only)
+if (process.env.NODE_ENV !== 'test' && typeof process.env.NEO4J_URI === 'string' && process.env.NEO4J_URI) {
+  startNeo4jHealthMonitor()
+}

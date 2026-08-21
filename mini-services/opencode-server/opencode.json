@@ -1,0 +1,38 @@
+{
+  "server": {
+    "port": 18790,
+    "bind": "loopback"
+  },
+  "providers": {
+    "nvidia": {
+      "type": "openai-compatible",
+      "baseURL": "https://integrate.api.nvidia.com/v1",
+      "apiKey": "${NVIDIA_API_KEY_1}",
+      "models": [
+        "nvidia/nemotron-3-super-120b-a12b",
+        "meta/llama-3.3-70b-instruct",
+        "openai/gpt-oss-120b",
+        "deepseek-ai/deepseek-v4-pro",
+        "moonshotai/kimi-k2.6",
+        "z-ai/glm-5.1",
+        "minimaxai/minimax-m2.7",
+        "qwen/qwen3.5-397b-a17b"
+      ]
+    }
+  },
+  "mcp": {
+    "servers": {
+      "knowledge-bridge": {
+        "type": "http",
+        "url": "http://127.0.0.1:18789",
+        "tools": ["knowledge_search", "knowledge_graph", "knowledge_write", "web_search"]
+      }
+    }
+  },
+  "lsp": {
+    "typescript": {
+      "command": "typescript-language-server",
+      "args": ["--stdio"]
+    }
+  }
+}

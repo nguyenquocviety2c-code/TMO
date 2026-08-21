@@ -1,0 +1,2002 @@
+     1→/**
+     2→ * Shared LLM Calling Module for GraphRAG
+     3→ *
+     4→ * SINGLE PROVIDER architecture — NVIDIA NIM ONLY:
+     5→ *   NVIDIA NIM (4 keys × 4 docs = 16 max concurrent, auto mode)
+     6→ *
+     7→ * Architecture: NVIDIA NIM ONLY (no Mistral, Cerebras, OpenRouter)
+     8→ *   - 3 extraction cores: nemotron-3-super, llama-3.3-70b, gpt-oss-120b
+     9→ *   - 5 agent/chat cores: deepseek-v4-pro, kimi-k2.6, glm-5.1, minimax-m2.7, qwen3.5-397b
+    10→ *   - NOT using: deepseek-v4-flash
+    11→ *
+    12→ * Key assignment (AUTO mode, least-loaded-first):
+    13→ *   - Each document gets a key (0-3, auto-assigned to least-loaded key)
+    14→ *   - Key N uses NVIDIA Key N (strict binding for rate limit isolation)
+    15→ *   - If Key N is rate-limited/exhausted → fallback to next available key
+    16→ *
+    17→ * Model rotation: Models within each group are tried in round-robin order
+    18→ *   so all models get usage, not just the first in the list.
+    19→ *
+    20→ * Token tracking: NVIDIA NIM (single provider)
+    21→ */
+    22→
+    23→// ==================== TOKEN EVENT EMITTER (SSE REALTIME) ====================
+    24→
+    25→import { EventEmitter } from 'events'
+    26→
+    27→/** EventEmitter for real-time token updates (SSE).
+    28→ *  Emits 'token-update' event whenever addTokensUsed() or addTokensUsedByAgent() is called.
+    29→ *  The SSE endpoint /api/token-usage/stream subscribes to this emitter. */
+    30→export const tokenEmitter = new EventEmitter()
+    31→tokenEmitter.setMaxListeners(50) // Allow multiple SSE connections
+    32→
+    33→/** Throttle SSE emission: max once per 500ms to avoid flooding clients.
+    34→ *  Token data is accumulated in-memory between emissions — no data loss. */
+    35→let lastEmitTime = 0
+    36→let emitTimer: ReturnType<typeof setTimeout> | null = null
+    37→const EMIT_THROTTLE_MS = 500
+    38→
+    39→function emitTokenUpdate() {
+    40→  const now = Date.now()
+    41→  if (now - lastEmitTime >= EMIT_THROTTLE_MS) {
+    42→    lastEmitTime = now
+    43→    // Emit a snapshot of current in-memory data (non-blocking)
+    44→    const snapshot = {
+    45→      date: dailyTokenDate,
+    46→      tokens: dailyTokenCount,
+    47→      providers: { ...dailyTokensByProvider },
+    48→      slots: (() => { const r: Record<string, Record<number, number>> = {}; for (const [p, s] of Object.entries(dailyTokensByProviderSlot)) { r[p] = { ...s } }; return r })(),
+    49→      models: (() => { const r: Record<string, Record<string, number>> = {}; for (const [p, m] of Object.entries(dailyTokensByProviderModel)) { r[p] = { ...m } }; return r })(),
+    50→      agents: Object.entries(dailyTokensByAgent).filter(([k]) => k.startsWith(dailyTokenDate)).map(([, d]) => ({ ...d })),
+    51→    }
+    52→    tokenEmitter.emit('token-update', snapshot)
+    53→  } else if (!emitTimer) {
+    54→    // Schedule a delayed emission to ensure updates aren't lost
+    55→    emitTimer = setTimeout(() => {
+    56→      emitTimer = null
+    57→      lastEmitTime = Date.now()
+    58→      const snapshot = {
+    59→        date: dailyTokenDate,
+    60→        tokens: dailyTokenCount,
+    61→        providers: { ...dailyTokensByProvider },
+    62→        slots: (() => { const r: Record<string, Record<number, number>> = {}; for (const [p, s] of Object.entries(dailyTokensByProviderSlot)) { r[p] = { ...s } }; return r })(),
+    63→        models: (() => { const r: Record<string, Record<string, number>> = {}; for (const [p, m] of Object.entries(dailyTokensByProviderModel)) { r[p] = { ...m } }; return r })(),
+    64→        agents: Object.entries(dailyTokensByAgent).filter(([k]) => k.startsWith(dailyTokenDate)).map(([, d]) => ({ ...d })),
+    65→      }
+    66→      tokenEmitter.emit('token-update', snapshot)
+    67→    }, EMIT_THROTTLE_MS - (now - lastEmitTime))
+    68→  }
+    69→}
+    70→
+    71→// ==================== TYPES ====================
+    72→
+    73→export interface LLMResult {
+    74→  content: string
+    75→  provider: string
+    76→  model: string
+    77→  error?: string
+    78→  tokensUsed?: number /// Total tokens (prompt + completion) from API response
+    79→  toolCalls?: Array<{
+    80→    id: string
+    81→    type: 'function'
+    82→    function: { name: string; arguments: string }
+    83→  }>
+    84→  finishReason?: string
+    85→}
+    86→
+    87→export interface LLMCallOptions {
+    88→  temperature?: number
+    89→  maxTokens?: number
+    90→  agentId?: string      /// AgentProfile.id — for per-agent token tracking
+    91→  agentName?: string    /// Agent name — denormalized for quick display
+    92→  tools?: Array<{ type: string; function: { name: string; description: string; parameters: Record<string, unknown> } }>
+    93→}
+    94→
+    95→// ==================== CONSTANTS ====================
+    96→
+    97→export const MAX_KEYS = 4
+    98→
+    99→/** Maximum documents each key can process concurrently.
+   100→ *  With 4 keys × 4 docs = 16 max concurrent documents (auto mode). */
+   101→export const MAX_DOCS_PER_KEY = 4
+   102→
+   103→/** Absolute maximum concurrent documents across all keys (auto mode). */
+   104→export const MAX_TOTAL_CONCURRENT = MAX_KEYS * MAX_DOCS_PER_KEY
+   105→
+   106→/** Single provider architecture — NVIDIA NIM ONLY */
+   107→const PROVIDER_COUNT = 1
+   108→const PROVIDER_NAMES = ['NVIDIA'] as const
+   109→
+   110→/** Key assignment mode — no more slot mode.
+   111→ *  Each of the 4 API keys can handle up to 4 documents concurrently.
+   112→ *  Auto mode: documents are assigned to the key with the fewest active docs.
+   113→ *  Max concurrent: 4 keys × 4 docs = 16 documents. */
+   114→export const KEY_ASSIGNMENT_MODE = 'auto' as const
+   115→
+   116→// ==================== PROVIDER ROTATION (simplified — single provider) ====================
+   117→
+   118→/** With a single provider (NVIDIA), rotation is trivial — always use index 0.
+   119→ *  Kept for API compatibility with callLLMSlot/callLLM signatures. */
+   120→let providerRotationCounter = 0
+   121→
+   122→function getNextProviderStart(): number {
+   123→  const start = providerRotationCounter % PROVIDER_COUNT
+   124→  providerRotationCounter++
+   125→  return start
+   126→}
+   127→
+   128→// ==================== MODEL ROTATION ====================
+   129→
+   130→/** Per-provider model rotation counters.
+   131→ *  Each provider starts its model list at a different offset each call,
+   132→ *  so all models within a provider get usage, not just the first one.
+   133→ */
+   134→const modelRotationCounters: Record<string, number> = {
+   135→  NVIDIA: 0,
+   136→}
+   137→
+   138→/** Get a rotated copy of a model list for a provider.
+   139→ *  The starting model changes each call so all models get used.
+   140→ */
+   141→function getRotatedModels(provider: string, models: string[]): string[] {
+   142→  const offset = modelRotationCounters[provider] % models.length
+   143→  modelRotationCounters[provider]++
+   144→  if (offset === 0) return models // No rotation needed
+   145→  return [...models.slice(offset), ...models.slice(0, offset)]
+   146→}
+   147→
+   148→/** NVIDIA NIM EXTRACTION models (4 keys × 4 docs, no daily cap)
+   149→ *  CHÍNH SÁCH: NVIDIA NIM chỉ sử dụng 3 lõi này cho trích xuất tài liệu.
+   150→ *  Các lõi khác (deepseek, kimi, glm, minimax, qwen3.5-397b) chỉ dùng cho agent/chat.
+   151→ *
+   152→ *  nvidia/nemotron-3-super-120b-a12b: Nemotron 3 Super, 120B MoE, high throughput ✓
+   153→ *  meta/llama-3.3-70b-instruct: Llama 3.3 70B — NOTE: dots not underscores! ✓
+   154→ *  openai/gpt-oss-120b: 120B MoE, strong reasoning ✓
+   155→ */
+   156→const NVIDIA_EXTRACTION_MODELS = [
+   157→  'nvidia/nemotron-3-super-120b-a12b',
+   158→  'meta/llama-3.3-70b-instruct',
+   159→  'openai/gpt-oss-120b',
+   160→]
+   161→
+   162→/** NVIDIA NIM ALL models (3 extraction + 5 agent/chat, không dùng deepseek-v4-flash)
+   163→ *  Model IDs verified 2025-07 against https://integrate.api.nvidia.com/v1/models
+   164→ */
+   165→const NVIDIA_MODELS = [
+   166→  // Extraction models (3 lõi trích xuất tài liệu)
+   167→  'nvidia/nemotron-3-super-120b-a12b',
+   168→  'meta/llama-3.3-70b-instruct',
+   169→  'openai/gpt-oss-120b',
+   170→  // Agent/Chat models (5 lõi, không dùng deepseek-v4-flash)
+   171→  'deepseek-ai/deepseek-v4-pro',
+   172→  'moonshotai/kimi-k2.6',
+   173→  'z-ai/glm-5.1',
+   174→  'minimaxai/minimax-m2.7',
+   175→  'qwen/qwen3.5-397b-a17b',
+   176→]
+   177→
+   178→/** NVIDIA NIM ALL models (3 extraction + 5 agent/chat) */
+   179→
+   180→// ==================== DAILY TOKEN TRACKING ====================
+   181→
+   182→/** In-memory daily token counter — persisted to DB periodically */
+   183→let dailyTokenCount = 0
+   184→let dailyTokenDate = '' // "YYYY-MM-DD"
+   185→let persistTimer: ReturnType<typeof setTimeout> | null = null
+   186→const PERSIST_INTERVAL_MS = 10_000 // Persist to DB every 10 seconds — reduced from 30s to minimize data loss on dev server hot-reloads
+   187→let lastPersistTime = 0 // Track last persist time for debounced immediate persist
+   188→const IMMEDIATE_PERSIST_MIN_INTERVAL_MS = 3_000 // Minimum 3s between immediate persists (debounce)
+   189→
+   190→/** In-memory per-provider daily token counters — persisted alongside total */
+   191→const dailyTokensByProvider: Record<string, number> = {} // provider → tokens
+   192→
+   193→/** In-memory per-provider-per-slot daily token counters — persisted alongside total */
+   194→const dailyTokensByProviderSlot: Record<string, Record<number, number>> = {} // provider → { slotIndex → tokens }
+   195→
+   196→/** In-memory per-provider-per-model daily token counters — tracks tokens per model */
+   197→const dailyTokensByProviderModel: Record<string, Record<string, number>> = {} // provider → { modelName → tokens }
+   198→
+   199→/** In-memory per-agent daily token counters — tracks tokens per agent per provider+model
+   200→ *  Key: "date:agentId:provider:model" */
+   201→const dailyTokensByAgent: Record<string, {
+   202→  agentId: string
+   203→  agentName: string
+   204→  provider: string
+   205→  model: string
+   206→  tokens: number
+   207→  inputTokens: number
+   208→  outputTokens: number
+   209→}> = {}
+   210→
+   211→// ==================== DIRTY TRACKING (avoid unnecessary DB writes) ====================
+   212→
+   213→/** Track which in-memory values have changed since the last persist.
+   214→ *  Only dirty records are written to SQLite, reducing I/O by ~80%. */
+   215→let totalTokensDirty = false
+   216→const providerDirty: Set<string> = new Set()     // Set of provider names that changed
+   217→const slotDirty: Set<string> = new Set()         // Set of "provider:slot" keys that changed
+   218→const modelDirty: Set<string> = new Set()        // Set of "provider:model" keys that changed
+   219→const agentDirty: Set<string> = new Set()        // Set of "agentId:provider:model" keys that changed
+   220→// NOTE: No remote sync needed — SQLite is the sole persistent store for token data
+   221→
+   222→/** Cached db reference — avoids repeated dynamic imports that can create
+   223→ *  separate PrismaClient instances in Next.js dev mode with Turbopack.
+   224→ *  This is the root cause of the intermittent "Unable to open the database file"
+   225→ *  error: each dynamic import might compile to a separate module context,
+   226→ *  creating a new PrismaClient that conflicts with the existing one.
+   227→ */
+   228→let cachedDb: InstanceType<typeof import('@/lib/db')['db']> | null = null
+   229→
+   230→async function getDb() {
+   231→  if (!cachedDb) {
+   232→    const { db } = await import('@/lib/db')
+   233→    cachedDb = db
+   234→  }
+   235→  return cachedDb
+   236→}
+   237→
+   238→/** Check if an error is a transient SQLite error that can be retried */
+   239→function isTransientDbError(err: unknown): boolean {
+   240→  return err instanceof Error && (
+   241→    err.message.includes('Unable to open') ||
+   242→    err.message.includes('SQLITE_BUSY') ||
+   243→    err.message.includes('SQLITE_CANTOPEN') ||
+   244→    err.message.includes('Error code 14') ||
+   245→    err.message.includes('database is locked') ||
+   246→    err.message.includes('Connection is closed') ||
+   247→    err.message.includes('prepared statement failed')
+   248→  )
+   249→}
+   250→
+   251→/** Retry a database operation with exponential backoff.
+   252→ *  SQLite has a single-writer limitation — concurrent writes from different
+   253→ *  PrismaClient instances (caused by Turbopack hot-reloading) can fail with
+   254→ *  SQLITE_CANTOPEN (Error code 14). Retrying with a delay gives the lock
+   255→ *  time to release.
+   256→ *
+   257→ *  Also resets the cachedDb on transient errors — sometimes the cached
+   258→ *  PrismaClient becomes stale after a hot-reload, and getting a fresh
+   259→ *  reference fixes the issue.
+   260→ */
+   261→async function retryDbOp<T>(
+   262→  op: (db: Awaited<ReturnType<typeof getDb>>) => Promise<T>,
+   263→  maxRetries = 3,
+   264→  baseDelayMs = 1000
+   265→): Promise<T> {
+   266→  let lastErr: unknown
+   267→  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+   268→    try {
+   269→      const db = await getDb()
+   270→      return await op(db)
+   271→    } catch (err) {
+   272→      lastErr = err
+   273→      if (!isTransientDbError(err) || attempt === maxRetries) break
+   274→      // Reset cachedDb on transient errors — the PrismaClient might be stale
+   275→      // after a Turbopack hot-reload, and getting a fresh reference fixes it.
+   276→      cachedDb = null
+   277→      const delay = baseDelayMs * Math.pow(2, attempt)
+   278→      console.log(`[TokenTracker] DB busy, retry ${attempt + 1}/${maxRetries} in ${delay}ms...`)
+   279→      await new Promise(resolve => setTimeout(resolve, delay))
+   280→    }
+   281→  }
+   282→  throw lastErr
+   283→}
+   284→
+   285→/** User timezone for daily token reset.
+   286→ *  The server runs in UTC, but the user is in Vietnam (ICT, UTC+7).
+   287→ *  Token counters must reset at midnight USER time, not midnight UTC.
+   288→ *  Without this fix, tokens would reset at 07:00 AM Vietnam time instead of 00:00. */
+   289→const USER_TIMEZONE = 'Asia/Ho_Chi_Minh'
+   290→
+   291→function getTodayDateStr(): string {
+   292→  // Use Intl.DateTimeFormat to get the correct date in the user's timezone
+   293→  // This ensures token counters reset at midnight in Vietnam (ICT), not UTC
+   294→  const now = new Date()
+   295→  const parts = new Intl.DateTimeFormat('en-CA', {
+   296→    timeZone: USER_TIMEZONE,
+   297→    year: 'numeric',
+   298→    month: '2-digit',
+   299→    day: '2-digit',
+   300→  }).formatToParts(now)
+   301→  const year = parts.find(p => p.type === 'year')!.value
+   302→  const month = parts.find(p => p.type === 'month')!.value
+   303→  const day = parts.find(p => p.type === 'day')!.value
+   304→  return `${year}-${month}-${day}`
+   305→}
+   306→
+   307→async function initDailyTokens(): Promise<void> {
+   308→  try {
+   309→    const today = getTodayDateStr()
+   310→    const dateChanged = dailyTokenDate && dailyTokenDate !== today
+   311→
+   312→    // If the date changed, persist the previous day's data BEFORE resetting
+   313→    if (dateChanged) {
+   314→      const oldDate = dailyTokenDate
+   315→      const oldCount = dailyTokenCount
+   316→      const oldProviders = { ...dailyTokensByProvider }
+   317→      const oldSlots: Record<string, Record<number, number>> = {}
+   318→      for (const [p, s] of Object.entries(dailyTokensByProviderSlot)) {
+   319→        oldSlots[p] = { ...s }
+   320→      }
+   321→      // Snapshot model + agent data too (BUG FIX)
+   322→      const oldModels: Record<string, Record<string, number>> = {}
+   323→      for (const [p, ms] of Object.entries(dailyTokensByProviderModel)) {
+   324→        oldModels[p] = { ...ms }
+   325→      }
+   326→      const oldAgents: Record<string, typeof dailyTokensByAgent[string]> = {}
+   327→      for (const [k, v] of Object.entries(dailyTokensByAgent)) {
+   328→        oldAgents[k] = { ...v }
+   329→      }
+   330→      console.log(`[TokenTracker] Date changed in init (${oldDate} → ${today}), persisting previous day data first`)
+   331→      await persistDailyTokens(oldDate, oldCount, oldProviders, oldSlots, oldModels, oldAgents).catch(() => {})
+   332→
+   333→      // Reset in-memory counters for the new day
+   334→      dailyTokenCount = 0
+   335→      for (const key of Object.keys(dailyTokensByProvider)) {
+   336→        delete dailyTokensByProvider[key]
+   337→      }
+   338→      for (const key of Object.keys(dailyTokensByProviderSlot)) {
+   339→        delete dailyTokensByProviderSlot[key]
+   340→      }
+   341→      for (const key of Object.keys(dailyTokensByProviderModel)) {
+   342→        delete dailyTokensByProviderModel[key]
+   343→      }
+   344→      for (const key of Object.keys(dailyTokensByAgent)) {
+   345→        delete dailyTokensByAgent[key]
+   346→      }
+   347→    }
+   348→
+   349→    // === SQLITE-ONLY INIT ===
+   350→    // Token tracking is now SQLite-only (no remote sync)
+   351→    // Architecture: In-memory → SQLite (every 30s)
+   352→    const record = await retryDbOp(db => db.dailyTokenUsage.findUnique({ where: { date: today } }))
+   353→    const dbTokens = record?.tokens ?? 0
+   354→
+   355→    // Load per-provider data from SQLite for today
+   356→    const dbProviderRecords = await retryDbOp(db => db.dailyTokenByProvider.findMany({ where: { date: today } }))
+   357→    for (const rec of dbProviderRecords) {
+   358→      if (dailyTokensByProvider[rec.provider] === undefined) {
+   359→        dailyTokensByProvider[rec.provider] = rec.tokens
+   360→      } else {
+   361→        dailyTokensByProvider[rec.provider] = Math.max(dailyTokensByProvider[rec.provider], rec.tokens)
+   362→      }
+   363→    }
+   364→
+   365→    // Load per-provider-per-slot data from SQLite for today
+   366→    const dbSlotRecords = await retryDbOp(db => db.dailyTokenByProviderSlot.findMany({ where: { date: today } }))
+   367→    for (const rec of dbSlotRecords) {
+   368→      if (!dailyTokensByProviderSlot[rec.provider]) {
+   369→        dailyTokensByProviderSlot[rec.provider] = {}
+   370→      }
+   371→      if (dailyTokensByProviderSlot[rec.provider][rec.slot] === undefined) {
+   372→        dailyTokensByProviderSlot[rec.provider][rec.slot] = rec.tokens
+   373→      } else {
+   374→        dailyTokensByProviderSlot[rec.provider][rec.slot] = Math.max(
+   375→          dailyTokensByProviderSlot[rec.provider][rec.slot],
+   376→          rec.tokens
+   377→        )
+   378→      }
+   379→    }
+   380→
+   381→    // Load per-provider-per-model data from SQLite for today
+   382→    const dbModelRecords = await retryDbOp(db => db.dailyTokenByProviderModel.findMany({ where: { date: today } }))
+   383→    for (const rec of dbModelRecords) {
+   384→      if (!dailyTokensByProviderModel[rec.provider]) {
+   385→        dailyTokensByProviderModel[rec.provider] = {}
+   386→      }
+   387→      if (dailyTokensByProviderModel[rec.provider][rec.model] === undefined) {
+   388→        dailyTokensByProviderModel[rec.provider][rec.model] = rec.tokens
+   389→      } else {
+   390→        dailyTokensByProviderModel[rec.provider][rec.model] = Math.max(
+   391→          dailyTokensByProviderModel[rec.provider][rec.model],
+   392→          rec.tokens
+   393→        )
+   394→      }
+   395→    }
+   396→
+   397→    // Load per-agent data from SQLite for today
+   398→    const dbAgentRecords = await retryDbOp(db => db.dailyTokenByAgent.findMany({ where: { date: today } }))
+   399→    for (const rec of dbAgentRecords) {
+   400→      const key = `${today}:${rec.agentId}:${rec.provider}:${rec.model}`
+   401→      if (!dailyTokensByAgent[key]) {
+   402→        dailyTokensByAgent[key] = {
+   403→          agentId: rec.agentId,
+   404→          agentName: rec.agentName,
+   405→          provider: rec.provider,
+   406→          model: rec.model,
+   407→          tokens: rec.tokens,
+   408→          inputTokens: rec.inputTokens,
+   409→          outputTokens: rec.outputTokens,
+   410→        }
+   411→      } else {
+   412→        dailyTokensByAgent[key].tokens = Math.max(dailyTokensByAgent[key].tokens, rec.tokens)
+   413→        dailyTokensByAgent[key].inputTokens = Math.max(dailyTokensByAgent[key].inputTokens, rec.inputTokens)
+   414→        dailyTokensByAgent[key].outputTokens = Math.max(dailyTokensByAgent[key].outputTokens, rec.outputTokens)
+   415→      }
+   416→    }
+   417→
+   418→    // CRITICAL: Use the MAX of in-memory and SQLite
+   419→    const maxFromSources = dbTokens
+   420→    if (dateChanged) {
+   421→      dailyTokenCount = maxFromSources
+   422→    } else {
+   423→      dailyTokenCount = Math.max(dailyTokenCount, maxFromSources)
+   424→    }
+   425→    dailyTokenDate = today
+   426→    console.log(`[TokenTracker] Initialized daily tokens: ${dailyTokenCount} (SQLite: ${dbTokens}, dateChanged: ${dateChanged}) for ${today}`)
+   427→  } catch (err) {
+   428→    console.error('[TokenTracker] Failed to init daily tokens:', err)
+   429→    if (!dailyTokenDate) {
+   430→      dailyTokenCount = dailyTokenCount || 0
+   431→      dailyTokenDate = getTodayDateStr()
+   432→    }
+   433→  }
+   434→}
+   435→
+   436→export function addTokensUsed(tokens: number, provider?: string, slotIndex?: number, model?: string): void {
+   437→  const today = getTodayDateStr()
+   438→  if (dailyTokenDate && dailyTokenDate !== today) {
+   439→    // Date changed — SNAPSHOT the previous day's data BEFORE resetting
+   440→    // This prevents the race condition where persistDailyTokens reads
+   441→    // the already-reset dailyTokenDate/count.
+   442→    const oldDate = dailyTokenDate
+   443→    const oldCount = dailyTokenCount
+   444→    const oldProviders = { ...dailyTokensByProvider }
+   445→    const oldSlots: Record<string, Record<number, number>> = {}
+   446→    for (const [p, s] of Object.entries(dailyTokensByProviderSlot)) {
+   447→      oldSlots[p] = { ...s }
+   448→    }
+   449→    // Snapshot model + agent data too (BUG FIX: these were lost before because
+   450→    // persistDailyTokens read from module-level vars which were already reset)
+   451→    const oldModels: Record<string, Record<string, number>> = {}
+   452→    for (const [p, ms] of Object.entries(dailyTokensByProviderModel)) {
+   453→      oldModels[p] = { ...ms }
+   454→    }
+   455→    const oldAgents: Record<string, typeof dailyTokensByAgent[string]> = {}
+   456→    for (const [k, v] of Object.entries(dailyTokensByAgent)) {
+   457→      oldAgents[k] = { ...v }
+   458→    }
+   459→
+   460→    console.log(`[TokenTracker] Date changed (${oldDate} → ${today}), persisting previous day data first`)
+   461→    // Fire-and-forget persist of previous day with ALL SNAPSHOT values
+   462→    persistDailyTokens(oldDate, oldCount, oldProviders, oldSlots, oldModels, oldAgents).catch(() => {})
+   463→
+   464→    // NOW reset for the new day
+   465→    console.log(`[TokenTracker] Resetting counter for new day: ${today}`)
+   466→    dailyTokenCount = 0
+   467→    dailyTokenDate = today
+   468→    // Reset per-provider counters
+   469→    for (const key of Object.keys(dailyTokensByProvider)) {
+   470→      delete dailyTokensByProvider[key]
+   471→    }
+   472→    // Reset per-provider-per-slot counters
+   473→    for (const key of Object.keys(dailyTokensByProviderSlot)) {
+   474→      delete dailyTokensByProviderSlot[key]
+   475→    }
+   476→    // Reset per-provider-per-model counters
+   477→    for (const key of Object.keys(dailyTokensByProviderModel)) {
+   478→      delete dailyTokensByProviderModel[key]
+   479→    }
+   480→    // Reset per-agent counters
+   481→    for (const key of Object.keys(dailyTokensByAgent)) {
+   482→      delete dailyTokensByAgent[key]
+   483→    }
+   484→  } else if (!dailyTokenDate) {
+   485→    // First call ever — set the date
+   486→    dailyTokenDate = today
+   487→  }
+   488→  dailyTokenCount += tokens
+   489→  // Track per-provider tokens
+   490→  if (provider) {
+   491→    dailyTokensByProvider[provider] = (dailyTokensByProvider[provider] || 0) + tokens
+   492→    // Track per-provider-per-slot tokens
+   493→    if (slotIndex !== undefined && slotIndex >= 0) {
+   494→      if (!dailyTokensByProviderSlot[provider]) {
+   495→        dailyTokensByProviderSlot[provider] = {}
+   496→      }
+   497→      dailyTokensByProviderSlot[provider][slotIndex] = (dailyTokensByProviderSlot[provider][slotIndex] || 0) + tokens
+   498→    }
+   499→    // Track per-provider-per-model tokens
+   500→    if (model) {
+   501→      if (!dailyTokensByProviderModel[provider]) {
+   502→        dailyTokensByProviderModel[provider] = {}
+   503→      }
+   504→      dailyTokensByProviderModel[provider][model] = (dailyTokensByProviderModel[provider][model] || 0) + tokens
+   505→    }
+   506→  }
+   507→  // Mark dirty flags for the changed records
+   508→  totalTokensDirty = true
+   509→  if (provider) {
+   510→    providerDirty.add(provider)
+   511→    if (slotIndex !== undefined && slotIndex >= 0) {
+   512→      slotDirty.add(`${provider}:${slotIndex}`)
+   513→    }
+   514→    if (model) {
+   515→      modelDirty.add(`${provider}:${model}`)
+   516→    }
+   517→  }
+   518→  if (!persistTimer) {
+   519→    persistTimer = setTimeout(async () => {
+   520→      persistTimer = null
+   521→      await persistDailyTokens()
+   522→    }, PERSIST_INTERVAL_MS)
+   523→  }
+   524→
+   525→  // DEBOUNCED IMMEDIATE PERSIST: For tokens > 500 (non-trivial LLM calls),
+   526→  // schedule an immediate persist 3 seconds after the last token addition.
+   527→  // This ensures token data is saved to SQLite quickly, reducing data loss
+   528→  // on dev server hot-reloads which can happen at any time.
+   529→  if (tokens > 500) {
+   530→    const now = Date.now()
+   531→    if (now - lastPersistTime > IMMEDIATE_PERSIST_MIN_INTERVAL_MS) {
+   532→      setTimeout(async () => {
+   533→        if (Date.now() - lastPersistTime > IMMEDIATE_PERSIST_MIN_INTERVAL_MS) {
+   534→          await persistDailyTokens().catch(() => {})
+   535→        }
+   536→      }, IMMEDIATE_PERSIST_MIN_INTERVAL_MS)
+   537→    }
+   538→  }
+   539→
+   540→  // Emit SSE event for real-time frontend updates
+   541→  emitTokenUpdate()
+   542→}
+   543→
+   544→/** Add per-agent token usage to in-memory counters.
+   545→ *  Called alongside addTokensUsed() when agentId is available. */
+   546→export function addTokensUsedByAgent(
+   547→  totalTokens: number,
+   548→  inputTokens: number,
+   549→  outputTokens: number,
+   550→  provider: string,
+   551→  model: string,
+   552→  agentId: string,
+   553→  agentName: string
+   554→): void {
+   555→  const today = getTodayDateStr()
+   556→  const key = `${today}:${agentId}:${provider}:${model}`
+   557→  const existing = dailyTokensByAgent[key]
+   558→  if (existing) {
+   559→    existing.tokens += totalTokens
+   560→    existing.inputTokens += inputTokens
+   561→    existing.outputTokens += outputTokens
+   562→  } else {
+   563→    dailyTokensByAgent[key] = {
+   564→      agentId,
+   565→      agentName,
+   566→      provider,
+   567→      model,
+   568→      tokens: totalTokens,
+   569→      inputTokens,
+   570→      outputTokens,
+   571→    }
+   572→  }
+   573→  agentDirty.add(`${agentId}:${provider}:${model}`)
+   574→  // Trigger persist timer if not already running
+   575→  if (!persistTimer) {
+   576→    persistTimer = setTimeout(async () => {
+   577→      persistTimer = null
+   578→      await persistDailyTokens()
+   579→    }, PERSIST_INTERVAL_MS)
+   580→  }
+   581→
+   582→  // Emit SSE event for real-time frontend updates
+   583→  emitTokenUpdate()
+   584→}
+   585→
+   586→async function persistDailyTokens(
+   587→  targetDate?: string,
+   588→  targetCount?: number,
+   589→  targetProviders?: Record<string, number>,
+   590→  targetSlots?: Record<string, Record<number, number>>,
+   591→  targetModels?: Record<string, Record<string, number>>,
+   592→  targetAgents?: Record<string, { agentId: string; agentName: string; provider: string; model: string; tokens: number; inputTokens: number; outputTokens: number }>
+   593→): Promise<void> {
+   594→  // Use provided values (for date-change persist) or current in-memory values
+   595→  const date = targetDate || dailyTokenDate
+   596→  const count = targetCount !== undefined ? targetCount : dailyTokenCount
+   597→  const providers = targetProviders || dailyTokensByProvider
+   598→  const slots = targetSlots || dailyTokensByProviderSlot
+   599→  const models = targetModels || dailyTokensByProviderModel
+   600→  const agents = targetAgents || dailyTokensByAgent
+   601→
+   602→  if (!date) return // Nothing to persist
+   603→
+   604→  // For forced persists (date-change, flush), ignore dirty tracking — write everything
+   605→  const isForcedPersist = targetDate !== undefined || targetCount !== undefined
+   606→  const hasDirtyData = isForcedPersist || totalTokensDirty || providerDirty.size > 0 || slotDirty.size > 0 || modelDirty.size > 0 || agentDirty.size > 0
+   607→
+   608→  if (!hasDirtyData) {
+   609→    // No changes since last persist — skip entirely (saves ~20 SQL queries per cycle)
+   610→    return
+   611→  }
+   612→
+   613→  try {
+   614→    // === PERSIST TO SQLITE (local cache) ===
+   615→    // Only write total if dirty
+   616→    if (isForcedPersist || totalTokensDirty) {
+   617→      await retryDbOp(db => db.dailyTokenUsage.upsert({
+   618→        where: { date },
+   619→        update: { tokens: count },
+   620→        create: { date, tokens: count },
+   621→      }))
+   622→    }
+   623→    // Persist per-provider token counts — only dirty providers
+   624→    for (const [provider, tokens] of Object.entries(providers)) {
+   625→      if (!isForcedPersist && !providerDirty.has(provider)) continue // Skip unchanged
+   626→      try {
+   627→        await retryDbOp(db => db.dailyTokenByProvider.upsert({
+   628→          where: { date_provider: { date, provider } },
+   629→          update: { tokens },
+   630→          create: { date, provider, tokens },
+   631→        }))
+   632→      } catch (err) {
+   633→        if (!isTransientDbError(err)) {
+   634→          console.error(`[TokenTracker] Failed to persist provider tokens for ${provider}:`, err)
+   635→        }
+   636→      }
+   637→    }
+   638→    // Persist per-provider-per-slot token counts — only dirty slots
+   639→    for (const [provider, providerSlots] of Object.entries(slots)) {
+   640→      for (const [slotStr, tokens] of Object.entries(providerSlots)) {
+   641→        const slot = parseInt(slotStr, 10)
+   642→        const dirtyKey = `${provider}:${slot}`
+   643→        if (!isForcedPersist && !slotDirty.has(dirtyKey)) continue // Skip unchanged
+   644→        try {
+   645→          await retryDbOp(db => db.dailyTokenByProviderSlot.upsert({
+   646→            where: { date_provider_slot: { date, provider, slot } },
+   647→            update: { tokens },
+   648→            create: { date, provider, slot, tokens },
+   649→          }))
+   650→        } catch (err) {
+   651→          if (!isTransientDbError(err)) {
+   652→            console.error(`[TokenTracker] Failed to persist slot tokens for ${provider} slot ${slot}:`, err)
+   653→          }
+   654→        }
+   655→      }
+   656→    }
+   657→
+   658→    // Persist per-provider-per-model token counts — only dirty models
+   659→    for (const [provider, providerModels] of Object.entries(models)) {
+   660→      for (const [modelName, tokens] of Object.entries(providerModels)) {
+   661→        const dirtyKey = `${provider}:${modelName}`
+   662→        if (!isForcedPersist && !modelDirty.has(dirtyKey)) continue // Skip unchanged
+   663→        try {
+   664→          await retryDbOp(db => db.dailyTokenByProviderModel.upsert({
+   665→            where: { date_provider_model: { date, provider, model: modelName } },
+   666→            update: { tokens },
+   667→            create: { date, provider, model: modelName, tokens },
+   668→          }))
+   669→        } catch (err) {
+   670→          if (!isTransientDbError(err)) {
+   671→            console.error(`[TokenTracker] Failed to persist model tokens for ${provider}/${modelName}:`, err)
+   672→          }
+   673→        }
+   674→      }
+   675→    }
+   676→
+   677→    // Persist per-agent token counts — only dirty agents
+   678→    for (const [key, agentData] of Object.entries(agents)) {
+   679→      // Key format: "date:agentId:provider:model" — check date matches
+   680→      if (!key.startsWith(date)) continue
+   681→      const dirtyKey = `${agentData.agentId}:${agentData.provider}:${agentData.model}`
+   682→      if (!isForcedPersist && !agentDirty.has(dirtyKey)) continue // Skip unchanged
+   683→      try {
+   684→        await retryDbOp(db => db.dailyTokenByAgent.upsert({
+   685→          where: {
+   686→            date_agentId_provider_model: {
+   687→              date,
+   688→              agentId: agentData.agentId,
+   689→              provider: agentData.provider,
+   690→              model: agentData.model,
+   691→            },
+   692→          },
+   693→          update: {
+   694→            tokens: agentData.tokens,
+   695→            inputTokens: agentData.inputTokens,
+   696→            outputTokens: agentData.outputTokens,
+   697→            agentName: agentData.agentName, // Update name in case it changed
+   698→          },
+   699→          create: {
+   700→            date,
+   701→            agentId: agentData.agentId,
+   702→            agentName: agentData.agentName,
+   703→            provider: agentData.provider,
+   704→            model: agentData.model,
+   705→            tokens: agentData.tokens,
+   706→            inputTokens: agentData.inputTokens,
+   707→            outputTokens: agentData.outputTokens,
+   708→          },
+   709→        }))
+   710→      } catch (err) {
+   711→        if (!isTransientDbError(err)) {
+   712→          console.error(`[TokenTracker] Failed to persist agent tokens for ${agentData.agentName}/${agentData.provider}/${agentData.model}:`, err)
+   713→        }
+   714→      }
+   715→    }
+   716→
+   717→    // Clear dirty flags after successful SQLite persist
+   718→    totalTokensDirty = false
+   719→    providerDirty.clear()
+   720→    slotDirty.clear()
+   721→    modelDirty.clear()
+   722→    agentDirty.clear()
+   723→
+   724→    // Update last persist time for debounced immediate persist
+   725→    lastPersistTime = Date.now()
+   726→
+   727→    // === SQLITE-ONLY PERSIST ===
+   728→    // Token data is stored in SQLite only — no remote sync needed
+   729→  } catch (err) {
+   730→    if (!isTransientDbError(err)) {
+   731→      console.error('[TokenTracker] Failed to persist daily tokens:', err)
+   732→    } else {
+   733→      console.warn('[TokenTracker] DB persist skipped (SQLite lock) — will retry next cycle')
+   734→    }
+   735→  }
+   736→}
+   737→
+   738→/** Flush in-memory token data to SQLite immediately.
+   739→ *  Called on graceful shutdown (SIGINT/SIGTERM) and before hot-reload. */
+   740→export async function flushTokenData(): Promise<void> {
+   741→  if (persistTimer) {
+   742→    clearTimeout(persistTimer)
+   743→    persistTimer = null
+   744→  }
+   745→  if (dailyTokenDate && dailyTokenCount > 0) {
+   746→    console.log(`[TokenTracker] Flushing token data: ${dailyTokenCount} tokens for ${dailyTokenDate}`)
+   747→    await persistDailyTokens()
+   748→  }
+   749→}
+   750→
+   751→// ==================== GRACEFUL SHUTDOWN ====================
+   752→// Ensure token data is persisted before the process exits.
+   753→// Without this, in-memory data is lost on dev server restart/hot-reload.
+   754→
+   755→let shutdownHandlersRegistered = false
+   756→
+   757→export function registerTokenShutdownHandlers(): void {
+   758→  if (shutdownHandlersRegistered) return
+   759→  shutdownHandlersRegistered = true
+   760→
+   761→  const flushAndExit = async (signal: string) => {
+   762→    console.log(`[TokenTracker] Received ${signal}, flushing token data...`)
+   763→    try {
+   764→      await flushTokenData()
+   765→    } catch (err) {
+   766→      console.error('[TokenTracker] Failed to flush on shutdown:', err)
+   767→    }
+   768→    process.exit(0)
+   769→  }
+   770→
+   771→  process.on('SIGINT', () => flushAndExit('SIGINT'))
+   772→  process.on('SIGTERM', () => flushAndExit('SIGTERM'))
+   773→  process.on('beforeExit', async () => {
+   774→    try {
+   775→      await flushTokenData()
+   776→    } catch {
+   777→      // Best effort
+   778→    }
+   779→  })
+   780→}
+   781→
+   782→// Auto-register shutdown handlers on module load
+   783→registerTokenShutdownHandlers()
+   784→
+   785→export async function getDailyTokenUsage(): Promise<{ date: string; tokens: number }> {
+   786→  const today = getTodayDateStr()
+   787→  if (dailyTokenDate !== today) {
+   788→    await initDailyTokens()
+   789→  }
+   790→  return { date: dailyTokenDate, tokens: dailyTokenCount }
+   791→}
+   792→
+   793→/** Get current in-memory per-provider token breakdown for today */
+   794→export function getDailyTokensByProvider(): Record<string, number> {
+   795→  return { ...dailyTokensByProvider }
+   796→}
+   797→
+   798→/** Get current in-memory per-provider-per-slot token breakdown for today */
+   799→export function getDailyTokensByProviderSlot(): Record<string, Record<number, number>> {
+   800→  // Deep clone to prevent mutation
+   801→  const result: Record<string, Record<number, number>> = {}
+   802→  for (const [provider, slots] of Object.entries(dailyTokensByProviderSlot)) {
+   803→    result[provider] = { ...slots }
+   804→  }
+   805→  return result
+   806→}
+   807→
+   808→/** Get current in-memory per-provider-per-model token breakdown for today */
+   809→export function getDailyTokensByProviderModel(): Record<string, Record<string, number>> {
+   810→  // Deep clone to prevent mutation
+   811→  const result: Record<string, Record<string, number>> = {}
+   812→  for (const [provider, models] of Object.entries(dailyTokensByProviderModel)) {
+   813→    result[provider] = { ...models }
+   814→  }
+   815→  return result
+   816→}
+   817→
+   818→/** Get current in-memory per-agent token breakdown for today */
+   819→export function getDailyTokensByAgent(): Array<{
+   820→  agentId: string
+   821→  agentName: string
+   822→  provider: string
+   823→  model: string
+   824→  tokens: number
+   825→  inputTokens: number
+   826→  outputTokens: number
+   827→}> {
+   828→  const today = getTodayDateStr()
+   829→  return Object.entries(dailyTokensByAgent)
+   830→    .filter(([key]) => key.startsWith(today))
+   831→    .map(([, data]) => ({ ...data }))
+   832→}
+   833→
+   834→/** Reset all in-memory daily token counters to 0 for the current day.
+   835→ *  Also updates the DB record to 0 and deletes all provider/slot records for today.
+   836→ */
+   837→export async function resetDailyTokens(): Promise<void> {
+   838→  const today = getTodayDateStr()
+   839→
+   840→  // Reset in-memory counters
+   841→  dailyTokenCount = 0
+   842→  dailyTokenDate = today
+   843→
+   844→  // Clear per-provider counters
+   845→  for (const key of Object.keys(dailyTokensByProvider)) {
+   846→    delete dailyTokensByProvider[key]
+   847→  }
+   848→
+   849→  // Clear per-provider-per-slot counters
+   850→  for (const key of Object.keys(dailyTokensByProviderSlot)) {
+   851→    delete dailyTokensByProviderSlot[key]
+   852→  }
+   853→
+   854→  // Clear per-provider-per-model counters
+   855→  for (const key of Object.keys(dailyTokensByProviderModel)) {
+   856→    delete dailyTokensByProviderModel[key]
+   857→  }
+   858→
+   859→  // Clear per-agent counters
+   860→  for (const key of Object.keys(dailyTokensByAgent)) {
+   861→    delete dailyTokensByAgent[key]
+   862→  }
+   863→
+   864→  // Update SQLite record for today to 0
+   865→  try {
+   866→    await retryDbOp(db => db.dailyTokenUsage.upsert({
+   867→      where: { date: today },
+   868→      update: { tokens: 0 },
+   869→      create: { date: today, tokens: 0 },
+   870→    }))
+   871→
+   872→    // Delete all provider records for today
+   873→    await retryDbOp(db => db.dailyTokenByProvider.deleteMany({
+   874→      where: { date: today },
+   875→    }))
+   876→
+   877→    // Delete all provider-slot records for today
+   878→    await retryDbOp(db => db.dailyTokenByProviderSlot.deleteMany({
+   879→      where: { date: today },
+   880→    }))
+   881→
+   882→    // Delete all provider-model records for today
+   883→    await retryDbOp(db => db.dailyTokenByProviderModel.deleteMany({
+   884→      where: { date: today },
+   885→    }))
+   886→
+   887→    // Delete all agent records for today
+   888→    await retryDbOp(db => db.dailyTokenByAgent.deleteMany({
+   889→      where: { date: today },
+   890→    }))
+   891→
+   892→    console.log(`[TokenTracker] Reset daily tokens to 0 for ${today} (SQLite)`)
+   893→  } catch (err) {
+   894→    console.error('[TokenTracker] Failed to reset daily tokens in SQLite:', err)
+   895→  }
+   896→
+   897→  // Token tracking is SQLite-only — no remote reset needed
+   898→
+   899→  // Emit SSE event so frontend knows counters were reset
+   900→  emitTokenUpdate()
+   901→}
+   902→
+   903→// Force-persist tokens (called when a document finishes processing)
+   904→export async function flushTokenCount(): Promise<void> {
+   905→  if (persistTimer) {
+   906→    clearTimeout(persistTimer)
+   907→    persistTimer = null
+   908→  }
+   909→  await persistDailyTokens()
+   910→}
+   911→
+   912→initDailyTokens().catch(() => {})
+   913→
+   914→// ==================== KEY POOL (AUTO MODE) ====================
+   915→
+   916→// ==================== KEY PERSISTENCE & RECOVERY ====================
+   917→
+   918→/**
+   919→ * On server restart, in-memory keyAssignments are lost.
+   920→ * This function recovers by:
+   921→ *   1. Querying Qdrant for documents in active processing states
+   922→ *   2. Re-assigning them to keys with available capacity
+   923→ *   3. Persisting key assignments to SQLite for durability
+   924→ *
+   925→ * Auto mode: Each of the 4 keys handles up to 4 docs (max 16 concurrent).
+   926→ * This is called on module init and can be called manually via API.
+   927→ */
+   928→export async function recoverKeys(): Promise<{
+   929→  recovered: number
+   930→  keys: Array<{ keyIndex: number; docIds: string[] }>
+   931→}> {
+   932→  try {
+   933→    const { listDocuments, updateDocumentStatus } = await import('@/lib/qdrant')
+   934→
+   935→    // Find documents that are actively being processed (stuck in transitional states).
+   936→    const activeStatuses = ['extracting', 'parsing', 'chunked']
+   937→    const allActiveDocs: Array<{ id: string; payload: { status: string; updated_at: string; title?: string; [key: string]: unknown } }> = []
+   938→
+   939→    for (const status of activeStatuses) {
+   940→      try {
+   941→        const result = await listDocuments({
+   942→          status,
+   943→          limit: MAX_TOTAL_CONCURRENT,
+   944→          orderBy: 'updated_at',
+   945→          orderDir: 'desc',
+   946→        })
+   947→        allActiveDocs.push(...result.documents)
+   948→      } catch (err) {
+   949→        console.warn(`[KeyPool] Recovery: failed to query status '${status}':`, err instanceof Error ? err.message : String(err))
+   950→      }
+   951→    }
+   952→
+   953→    // Deduplicate by doc ID
+   954→    const seenIds = new Set<string>()
+   955→    const activeDocs = allActiveDocs.filter(d => {
+   956→      if (seenIds.has(d.id)) return false
+   957→      seenIds.add(d.id)
+   958→      return true
+   959→    })
+   960→
+   961→    if (activeDocs.length === 0) {
+   962→      console.log('[KeyPool] No active documents to recover from Qdrant')
+   963→      return { recovered: 0, keys: getKeyStatus() }
+   964→    }
+   965→
+   966→    console.log(`[KeyPool] Found ${activeDocs.length} docs in active processing states (${activeStatuses.join('/')})`)
+   967→
+   968→    initKeyAssignments()
+   969→    let recovered = 0
+   970→    let staleReset = 0
+   971→    for (const doc of activeDocs) {
+   972→      // Only assign if not already assigned to a key
+   973→      const alreadyAssigned = keyAssignments.some(k => k.docIds.includes(doc.id))
+   974→      if (alreadyAssigned) continue
+   975→
+   976→      // Find a key with available capacity (auto mode: fewest docs first)
+   977→      const availableKey = keyAssignments
+   978→        .filter(k => k.docIds.length < MAX_DOCS_PER_KEY)
+   979→        .sort((a, b) => a.docIds.length - b.docIds.length)[0]
+   980→      if (!availableKey) break  // All keys at capacity
+   981→
+   982→      // Check if doc was updated recently (within 5 min)
+   983→      const updatedAt = new Date(doc.payload.updated_at).getTime()
+   984→      const isRecent = Date.now() - updatedAt < 5 * 60 * 1000
+   985→
+   986→      if (!isRecent) {
+   987→        console.log(`[KeyPool] Recovery: doc ${doc.id.slice(0, 8)}... (${doc.payload.status}) is stale (updated ${Math.round((Date.now() - updatedAt) / 60000)}m ago) — resetting to 'partial'`)
+   988→        await updateDocumentStatus(doc.id, { status: 'partial' })
+   989→        staleReset++
+   990→        continue
+   991→      }
+   992→
+   993→      // Recently updated — assign to key
+   994→      availableKey.docIds.push(doc.id)
+   995→      recovered++
+   996→      console.log(`[KeyPool] Recovery: Key ${availableKey.keyIndex} re-assigned doc ${doc.id.slice(0, 8)}... (${availableKey.docIds.length}/${MAX_DOCS_PER_KEY}, status: ${doc.payload.status})`)
+   997→
+   998→      // Persist key assignment to SQLite
+   999→      try {
+  1000→        await retryDbOp(db => db.jobQueue.upsert({
+  1001→          where: { id: `key-${availableKey.keyIndex}-doc-${doc.id.slice(0, 8)}` },
+  1002→          update: { status: 'running', documentId: doc.id, updatedAt: new Date() },
+  1003→          create: {
+  1004→            id: `key-${availableKey.keyIndex}-doc-${doc.id.slice(0, 8)}`,
+  1005→            type: 'key_assignment',
+  1006→            status: 'running',
+  1007→            documentId: doc.id,
+  1008→            priority: availableKey.keyIndex,
+  1009→          },
+  1010→        }))
+  1011→      } catch (e) {
+  1012→        console.warn(`[KeyPool] Failed to persist key ${availableKey.keyIndex} to SQLite:`, e)
+  1013→      }
+  1014→    }
+  1015→
+  1016→    console.log(`[KeyPool] Recovery complete: ${recovered} key(s) re-assigned, ${staleReset} stale doc(s) reset to 'partial'`)
+  1017→    return { recovered, keys: getKeyStatus() }
+  1018→  } catch (err) {
+  1019→    console.error('[KeyPool] Key recovery failed:', err)
+  1020→    return { recovered: 0, keys: getKeyStatus() }
+  1021→  }
+  1022→}
+  1023→
+  1024→/** Persist current key assignments to SQLite for crash recovery */
+  1025→export async function persistKeyAssignments(): Promise<void> {
+  1026→  try {
+  1027→    for (const ka of keyAssignments) {
+  1028→      const status = ka.docIds.length > 0 ? 'running' : 'available'
+  1029→      const documentId = ka.docIds.length > 0 ? ka.docIds.join(',') : null
+  1030→      await retryDbOp(db => db.jobQueue.upsert({
+  1031→        where: { id: `key-${ka.keyIndex}` },
+  1032→        update: {
+  1033→          status,
+  1034→          documentId,
+  1035→          updatedAt: new Date(),
+  1036→        },
+  1037→        create: {
+  1038→          id: `key-${ka.keyIndex}`,
+  1039→          type: 'key_assignment',
+  1040→          status,
+  1041→          documentId,
+  1042→          priority: ka.keyIndex,
+  1043→        },
+  1044→      }))
+  1045→    }
+  1046→  } catch (err) {
+  1047→    console.warn('[KeyPool] Failed to persist key assignments:', err)
+  1048→  }
+  1049→}
+  1050→
+  1051→// Run recovery on module load (after server restart)
+  1052→recoverKeys().catch(() => {})
+  1053→
+  1054→
+  1055→/**
+  1056→ * Key Assignment Pool — 4 API keys for document processing (AUTO MODE).
+  1057→ *
+  1058→ * No more slot mode — documents are automatically assigned to the key
+  1059→ * with the fewest active documents (least-loaded first).
+  1060→ *
+  1061→ * Each key can handle up to 4 documents concurrently.
+  1062→ * Max concurrent: 4 keys × 4 docs = 16 documents.
+  1063→ *
+  1064→ * Key N uses NVIDIA Key N (strict binding for rate limit isolation).
+  1065→ * If Key N is rate-limited/exhausted, the system falls back to another
+  1066→ * available key from the same provider.
+  1067→ */
+  1068→
+  1069→// ==================== PAUSE MECHANISM ====================
+  1070→
+  1071→/**
+  1072→ * In-memory set of document IDs that have been paused by the user.
+  1073→ * The extraction loop checks this set before each chunk group and
+  1074→ * the auto-chain loop checks before each batch. When a document is
+  1075→ * found in this set, the pipeline stops immediately and returns 'partial'.
+  1076→ *
+  1077→ * The set is cleared when a document is re-started (handleProcessDoc).
+  1078→ */
+  1079→const pausedDocIds: Set<string> = new Set()
+  1080→
+  1081→/** Mark a document as paused — the pipeline will stop at the next checkpoint */
+  1082→export function markDocPaused(docId: string): void {
+  1083→  pausedDocIds.add(docId)
+  1084→  console.log(`[KeyPool] Document ${docId.slice(0, 8)}... marked as PAUSED`)
+  1085→}
+  1086→
+  1087→/** Clear the paused flag when a document is re-started */
+  1088→export function clearDocPaused(docId: string): void {
+  1089→  pausedDocIds.delete(docId)
+  1090→}
+  1091→
+  1092→/** Check if a document has been paused */
+  1093→export function isDocPaused(docId: string): boolean {
+  1094→  return pausedDocIds.has(docId)
+  1095→}
+  1096→
+  1097→interface KeyAssignment {
+  1098→  keyIndex: number
+  1099→  docIds: string[]             // Documents currently using this key (up to MAX_DOCS_PER_KEY)
+  1100→  failureCount: number         // Consecutive failures
+  1101→}
+  1102→
+  1103→const keyAssignments: KeyAssignment[] = []
+  1104→
+  1105→/** Initialize key assignments — auto mode, least-loaded-first */
+  1106→function initKeyAssignments(): void {
+  1107→  if (keyAssignments.length > 0) return
+  1108→  for (let i = 0; i < MAX_KEYS; i++) {
+  1109→    keyAssignments.push({
+  1110→      keyIndex: i,
+  1111→      docIds: [],
+  1112→      failureCount: 0,
+  1113→    })
+  1114→  }
+  1115→  console.log(`[KeyPool] Initialized ${MAX_KEYS} keys × ${MAX_DOCS_PER_KEY} docs/key = ${MAX_TOTAL_CONCURRENT} max concurrent (auto mode, Key N → NVIDIA Key N)`)
+  1116→}
+  1117→initKeyAssignments()
+  1118→
+  1119→/** Acquire a key for a document (auto mode: least-loaded-first).
+  1120→ *  Returns the key index, or -1 if all keys are at capacity.
+  1121→ *  Each key can hold up to MAX_DOCS_PER_KEY documents.
+  1122→ *  Key N uses NVIDIA Key N.
+  1123→ */
+  1124→export function acquireKey(docId: string): number {
+  1125→  initKeyAssignments()
+  1126→  // First check if this doc already has a key (idempotent)
+  1127→  for (const ka of keyAssignments) {
+  1128→    if (ka.docIds.includes(docId)) return ka.keyIndex
+  1129→  }
+  1130→
+  1131→  // Global cap: can't exceed MAX_TOTAL_CONCURRENT across all keys
+  1132→  const totalDocs = keyAssignments.reduce((sum, k) => sum + k.docIds.length, 0)
+  1133→  if (totalDocs >= MAX_TOTAL_CONCURRENT) return -1
+  1134→
+  1135→  // Auto mode: find key with fewest docs (least-loaded-first)
+  1136→  const availableKey = keyAssignments
+  1137→    .filter(k => k.docIds.length < MAX_DOCS_PER_KEY)
+  1138→    .sort((a, b) => a.docIds.length - b.docIds.length)[0]
+  1139→  if (!availableKey) return -1 // All at capacity
+  1140→
+  1141→  availableKey.docIds.push(docId)
+  1142→  console.log(`[KeyPool] Key ${availableKey.keyIndex} acquired by doc ${docId.slice(0, 8)}... (${availableKey.docIds.length}/${MAX_DOCS_PER_KEY} docs, uses NVIDIA key ${availableKey.keyIndex + 1})`)
+  1143→  return availableKey.keyIndex
+  1144→}
+  1145→
+  1146→/** Release a key when a document finishes processing */
+  1147→export function releaseKey(docId: string): void {
+  1148→  for (const ka of keyAssignments) {
+  1149→    const idx = ka.docIds.indexOf(docId)
+  1150→    if (idx >= 0) {
+  1151→      ka.docIds.splice(idx, 1)
+  1152→      console.log(`[KeyPool] Key ${ka.keyIndex} released by doc ${docId.slice(0, 8)}... (${ka.docIds.length}/${MAX_DOCS_PER_KEY} docs remaining)`)
+  1153→      if (ka.docIds.length === 0) {
+  1154→        ka.failureCount = 0
+  1155→      }
+  1156→      return
+  1157→    }
+  1158→  }
+  1159→}
+  1160→
+  1161→/** Get the current key assignment status (for UI display) */
+  1162→export function getKeyStatus(): Array<{
+  1163→  keyIndex: number
+  1164→  docIds: string[]
+  1165→}> {
+  1166→  return keyAssignments.map(k => ({
+  1167→    keyIndex: k.keyIndex,
+  1168→    docIds: [...k.docIds],
+  1169→  }))
+  1170→}
+  1171→
+  1172→/** Get number of available capacity across all keys */
+  1173→export function getFreeKeyCount(): number {
+  1174→  return keyAssignments.reduce((sum, k) => sum + (MAX_DOCS_PER_KEY - k.docIds.length), 0)
+  1175→}
+  1176→
+  1177→/** Get total number of documents currently assigned to keys */
+  1178→export function getActiveDocCount(): number {
+  1179→  return keyAssignments.reduce((sum, k) => sum + k.docIds.length, 0)
+  1180→}
+  1181→
+  1182→/** Get ALL document IDs currently assigned to a key (actively being processed).
+  1183→ *  Used by reconciliation to skip docs that have an active key assignment,
+  1184→ *  preventing the reconciliation from interfering with a running pipeline.
+  1185→ */
+  1186→export function getActiveDocIds(): string[] {
+  1187→  return keyAssignments.flatMap(k => k.docIds)
+  1188→}
+  1189→
+  1190→// ==================== DAILY QUOTA CONFIGURATION ====================
+  1191→
+  1192→/** Provider-specific daily token limits (conservative estimates for free tiers).
+  1193→ *  These are used for proactive detection — when daily usage approaches these
+  1194→ *  limits, the key is marked as daily-quota-exhausted BEFORE the API returns 429.
+  1195→ *
+  1196→ *  The reactive detection (parsing 429 error bodies) serves as a backup for
+  1197→ *  cases where the actual limit differs from these estimates.
+  1198→ *
+  1199→ *  Set to 0 to disable proactive tracking for a provider (rely on 429 detection only).
+  1200→ */
+  1201→const PROVIDER_DAILY_TOKEN_LIMITS: Record<string, number> = {
+  1202→  // NVIDIA: No documented daily limit (rate-limit only, 40 RPM/key)
+  1203→  NVIDIA: 0,
+  1204→}
+  1205→
+  1206→/** Get the timestamp of the next midnight in the user's timezone (Asia/Ho_Chi_Minh, UTC+7).
+  1207→ *  Used as the reset time for daily quota exhaustion. */
+  1208→function getMidnightTimestamp(): number {
+  1209→  const now = new Date()
+  1210→  // User timezone: UTC+7 (Asia/Ho_Chi_Minh)
+  1211→  const utcOffsetMs = 7 * 60 * 60 * 1000
+  1212→  const localNow = new Date(now.getTime() + utcOffsetMs)
+  1213→  // Set to midnight local time
+  1214→  const localMidnight = new Date(localNow)
+  1215→  localMidnight.setUTCHours(24, 0, 0, 0) // Next midnight
+  1216→  // Convert back to UTC timestamp
+  1217→  return localMidnight.getTime() - utcOffsetMs
+  1218→}
+  1219→
+  1220→/** Parse a 429 response body to determine if it's a daily quota exhaustion
+  1221→ *  (permanent until midnight) vs a temporary rate limit (RPM exceeded, retry after cooldown).
+  1222→ *
+  1223→ *  Returns { isDailyQuota: boolean, resetAt?: number } based on error body analysis.
+  1224→ *
+  1225→ *  Provider-specific patterns:
+  1226→ *  - NVIDIA: "exceeded" / "limit reached" / "token limit"
+  1227→ */
+  1228→function parse429ForDailyQuota(providerName: string, body: string): { isDailyQuota: boolean; resetAt?: number } {
+  1229→  const lower = body.toLowerCase()
+  1230→
+  1231→  // Universal patterns that indicate daily quota exhaustion
+  1232→  const dailyPatterns = [
+  1233→    'daily',
+  1234→    'insufficient_quota',
+  1235→    'plan limit',
+  1236→    'billing',
+  1237→    'credits',
+  1238→    'budget',
+  1239→    'allocation',
+  1240→    'monthly',
+  1241→    'tier limit',
+  1242→  ]
+  1243→
+  1244→  // Patterns that indicate TEMPORARY rate limit (should NOT trigger daily quota)
+  1245→  const temporaryPatterns = [
+  1246→    'rate limit',
+  1247→    'too many requests',
+  1248→    'requests per minute',
+  1249→    'rpm',
+  1250→    'rpm limit',
+  1251→    'concurrent',
+  1252→    'simultaneous',
+  1253→    'per second',
+  1254→    'per minute',
+  1255→    'request limit exceeded',     // NVIDIA: "Request limit exceeded" = RPM limit, NOT daily quota
+  1256→    'requests exceeded',          // NVIDIA: "Requests exceeded" = RPM limit
+  1257→    'limit exceeded',             // NVIDIA: "Limit exceeded" = usually RPM, not daily
+  1258→    'capacity exceeded',          // NVIDIA: temporary capacity issue
+  1259→    'server is busy',             // NVIDIA: temporary overload
+  1260→    'try again',                  // Generic: temporary issue, try later
+  1261→    'back off',                   // Generic: exponential backoff needed
+  1262→    'retry after',                // Generic: retry after a delay
+  1263→    'slow down',                  // Generic: rate limiting
+  1264→  ]
+  1265→
+  1266→  // Check for temporary patterns first
+  1267→  for (const pattern of temporaryPatterns) {
+  1268→    if (lower.includes(pattern)) {
+  1269→      return { isDailyQuota: false }
+  1270→    }
+  1271→  }
+  1272→
+  1273→  // Check for daily/quota patterns
+  1274→  for (const pattern of dailyPatterns) {
+  1275→    if (lower.includes(pattern)) {
+  1276→      return { isDailyQuota: true, resetAt: getMidnightTimestamp() }
+  1277→    }
+  1278→  }
+  1279→
+  1280→  // NVIDIA-specific: Only match truly daily/quota-specific patterns.
+  1281→  // BUG FIX: The old "exceeded" pattern was too broad — it matched "Request limit exceeded"
+  1282→  // (which is a temporary RPM limit, not daily quota). Now we require "daily" or "quota"
+  1283→  // context to confirm it's truly a daily quota exhaustion, not just a temporary rate limit.
+  1284→  if (providerName === 'NVIDIA') {
+  1285→    // Truly daily quota patterns (NOT just "exceeded" which is usually RPM)
+  1286→    if (lower.includes('daily quota') || lower.includes('daily limit') ||
+  1287→        lower.includes('quota exceeded') || lower.includes('daily allocation') ||
+  1288→        lower.includes('token limit reached for today') || lower.includes('daily token')) {
+  1289→      return { isDailyQuota: true, resetAt: getMidnightTimestamp() }
+  1290→    }
+  1291→    // "limit reached" without "daily" context — could be RPM, treat as temporary
+  1292→    // Only mark as daily if it explicitly says "daily" or "quota"
+  1293→    if (lower.includes('limit reached') && (lower.includes('daily') || lower.includes('quota'))) {
+  1294→      return { isDailyQuota: true, resetAt: getMidnightTimestamp() }
+  1295→    }
+  1296→  }
+  1297→
+  1298→  // Default: not daily quota, treat as temporary rate limit
+  1299→  return { isDailyQuota: false }
+  1300→}
+  1301→
+  1302→// ==================== PROVIDER KEY POOL (NVIDIA NIM ONLY) ====================
+  1303→
+  1304→interface ProviderKeyInfo {
+  1305→  key: string
+  1306→  keyIndex: number  // Index in the pool's keys array — used for per-key token tracking
+  1307→  rateLimited: boolean
+  1308→  rateLimitResetAt: number
+  1309→  failureCount: number
+  1310→  exhausted: boolean
+  1311→  exhaustedAt: number
+  1312→  // Daily quota exhaustion — key hit its daily limit (tokens or requests).
+  1313→  // Unlike `exhausted` (which recovers after 60s cooldown), daily quota resets at midnight.
+  1314→  dailyQuotaExhausted: boolean
+  1315→  dailyQuotaResetAt: number  // Timestamp when daily quota resets (midnight in user timezone)
+  1316→  // Per-key token tracking
+  1317→  totalTokensUsed: number
+  1318→  // Per-key daily token tracking
+  1319→  dailyTokensUsed: number
+  1320→  // Per-key daily request tracking
+  1321→  dailyRequestCount: number
+  1322→  dailyRequestDate: string  // YYYY-MM-DD in user timezone
+  1323→}
+  1324→
+  1325→class ProviderKeyPool {
+  1326→  private keys: ProviderKeyInfo[]
+  1327→  private nextKeyIndex: number = 0
+  1328→  private _providerName: string
+  1329→  private exhaustionCooldownMs: number
+  1330→
+  1331→  constructor(providerName: string, keys: string[], exhaustionCooldownMs = 60000) {
+  1332→    this._providerName = providerName
+  1333→    this.exhaustionCooldownMs = exhaustionCooldownMs
+  1334→    // CRITICAL: Do NOT filter out empty strings — that would shift array indices
+  1335→    // and break the key-to-NVIDIA-key mapping (Key N must use NVIDIA Key N).
+  1336→    // Instead, keep empty entries as placeholder objects with an empty key.
+  1337→    // getKeyByIndex() will skip them and fall back to getNextKey().
+  1338→    this.keys = keys.map((key, idx) => ({
+  1339→      key,
+  1340→      keyIndex: idx,  // Track which index this key is at — used for per-key token tracking
+  1341→      rateLimited: false,
+  1342→      rateLimitResetAt: 0,
+  1343→      failureCount: 0,
+  1344→      exhausted: key === '', // Mark empty keys as exhausted so they're never used
+  1345→      exhaustedAt: key === '' ? 0 : 0,
+  1346→      dailyQuotaExhausted: false, // Daily quota not exhausted yet
+  1347→      dailyQuotaResetAt: 0,        // Will be set when quota is hit
+  1348→      totalTokensUsed: 0,  // Track cumulative token usage per key
+  1349→      dailyTokensUsed: 0, // Track daily token usage per key (resets at midnight)
+  1350→      dailyRequestCount: 0, // Track daily request count per key
+  1351→      dailyRequestDate: '',  // Will be set on first use
+  1352→    }))
+  1353→  }
+  1354→
+  1355→  /** Provider name (public getter) */
+  1356→  get providerName(): string { return this._providerName }
+  1357→
+  1358→  /** Get next available key (round-robin, skipping empty/rate-limited/exhausted) */
+  1359→  getNextKey(): ProviderKeyInfo | null {
+  1360→    // Try all keys starting from nextKeyIndex
+  1361→    for (let i = 0; i < this.keys.length; i++) {
+  1362→      const idx = (this.nextKeyIndex + i) % this.keys.length
+  1363→      const keyInfo = this.keys[idx]
+  1364→
+  1365→      // Skip empty keys (missing env var) — permanently unavailable
+  1366→      if (!keyInfo.key) continue
+  1367→
+  1368→      // Check rate limit reset
+  1369→      if (keyInfo.rateLimited && Date.now() >= keyInfo.rateLimitResetAt) {
+  1370→        keyInfo.rateLimited = false
+  1371→        keyInfo.failureCount = 0
+  1372→      }
+  1373→
+  1374→      // Check exhaustion recovery (but not for empty keys — they stay exhausted forever)
+  1375→      if (keyInfo.exhausted && keyInfo.key && Date.now() >= keyInfo.exhaustedAt + this.exhaustionCooldownMs) {
+  1376→        keyInfo.exhausted = false
+  1377→        keyInfo.exhaustedAt = 0
+  1378→        keyInfo.failureCount = 0
+  1379→      }
+  1380→
+  1381→      // Check daily quota exhaustion — skip key if daily limit reached and not yet reset
+  1382→      if (keyInfo.dailyQuotaExhausted) {
+  1383→        if (Date.now() >= keyInfo.dailyQuotaResetAt) {
+  1384→          // Past reset time — clear daily quota exhaustion
+  1385→          keyInfo.dailyQuotaExhausted = false
+  1386→          keyInfo.dailyQuotaResetAt = 0
+  1387→          keyInfo.dailyTokensUsed = 0
+  1388→          keyInfo.dailyRequestCount = 0
+  1389→          keyInfo.dailyRequestDate = getTodayDateStr()
+  1390→          console.log(`[LLM] ${this._providerName} key#${idx} ...${keyInfo.key.slice(-6)} daily quota reset (time expired) ✓`)
+  1391→        } else {
+  1392→          continue // Skip this key — daily quota still exhausted
+  1393→        }
+  1394→      }
+  1395→
+  1396→      if (!keyInfo.rateLimited && !keyInfo.exhausted) {
+  1397→        this.nextKeyIndex = (idx + 1) % this.keys.length
+  1398→        return keyInfo
+  1399→      }
+  1400→    }
+  1401→    // Emergency fallback: if ALL keys are daily-quota-exhausted, force-reset one
+  1402→    return this.emergencyDailyQuotaReset()  // Returns null if emergency not applicable
+  1403→  }
+  1404→
+  1405→  /** Emergency recovery: If ALL keys are daily-quota-exhausted, reset the one
+  1406→   *  that was exhausted earliest (15-minute minimum wait). This prevents a
+  1407→   *  total system freeze where no extraction is possible until midnight.
+  1408→   *  The 15-minute wait ensures we don't immediately re-trigger the quota. */
+  1409→  private emergencyDailyQuotaReset(): ProviderKeyInfo | null {
+  1410→    const DAILY_QUOTA_EMERGENCY_RESET_MS = 15 * 60 * 1000 // 15 minutes minimum wait
+  1411→    const allValidKeys = this.keys.filter(k => !!k.key)
+  1412→    const dailyExhaustedKeys = allValidKeys.filter(k => k.dailyQuotaExhausted)
+  1413→
+  1414→    // Only trigger emergency if ALL valid keys are daily-quota-exhausted
+  1415→    if (dailyExhaustedKeys.length > 0 && dailyExhaustedKeys.length === allValidKeys.length) {
+  1416→      // Sort by dailyQuotaResetAt ascending — the one with earliest reset was marked first
+  1417→      const earliest = dailyExhaustedKeys.sort((a, b) => a.dailyQuotaResetAt - b.dailyQuotaResetAt)[0]
+  1418→      // Calculate when this key was marked: resetAt is midnight, so markedAt = some time before that
+  1419→      // We can't know exact markedAt, but we know midnight - markedAt >= 15min means it's been a while
+  1420→      // Simpler: always allow emergency reset if we're here (all keys stuck), just add a rate limit
+  1421→      const idx = this.keys.indexOf(earliest)
+  1422→      console.warn(`[LLM] EMERGENCY: All ${dailyExhaustedKeys.length} ${this._providerName} keys are daily-quota-exhausted. Force-resetting key#${idx} ...${earliest.key.slice(-6)}`)
+  1423→      earliest.dailyQuotaExhausted = false
+  1424→      earliest.dailyQuotaResetAt = 0
+  1425→      earliest.failureCount = 0
+  1426→      earliest.rateLimited = false
+  1427→      this.nextKeyIndex = (idx + 1) % this.keys.length
+  1428→      return earliest
+  1429→    }
+  1430→    return null
+  1431→  }
+  1432→
+  1433→  /** Get key at a specific index (for KEY-BASED key selection with fallback).
+  1434→   *
+  1435→   *  Priority:
+  1436→   *   1. Try the exact key for this index (Key N → NVIDIA Key N, strict binding)
+  1437→   *   2. If that key is unavailable (rate-limited/exhausted), fall back to getNextKey()
+  1438→   *      which uses a round-robin key from the SAME provider (cross-key sharing).
+  1439→   *
+  1440→   *  This "strict-first, fallback-second" approach ensures:
+  1441→   *   - Under normal load: each key assignment uses its own dedicated key (max parallelism)
+  1442→   *   - Under heavy load: keys share capacity rather than failing entirely
+  1443→   *   - No key is ever completely stuck if the provider has ANY available key
+  1444→   */
+  1445→  getKeyByIndex(index: number): ProviderKeyInfo | null {
+  1446→    if (index < 0 || index >= this.keys.length) return null
+  1447→    const keyInfo = this.keys[index]
+  1448→    // Empty key (missing env var) — permanently unavailable, never recover
+  1449→    if (!keyInfo.key) return this.getNextKey() // Fallback to another available key
+  1450→    // Check rate limit reset
+  1451→    if (keyInfo.rateLimited && Date.now() >= keyInfo.rateLimitResetAt) {
+  1452→      keyInfo.rateLimited = false
+  1453→      keyInfo.failureCount = 0
+  1454→    }
+  1455→    // Check exhaustion recovery
+  1456→    if (keyInfo.exhausted && Date.now() >= keyInfo.exhaustedAt + this.exhaustionCooldownMs) {
+  1457→      keyInfo.exhausted = false
+  1458→      keyInfo.exhaustedAt = 0
+  1459→      keyInfo.failureCount = 0
+  1460→    }
+  1461→
+  1462→    // Check daily quota exhaustion — skip key if daily limit reached
+  1463→    if (keyInfo.dailyQuotaExhausted) {
+  1464→      if (Date.now() >= keyInfo.dailyQuotaResetAt) {
+  1465→        keyInfo.dailyQuotaExhausted = false
+  1466→        keyInfo.dailyQuotaResetAt = 0
+  1467→        keyInfo.dailyTokensUsed = 0
+  1468→        keyInfo.dailyRequestCount = 0
+  1469→        keyInfo.dailyRequestDate = getTodayDateStr()
+  1470→      } else {
+  1471→        // Daily quota still exhausted — fall through to fallback
+  1472→      }
+  1473→    }
+  1474→    if (!keyInfo.rateLimited && !keyInfo.exhausted && !keyInfo.dailyQuotaExhausted) return keyInfo
+  1475→    // KEY UNAVAILABLE — fall back to another available key from this provider
+  1476→    // This prevents a key from being completely stuck when its dedicated key is rate-limited.
+  1477→    // We still prefer the dedicated key (tried first above), but sharing is better than failing.
+  1478→    console.log(`[LLM] ${this._providerName} key#${index} unavailable, trying fallback key`)
+  1479→    return this.getNextKey()
+  1480→  }
+  1481→
+  1482→  /** Mark a key as rate-limited.
+  1483→   *  Exhaustion threshold is 20 — high enough to avoid premature exhaustion
+  1484→   *  from temporary rate limits (40 RPM/key), but low enough to stop using
+  1485→   *  truly broken keys. Each 429 or error increments failureCount;
+  1486→   *  markSuccess resets it to 0. */
+  1487→  markRateLimited(key: string, cooldownMs: number): void {
+  1488→    const keyInfo = this.keys.find(k => k.key === key)
+  1489→    if (keyInfo) {
+  1490→      keyInfo.rateLimited = true
+  1491→      keyInfo.rateLimitResetAt = Date.now() + cooldownMs
+  1492→      keyInfo.failureCount++
+  1493→      if (keyInfo.failureCount >= 20) {
+  1494→        keyInfo.exhausted = true
+  1495→        keyInfo.exhaustedAt = Date.now()
+  1496→        console.log(`[LLM] ${this._providerName} key#${this.keys.indexOf(keyInfo)} ...${key.slice(-6)} marked exhausted (auto-retry in ${this.exhaustionCooldownMs / 1000}s)`)
+  1497→      }
+  1498→    }
+  1499→  }
+  1500→
+  1501→  /** Mark a key as rate-limited WITHOUT incrementing failureCount.
+  1502→   *  Used for fallback attempts — the original key already absorbed the failure,
+  1503→   *  so fallback keys should NOT be penalized with failureCount increments.
+  1504→   *  Without this, fallback cascades can exhaust ALL keys in seconds. */
+  1505→  markRateLimitedSoft(key: string, cooldownMs: number): void {
+  1506→    const keyInfo = this.keys.find(k => k.key === key)
+  1507→    if (keyInfo) {
+  1508→      keyInfo.rateLimited = true
+  1509→      keyInfo.rateLimitResetAt = Date.now() + cooldownMs
+  1510→      // NO failureCount++ — this was a fallback attempt, not a primary failure
+  1511→    }
+  1512→  }
+  1513→
+  1514→  /** Mark a key as daily-quota-exhausted.
+  1515→   *  Unlike `exhausted` (which recovers after cooldownMs), daily quota resets at midnight.
+  1516→   *  This is triggered when the API returns a 429 with a message indicating daily limit,
+  1517→   *  or when our proactive tracking detects the limit has been reached.
+  1518→   *
+  1519→   *  @param resetAt - Timestamp when the daily quota resets (default: midnight in user timezone) */
+  1520→  markDailyQuotaExhausted(key: string, resetAt?: number): void {
+  1521→    const keyInfo = this.keys.find(k => k.key === key)
+  1522→    if (keyInfo) {
+  1523→      keyInfo.dailyQuotaExhausted = true
+  1524→      keyInfo.dailyQuotaResetAt = resetAt || getMidnightTimestamp()
+  1525→      const idx = this.keys.indexOf(keyInfo)
+  1526→      console.warn(`[LLM] ${this._providerName} key#${idx} ...${key.slice(-6)} DAILY QUOTA EXHAUSTED — disabled until ${new Date(keyInfo.dailyQuotaResetAt).toLocaleString()}`)
+  1527→    }
+  1528→  }
+  1529→
+  1530→  /** Mark a key as successful (reset failure count, clear exhaustion).
+  1531→   *  Also tracks per-key token usage, daily token tracking, and request counts. */
+  1532→  markSuccess(key: string, tokensUsed?: number): void {
+  1533→    const keyInfo = this.keys.find(k => k.key === key)
+  1534→    if (keyInfo) {
+  1535→      keyInfo.failureCount = 0
+  1536→      // Clear exhaustion if present (successful call proves the key works)
+  1537→      if (keyInfo.exhausted) {
+  1538→        keyInfo.exhausted = false
+  1539→        keyInfo.exhaustedAt = 0
+  1540→        console.log(`[LLM] ${this._providerName} key#${this.keys.indexOf(keyInfo)} ...${key.slice(-6)} recovered from exhaustion ✓`)
+  1541→      }
+  1542→      // Track per-key token usage
+  1543→      if (tokensUsed && tokensUsed > 0) {
+  1544→        keyInfo.totalTokensUsed += tokensUsed
+  1545→      }
+  1546→      // Track per-key daily token and request counts
+  1547→      const today = getTodayDateStr()
+  1548→      if (keyInfo.dailyRequestDate !== today) {
+  1549→        // New day — reset daily counters
+  1550→        keyInfo.dailyRequestCount = 1
+  1551→        keyInfo.dailyRequestDate = today
+  1552→        keyInfo.dailyTokensUsed = tokensUsed || 0
+  1553→        // Also clear daily quota exhaustion on new day
+  1554→        if (keyInfo.dailyQuotaExhausted && Date.now() >= keyInfo.dailyQuotaResetAt) {
+  1555→          keyInfo.dailyQuotaExhausted = false
+  1556→          keyInfo.dailyQuotaResetAt = 0
+  1557→          console.log(`[LLM] ${this._providerName} key#${this.keys.indexOf(keyInfo)} ...${key.slice(-6)} daily quota reset (new day) ✓`)
+  1558→        }
+  1559→      } else {
+  1560→        keyInfo.dailyRequestCount++
+  1561→        keyInfo.dailyTokensUsed += (tokensUsed || 0)
+  1562→      }
+  1563→    }
+  1564→  }
+  1565→
+  1566→  /** Check if any key is available (considering per-provider limits and daily quota) */
+  1567→  hasAvailableKey(): boolean {
+  1568→    return this.keys.some(k => {
+  1569→      if (!k.key) return false // Empty key (missing env var)
+  1570→      if (k.rateLimited && Date.now() < k.rateLimitResetAt) return false
+  1571→      if (k.exhausted && Date.now() < k.exhaustedAt + this.exhaustionCooldownMs) return false
+  1572→      if (k.dailyQuotaExhausted && Date.now() < k.dailyQuotaResetAt) return false
+  1573→      // Auto-reset daily quota if past reset time
+  1574→      if (k.dailyQuotaExhausted && Date.now() >= k.dailyQuotaResetAt) {
+  1575→        k.dailyQuotaExhausted = false
+  1576→        k.dailyQuotaResetAt = 0
+  1577→      }
+  1578→      return true
+  1579→    })
+  1580→  }
+  1581→
+  1582→  get keyCount(): number { return this.keys.filter(k => !!k.key).length }
+  1583→  get availableCount(): number { return this.keys.filter(k => !!k.key && !k.rateLimited && !k.exhausted && !k.dailyQuotaExhausted).length }
+  1584→
+  1585→  /** Get count of keys with daily quota exhausted */
+  1586→  get dailyQuotaExhaustedCount(): number { return this.keys.filter(k => !!k.key && k.dailyQuotaExhausted && Date.now() < k.dailyQuotaResetAt).length }
+  1587→
+  1588→  /** Get provider availability as a ratio (0.0 to 1.0).
+  1589→   *  Used for backpressure decisions — when availability is low,
+  1590→   *  workers should pause to prevent cascading exhaustion. */
+  1591→  getAvailability(): number {
+  1592→    const available = this.keys.filter(k => {
+  1593→      if (!k.key) return false // Empty key (missing env var)
+  1594→      // Rate-limited and cooldown not yet expired
+  1595→      if (k.rateLimited && Date.now() < k.rateLimitResetAt) return false
+  1596→      // Exhausted and cooldown not yet expired
+  1597→      if (k.exhausted && Date.now() < k.exhaustedAt + this.exhaustionCooldownMs) return false
+  1598→      // Daily quota exhausted and not yet reset
+  1599→      if (k.dailyQuotaExhausted && Date.now() < k.dailyQuotaResetAt) return false
+  1600→      // Auto-reset daily quota if past reset time
+  1601→      if (k.dailyQuotaExhausted && Date.now() >= k.dailyQuotaResetAt) {
+  1602→        k.dailyQuotaExhausted = false
+  1603→        k.dailyQuotaResetAt = 0
+  1604→      }
+  1605→      return true
+  1606→    }).length
+  1607→    return this.keys.length > 0 ? available / this.keys.length : 0
+  1608→  }
+  1609→
+  1610→  /** Get detailed key status for diagnostics (includes token/request/daily-quota tracking) */
+  1611→  getKeyStatus(): Array<{
+  1612→    index: number
+  1613→    available: boolean
+  1614→    rateLimited: boolean
+  1615→    exhausted: boolean
+  1616→    dailyQuotaExhausted: boolean
+  1617→    dailyQuotaResetAt: number
+  1618→    failureCount: number
+  1619→    totalTokensUsed: number
+  1620→    dailyTokensUsed: number
+  1621→    dailyRequestCount: number
+  1622→    dailyRequestDate: string
+  1623→  }> {
+  1624→    return this.keys.map((k, i) => ({
+  1625→      index: i,
+  1626→      available: !!k.key && !k.rateLimited && !k.exhausted && !k.dailyQuotaExhausted,
+  1627→      rateLimited: k.rateLimited && Date.now() < k.rateLimitResetAt,
+  1628→      exhausted: k.exhausted,
+  1629→      dailyQuotaExhausted: k.dailyQuotaExhausted && Date.now() < k.dailyQuotaResetAt,
+  1630→      dailyQuotaResetAt: k.dailyQuotaResetAt,
+  1631→      failureCount: k.failureCount,
+  1632→      totalTokensUsed: k.totalTokensUsed,
+  1633→      dailyTokensUsed: k.dailyTokensUsed,
+  1634→      dailyRequestCount: k.dailyRequestCount,
+  1635→      dailyRequestDate: k.dailyRequestDate,
+  1636→    }))
+  1637→  }
+  1638→
+  1639→  /** Get total tokens used across all keys (for diagnostics) */
+  1640→  get totalTokensUsed(): number {
+  1641→    return this.keys.reduce((sum, k) => sum + k.totalTokensUsed, 0)
+  1642→  }
+  1643→
+  1644→  /** Get total daily tokens used across all keys (for diagnostics) */
+  1645→  get totalDailyTokensUsed(): number {
+  1646→    const today = getTodayDateStr()
+  1647→    return this.keys.reduce((sum, k) => sum + (k.dailyRequestDate === today ? k.dailyTokensUsed : 0), 0)
+  1648→  }
+  1649→
+  1650→  /** Get total daily requests across all keys (for diagnostics) */
+  1651→  get totalDailyRequests(): number {
+  1652→    const today = getTodayDateStr()
+  1653→    return this.keys.reduce((sum, k) => sum + (k.dailyRequestDate === today ? k.dailyRequestCount : 0), 0)
+  1654→  }
+  1655→}
+  1656→
+  1657→// ==================== INITIALIZE PROVIDER POOLS ====================
+  1658→// Only NVIDIA NIM is active.
+  1659→
+  1660→const nvidiaPool = new ProviderKeyPool('NVIDIA', [
+  1661→  process.env.NVIDIA_API_KEY_1 || '',
+  1662→  process.env.NVIDIA_API_KEY_2 || '',
+  1663→  process.env.NVIDIA_API_KEY_3 || '',
+  1664→  process.env.NVIDIA_API_KEY_4 || '',
+  1665→])
+  1666→
+  1667→console.log(`[LLM] Provider pool: NVIDIA=${nvidiaPool.keyCount} keys (${NVIDIA_MODELS.length} models) — SINGLE PROVIDER`)
+  1668→console.log(`[LLM] NVIDIA: 3 extraction cores + 5 agent/chat cores = 8 models, 4 keys × 4 docs = 16 max concurrent`)
+  1669→
+  1670→// ==================== BACKPRESSURE — PROVIDER AVAILABILITY ====================
+  1671→
+  1672→/** Get overall provider availability across all active pools (0.0 to 1.0).
+  1673→ *  Used by the extraction pipeline to implement backpressure:
+  1674→ *  - availability < 0.25 → pause chunk dispatch for 10s (cascading exhaustion protection)
+  1675→ *  - availability >= 0.5 → normal operation
+  1676→ *
+  1677→ *  This prevents the scenario where 8 concurrent workers keep pulling chunks
+  1678→ *  even when ALL providers are failing, which accelerates key exhaustion.
+  1679→ */
+  1680→export function getOverallAvailability(): number {
+  1681→  // Only NVIDIA pool matters
+  1682→  return nvidiaPool.keyCount > 0 ? nvidiaPool.getAvailability() : 0
+  1683→}
+  1684→
+  1685→/** Get per-provider availability for adaptive concurrency decisions.
+  1686→ *  Returns a record like { nvidia: 0.75 } */
+  1687→export function getProviderAvailability(): Record<string, number> {
+  1688→  return {
+  1689→    nvidia: nvidiaPool.getAvailability(),
+  1690→  }
+  1691→}
+  1692→
+  1693→// ==================== KEY-BASED PROVIDER TRY FUNCTION ====================
+  1694→
+  1695→/**
+  1696→ * Provider call using a ProviderKeyPool with dual key selection mode.
+  1697→ *
+  1698→ * Key selection:
+  1699→ *   - keyIndex >= 0 (0-3): STRICT key binding — uses Key N from each provider
+  1700→ *   - keyIndex = -1: LEGACY round-robin — uses getNextKey() for non-extraction callers (chat, health)
+  1701→ *
+  1702→ * STRICT key binding (keyIndex >= 0):
+  1703→ * - Key N uses ONLY Key N from each provider (fallback to other keys if unavailable)
+  1704→ * - If the key is rate-limited or exhausted → return null (skip to next provider)
+  1705→ * - This ensures each provider's keys are used in parallel across all 4 keys
+  1706→ *
+  1707→ * Legacy round-robin (keyIndex = -1):
+  1708→ * - Uses getNextKey() which cycles through available keys
+  1709→ * - Used by callLLM() for chat, health checks, classification etc.
+  1710→ */
+  1711→async function tryProviderWithSlotKey(
+  1712→  slotIndex: number,        // 0-3, determines which key to use
+  1713→  pool: ProviderKeyPool,    // The provider's key pool
+  1714→  endpoint: string,
+  1715→  models: string[],
+  1716→  prompt: string,
+  1717→  systemPrompt: string | undefined,
+  1718→  timeoutMs: number = 120000,
+  1719→  extraHeaders: Record<string, string> = {},
+  1720→  rateLimitCooldownMs: number = 60000,
+  1721→  temperature: number = 0.1,
+  1722→  maxTokens: number = 4096,
+  1723→  agentId?: string,         // For per-agent token tracking
+  1724→  agentName?: string,       // For per-agent token tracking
+  1725→  isFallback: boolean = false, // When true, don't increment failureCount on errors — prevents cascade exhaustion
+  1726→  tools?: Array<{ type: string; function: { name: string; description: string; parameters: Record<string, unknown> } }>,
+  1727→): Promise<LLMResult | null> {
+  1728→  const providerName = pool.providerName
+  1729→
+  1730→  // Key selection: key-based (strict) or round-robin (legacy)
+  1731→  // keyIndex 0-3: STRICT binding — only use Key N from each provider (no cross-key fallback)
+  1732→  // keyIndex -1: LEGACY round-robin — use getNextKey() for non-extraction tasks (chat, health, classification)
+  1733→  const keyInfo = slotIndex >= 0
+  1734→    ? pool.getKeyByIndex(slotIndex)   // Key-based: strict key binding
+  1735→    : pool.getNextKey()               // Legacy: round-robin key rotation
+  1736→
+  1737→  if (!keyInfo) {
+  1738→    if (slotIndex >= 0) {
+  1739→      console.log(`[LLM] Key ${slotIndex} ${providerName} key#${slotIndex} unavailable (rate-limited/exhausted/limit-reached), skipping to next provider`)
+  1740→    } else {
+  1741→      console.log(`[LLM] ${providerName} no available keys (all rate-limited/exhausted/limit-reached), skipping to next provider`)
+  1742→    }
+  1743→    return null
+  1744→  }
+  1745→
+  1746→  const messages = [
+  1747→    ...(systemPrompt ? [{ role: 'system' as const, content: systemPrompt }] : []),
+  1748→    { role: 'user' as const, content: prompt },
+  1749→  ]
+  1750→
+  1751→  // MODEL ROTATION: Rotate starting model each call so all models get usage
+  1752→  const rotatedModels = getRotatedModels(providerName, models)
+  1753→
+  1754→  // Track consecutive 429s across models — if 2+ models return 429 with the same key,
+  1755→  // it's likely a key-level rate limit (not model-scoped), so we skip remaining models
+  1756→  // to prevent unnecessary failureCount increments that accelerate key exhaustion.
+  1757→  let consecutive429Count = 0
+  1758→
+  1759→  // Try each model with this slot's dedicated key (rotated order)
+  1760→  for (const model of rotatedModels) {
+  1761→    try {
+  1762→      const controller = new AbortController()
+  1763→      const timer = setTimeout(() => controller.abort(), timeoutMs)
+  1764→
+  1765→      const response = await fetch(endpoint, {
+  1766→        method: 'POST',
+  1767→        headers: {
+  1768→          'Content-Type': 'application/json',
+  1769→          Authorization: `Bearer ${keyInfo.key}`,
+  1770→          ...extraHeaders,
+  1771→        },
+  1772→        body: JSON.stringify({
+  1773→          model,
+  1774→          messages,
+  1775→          max_tokens: maxTokens ?? 4096,
+  1776→          temperature: temperature ?? 0.1,
+  1777→          ...(tools && tools.length > 0 ? { tools, tool_choice: 'auto' } : {}),
+  1778→        }),
+  1779→        signal: controller.signal,
+  1780→      })
+  1781→      clearTimeout(timer)
+  1782→
+  1783→      if (response.status === 429) {
+  1784→        const keyLabel = slotIndex >= 0 ? `key#${slotIndex}` : 'key (round-robin)'
+  1785→        // Read the response body to distinguish daily quota exhaustion from temporary rate limit
+  1786→        let errorBody = ''
+  1787→        try { errorBody = await response.text() } catch { /* ignore read error */ }
+  1788→        const quotaCheck = parse429ForDailyQuota(providerName, errorBody)
+  1789→
+  1790→        if (quotaCheck.isDailyQuota) {
+  1791→          // DAILY QUOTA EXHAUSTED — mark key as daily-exhausted (no retry until midnight)
+  1792→          console.warn(`[LLM] Key ${slotIndex} ${providerName} ${keyLabel} model ${model} → 429 DAILY QUOTA EXHAUSTED (body: ${errorBody.slice(0, 200)})`)
+  1793→          pool.markDailyQuotaExhausted(keyInfo.key, quotaCheck.resetAt)
+  1794→          // Skip remaining models — if one model says daily quota, all will say the same
+  1795→          break
+  1796→        }
+  1797→
+  1798→        // Temporary rate limit (RPM exceeded) — apply cooldown and try next model
+  1799→        console.log(`[LLM] Key ${slotIndex} ${providerName} ${keyLabel} model ${model} → 429 Rate Limited (cooldown ${rateLimitCooldownMs / 1000}s, fallback=${isFallback}, body: ${errorBody.slice(0, 100)})`)
+  1800→        // BUG FIX: Use markRateLimitedSoft for fallback attempts to prevent cascade exhaustion.
+  1801→        // Without this, 8 workers × 4 fallback keys = 32 failureCount increments in seconds,
+  1802→        // exhausting ALL keys simultaneously.
+  1803→        if (isFallback) {
+  1804→          pool.markRateLimitedSoft(keyInfo.key, rateLimitCooldownMs)
+  1805→        } else {
+  1806→          pool.markRateLimited(keyInfo.key, rateLimitCooldownMs)
+  1807→        }
+  1808→        consecutive429Count++
+  1809→        // If 2+ consecutive 429s on the same key → likely key-level rate limit,
+  1810→        // not model-scoped. Skip remaining models to avoid unnecessary failureCount increments.
+  1811→        if (consecutive429Count >= 2) {
+  1812→          console.warn(`[LLM] ${consecutive429Count} consecutive 429s on ${providerName} key — assuming key-level rate limit, skipping remaining models`)
+  1813→          break  // Exit model loop → move to next provider
+  1814→        }
+  1815→        continue
+  1816→      }
+  1817→
+  1818→      // Reset consecutive counter on non-429 response
+  1819→      consecutive429Count = 0
+  1820→
+  1821→      if (response.ok) {
+  1822→        const data = await response.json() as {
+  1823→          choices: Array<{
+  1824→            message: {
+  1825→              content: string
+  1826→              tool_calls?: Array<{
+  1827→                id: string
+  1828→                type: 'function'
+  1829→                function: { name: string; arguments: string }
+  1830→              }>
+  1831→            }
+  1832→            finish_reason?: string
+  1833→          }>
+  1834→          usage?: { prompt_tokens?: number; completion_tokens?: number; total_tokens?: number }
+  1835→        }
+  1836→        const content = data.choices?.[0]?.message?.content
+  1837→        const totalTokens = data.usage?.total_tokens ?? ((data.usage?.prompt_tokens ?? 0) + (data.usage?.completion_tokens ?? 0))
+  1838→        if (content) {
+  1839→          const keyLabel = slotIndex >= 0 ? `key#${slotIndex}` : 'key (rr)'
+  1840→          console.log(`[LLM] Key ${slotIndex} ${providerName} ${keyLabel} model ${model} ✓ (${totalTokens} tokens)`)
+  1841→          // Pass tokensUsed to markSuccess so per-key token tracking works
+  1842→          pool.markSuccess(keyInfo.key, totalTokens)
+  1843→          // Use the ACTUAL key index for per-slot token tracking, not the requested slotIndex.
+  1844→          // When slotIndex=-1 (round-robin, used by agent/chat calls), we still want to
+  1845→          // track which key was actually used so the Provider × Slot table shows all tokens.
+  1846→          // When getKeyByIndex() falls back to a different key, we also want the correct slot.
+  1847→          const actualKeyIndex = keyInfo.keyIndex
+  1848→          if (totalTokens > 0) addTokensUsed(totalTokens, providerName.toLowerCase(), actualKeyIndex, model)
+  1849→          // Per-agent token tracking
+  1850→          if (totalTokens > 0 && agentId && agentName) {
+  1851→            const inputTokens = data.usage?.prompt_tokens ?? 0
+  1852→            const outputTokens = data.usage?.completion_tokens ?? 0
+  1853→            addTokensUsedByAgent(totalTokens, inputTokens, outputTokens, providerName.toLowerCase(), model, agentId, agentName)
+  1854→          }
+  1855→          return {
+  1856→            content,
+  1857→            provider: providerName.toLowerCase(),
+  1858→            model,
+  1859→            tokensUsed: totalTokens,
+  1860→            toolCalls: data.choices?.[0]?.message?.tool_calls,
+  1861→            finishReason: data.choices?.[0]?.finish_reason,
+  1862→          }
+  1863→        }
+  1864→      }
+  1865→
+  1866→      // Non-429 HTTP error (5xx, 401, 403, etc.) — mark as rate-limited with short cooldown
+  1867→      // so failureCount increments but the key can recover quickly.
+  1868→      // This prevents silent failures from flying under the radar.
+  1869→      const isServerError = response.status >= 500
+  1870→      const isAuthError = response.status === 401 || response.status === 403
+  1871→      if (isServerError || isAuthError) {
+  1872→        const cooldown = isServerError ? 10000 : 60000 // 10s for 5xx, 60s for auth errors
+  1873→        console.warn(`[LLM] Key ${slotIndex} ${providerName} key#${slotIndex} model ${model} HTTP ${response.status} — marking rate-limited (${cooldown / 1000}s cooldown, fallback=${isFallback})`)
+  1874→        if (isFallback) {
+  1875→          pool.markRateLimitedSoft(keyInfo.key, cooldown)
+  1876→        } else {
+  1877→          pool.markRateLimited(keyInfo.key, cooldown)
+  1878→        }
+  1879→        if (isAuthError) break // Auth error won't be fixed by trying other models
+  1880→      } else {
+  1881→        console.log(`[LLM] Key ${slotIndex} ${providerName} key#${slotIndex} model ${model} HTTP ${response.status}`)
+  1882→      }
+  1883→    } catch (err) {
+  1884→      if (err instanceof Error && err.name === 'AbortError') {
+  1885→        console.log(`[LLM] Key ${slotIndex} ${providerName} key#${slotIndex} model ${model} timed out (${timeoutMs / 1000}s)`)
+  1886→      } else {
+  1887→        console.log(`[LLM] Key ${slotIndex} ${providerName} key#${slotIndex} model ${model} error: ${err instanceof Error ? err.message : 'unknown'}`)
+  1888→      }
+  1889→      // Network errors — use soft marking for fallback to prevent cascade exhaustion
+  1890→      if (isFallback) {
+  1891→        pool.markRateLimitedSoft(keyInfo.key, 10000) // 10s cooldown, no failureCount increment
+  1892→      } else {
+  1893→        pool.markRateLimited(keyInfo.key, 10000) // 10s cooldown for network errors
+  1894→      }
+  1895→    }
+  1896→  }
+  1897→
+  1898→  // All models failed for this provider's key — return null so caller tries next provider
+  1899→  return null
+  1900→}
+  1901→
+  1902→// ==================== PROVIDER-SPECIFIC TRY FUNCTIONS ====================
+  1903→
+  1904→/** Try NVIDIA NIM with assigned key — EXTRACTION ONLY: chỉ 3 lõi nemotron-3-super, llama-3.3-70b, gpt-oss-120b */
+  1905→async function tryNvidiaSlot(slotIndex: number, prompt: string, systemPrompt: string | undefined, temperature?: number, maxTokens?: number, agentId?: string, agentName?: string, isFallback: boolean = false): Promise<LLMResult | null> {
+  1906→  return tryProviderWithSlotKey(
+  1907→    slotIndex,
+  1908→    nvidiaPool,
+  1909→    'https://integrate.api.nvidia.com/v1/chat/completions',
+  1910→    NVIDIA_EXTRACTION_MODELS,
+  1911→    prompt,
+  1912→    systemPrompt,
+  1913→    60000, // 60s timeout
+  1914→    {},
+  1915→    30000, // 30s rate limit cooldown — shorter to recover faster from temporary rate limits
+  1916→    temperature ?? 0.1,
+  1917→    maxTokens ?? 4096,
+  1918→    agentId,
+  1919→    agentName,
+  1920→    isFallback,
+  1921→  )
+  1922→}
+  1923→
+  1924→// ==================== LEGACY PROVIDER TRY FUNCTIONS (for callLLM) ====================
+  1925→
+  1926→/** Try NVIDIA NIM — 4 keys × 4 docs, no daily cap (legacy round-robin) */
+  1927→async function tryNvidia(prompt: string, systemPrompt: string | undefined, temperature?: number, maxTokens?: number, agentId?: string, agentName?: string): Promise<LLMResult | null> {
+  1928→  return tryProviderWithSlotKey(
+  1929→    -1,
+  1930→    nvidiaPool,
+  1931→    'https://integrate.api.nvidia.com/v1/chat/completions',
+  1932→    NVIDIA_MODELS,
+  1933→    prompt,
+  1934→    systemPrompt,
+  1935→    60000,
+  1936→    {},
+  1937→    30000, // 30s rate limit cooldown (same as extraction)
+  1938→    temperature ?? 0.1,
+  1939→    maxTokens ?? 4096,
+  1940→    agentId,
+  1941→    agentName,
+  1942→  )
+  1943→}
+  1944→
+  1945→/** Get per-provider key pool diagnostics (token usage, request counts, key status) */
+  1946→export function getProviderDiagnostics(): Record<string, {
+  1947→  keyCount: number
+  1948→  availableCount: number
+  1949→  dailyQuotaExhaustedCount: number
+  1950→  totalTokensUsed: number
+  1951→  totalDailyTokensUsed: number
+  1952→  totalDailyRequests: number
+  1953→  dailyTokenLimit: number
+  1954→  keys: Array<{
+  1955→    index: number
+  1956→    available: boolean
+  1957→    rateLimited: boolean
+  1958→    exhausted: boolean
+  1959→    dailyQuotaExhausted: boolean
+  1960→    dailyQuotaResetAt: number
+  1961→    failureCount: number
+  1962→    totalTokensUsed: number
+  1963→    dailyTokensUsed: number
+  1964→    dailyRequestCount: number
+  1965→    dailyRequestDate: string
+  1966→  }>
+  1967→}> {
+  1968→  const pools = [
+  1969→    { name: 'NVIDIA', pool: nvidiaPool },
+  1970→  ]
+  1971→  const result: Record<string, {
+  1972→    keyCount: number
+  1973→    availableCount: number
+  1974→    dailyQuotaExhaustedCount: number
+  1975→    totalTokensUsed: number
+  1976→    totalDailyTokensUsed: number
+  1977→    totalDailyRequests: number
+  1978→    dailyTokenLimit: number
+  1979→    keys: Array<{
+  1980→      index: number
+  1981→      available: boolean
+  1982→      rateLimited: boolean
+  1983→      exhausted: boolean
+  1984→      dailyQuotaExhausted: boolean
+  1985→      dailyQuotaResetAt: number
+  1986→      failureCount: number
+  1987→      totalTokensUsed: number
+  1988→      dailyTokensUsed: number
+  1989→      dailyRequestCount: number
+  1990→      dailyRequestDate: string
+  1991→    }>
+  1992→  }> = {}
+  1993→  for (const { name, pool } of pools) {
+  1994→    result[name] = {
+  1995→      keyCount: pool.keyCount,
+  1996→      availableCount: pool.availableCount,
+  1997→      dailyQuotaExhaustedCount: pool.dailyQuotaExhaustedCount,
+  1998→      totalTokensUsed: pool.totalTokensUsed,
+  1999→      totalDailyTokensUsed: pool.totalDailyTokensUsed,
+  2000→      totalDailyRequests: pool.totalDailyRequests,
+
+[showing lines 1-2000 of 2298; use offset=2001 with limit to continue reading]

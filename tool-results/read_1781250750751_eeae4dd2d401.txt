@@ -1,0 +1,1114 @@
+     1→# OpenClaw Integration — Kế Hoạch Triển Khai Chi Tiết
+     2→
+     3→> Ngày tạo: 2026-03-05  
+     4→> Cập nhật: 2026-03-05  
+     5→> Dựa trên: `OPENCLAW_INTEGRATION_ANALYSIS.md` + Khảo sát codebase thực tế
+     6→
+     7→---
+     8→
+     9→## Mục Lục
+    10→
+    11→1. [Tổng Quan Kiến Trúc Mục Tiêu](#1-tổng-quan-kiến-trúc-mục-tiêu)
+    12→2. [Phát Hiện Quan Trọng Mới](#2-phát-hiện-quan-trọng-mới)
+    13→3. [P0: Gateway-First Tool Calling](#3-p0-gateway-first-tool-calling)
+    14→4. [P1: Skills → Tools Connection](#4-p1-skills--tools-connection)
+    15→5. [P2: Full Archive Download & Execution](#5-p2-full-archive-download--execution)
+    16→6. [P3: Extensible Tool System](#6-p3-extensible-tool-system)
+    17→7. [Dependency Map](#7-dependency-map)
+    18→8. [Risk & Mitigation](#8-risk--mitigation)
+    19→
+    20→---
+    21→
+    22→## 1. Tổng Quan Kiến Trúc Mục Tiêu
+    23→
+    24→### Kiến trúc hiện tại (BROKEN):
+    25→
+    26→```
+    27→User Chat → /api/openclaw/chat
+    28→              ├── Code query? → OpenCode (port 18790) ← OK
+    29→              ├── Agent có provider+model? → ReAct loop:
+    30→              │     callLLMForAgent() → ❌ KHÔNG gửi tools
+    31→              │     parseToolCallsFromOutput() → ❌ Regex fragile  
+    32→              │     executeTool() → ❌ Chỉ 7 tools
+    33→              ├── Không có agent? → Gateway chatCompletion() → ❌ Không có NVIDIA key
+    34→              └── Fallback → /api/query → Local RAG
+    35→```
+    36→
+    37→### Kiến trúc mục tiêu (SAU P0):
+    38→
+    39→```
+    40→User Chat → /api/openclaw/chat
+    41→              ├── Code query? → OpenCode (port 18790) ← giữ nguyên
+    42→              │
+    43→              ├── Gateway ONLINE?
+    44→              │     └── YES → Route qua Gateway:
+    45→              │           POST /v1/chat/completions
+    46→              │           + Header: x-openclaw-model = agent.model
+    47→              │           + Body: tools = Gateway's 37 tools
+    48→              │           → Gateway tự handle ReAct loop
+    49→              │           → Trả về final response (đã xử lý tools)
+    50→              │           → ✅ 37 tools khả dụng
+    51→              │
+    52→              ├── Gateway OFFLINE?
+    53→              │     └── YES → Fallback local ReAct loop:
+    54→              │           callLLMForAgent() + tools parameter ← SỬA
+    55→              │           Parse structured tool_calls ← SỬA
+    56→              │           executeTool() (7 local tools + Gateway /tools/invoke) ← MỞ RỘNG
+    57→              │           → ✅ 7+ tools khả dụng
+    58→              │
+    59→              └── Cuối cùng → /api/query → Local RAG ← giữ nguyên
+    60→```
+    61→
+    62→### Chiến lược: Gateway-First, Local-Fallback
+    63→
+    64→- **Gateway online** → Route tất cả qua Gateway → 37 tools đầy đủ
+    65→- **Gateway offline** → Fallback local ReAct loop → 7+ tools (sửa đổi)
+    66→- **Không phá vỡ** flow hiện tại — chỉ thêm layer mới
+    67→
+    68→---
+    69→
+    70→## 2. Phát Hiện Quan Trọng Mới
+    71→
+    72→### ⚠️ HTTP Deny List — Thay đổi chiến lược P0
+    73→
+    74→Khi khảo sát Gateway API thực tế, phát hiện:
+    75→
+    76→**12+ tools quan trọng bị DENY qua HTTP `/tools/invoke`:**
+    77→```
+    78→exec, spawn, shell, fs_write, fs_delete, fs_move,
+    79→apply_patch, sessions_spawn, sessions_send, cron, gateway, nodes
+    80→```
+    81→
+    82→**Ý nghĩa:**
+    83→- Pattern B (Hybrid: gọi NVIDIA trực tiếp + execute tools qua `/tools/invoke`) **KHÔNG THỂ DÙNG** cho file/exec tools
+    84→- Chỉ có thể dùng `/tools/invoke` cho: `web_search`, `web_fetch`, `x_search`, `memory_search`, `memory_get`, `sessions_list`, `session_status`, `agents_list`, `message`
+    85→- **Pattern A (route qua Gateway `/v1/chat/completions`)** là con đường duy nhất để dùng tất cả 37 tools vì Gateway's internal agent loop không bị HTTP deny list
+    86→
+    87→### ✅ Gateway hỗ trợ model override per request
+    88→
+    89→- Header `x-openclaw-model` cho phép chỉ định model cho mỗi request
+    90→- Ví dụ: `x-openclaw-model: nvidia/qwen/qwen3.5-397b-a17b` → BOLT agent
+    91→- Không cần cấu hình mỗi agent riêng trong Gateway
+    92→
+    93→### ✅ Gateway đã có NVIDIA NIM built-in provider
+    94→
+    95→- Chỉ cần set `NVIDIA_API_KEY` env var → Gateway tự gọi NVIDIA NIM
+    96→- Dynamic model discovery từ `assets.ngc.nvidia.com` (cache 24h, max 32 models)
+    97→- App có thể dùng bất kỳ NVIDIA model nào thông qua `x-openclaw-model` header
+    98→
+    99→---
+   100→
+   101→## 3. P0: Gateway-First Tool Calling
+   102→
+   103→### Mục tiêu
+   104→Agents có thể gọi và thực thi tools thật. Khi Gateway online → 37 tools. Khi offline → 7+ local tools.
+   105→
+   106→### Thời gian dự kiến: 2-3 ngày
+   107→
+   108→### P0.1: Cấu hình NVIDIA NIM cho Gateway
+   109→
+   110→**Triển khai:**
+   111→```bash
+   112→# 1. Set NVIDIA_API_KEY cho Gateway process
+   113→# Sửa mini-services/openclaw-gateway/index.ts
+   114→# Thêm NVIDIA_API_KEY vào env khi spawn process
+   115→```
+   116→
+   117→**File cần sửa:** `mini-services/openclaw-gateway/index.ts`
+   118→
+   119→**Chi tiết:**
+   120→- Đọc `NVIDIA_API_KEY_1` từ `.env` (app đã có 4 keys)
+   121→- Pass `NVIDIA_API_KEY` env var cho child process khi spawn `openclaw gateway run`
+   122→- Kiểm tra Gateway có nhận được key không: `curl http://127.0.0.1:18789/v1/models`
+   123→
+   124→**Cách triển khai:**
+   125→```typescript
+   126→// mini-services/openclaw-gateway/index.ts
+   127→// Trong spawn args, thêm env:
+   128→const env = {
+   129→  ...process.env,
+   130→  NVIDIA_API_KEY: process.env.NVIDIA_API_KEY_1 || '',
+   131→};
+   132→
+   133→const child = spawn('npx', ['openclaw', 'gateway', 'run', ...], {
+   134→  env,  // ← thêm dòng này
+   135→  stdio: ['ignore', 'pipe', 'pipe'],
+   136→});
+   137→```
+   138→
+   139→**Verify:**
+   140→```bash
+   141→curl -X POST http://127.0.0.1:18789/v1/chat/completions \
+   142→  -H "Content-Type: application/json" \
+   143→  -d '{"model":"openclaw","messages":[{"role":"user","content":"Say hello"}],"max_tokens":50}'
+   144→# → Phải trả về response thay vì "missing-provider-auth" error
+   145→```
+   146→
+   147→---
+   148→
+   149→### P0.2: Sửa Chat Route — Gateway-First với Model Override
+   150→
+   151→**File cần sửa:** `src/app/api/openclaw/chat/route.ts`
+   152→
+   153→**Hiện tại (line 542-648):**
+   154→```
+   155→if (hasAgentProviderModel) → runAgentReActLoop() (bypasses Gateway)
+   156→if (!hasAgentProviderModel) → try Gateway chatCompletion()
+   157→```
+   158→
+   159→**Sửa thành:**
+   160→```
+   161→1. Luôn kiểm tra Gateway online trước
+   162→2. Nếu Gateway online → route QUA Gateway (dù có agent provider hay không)
+   163→3. Nếu Gateway offline → fallback local ReAct loop
+   164→```
+   165→
+   166→**Chi tiết triển khai:**
+   167→
+   168→```typescript
+   169→// === NEW: Gateway-First Chat Flow ===
+   170→
+   171→// Bước 1: Kiểm tra Gateway status (cache 30s để tránh spam)
+   172→let gatewayOnline = false
+   173→let gatewayCacheTime = 0
+   174→const GATEWAY_CACHE_TTL = 30000
+   175→
+   176→async function isGatewayOnlineCached(): Promise<boolean> {
+   177→  const now = Date.now()
+   178→  if (now - gatewayCacheTime < GATEWAY_CACHE_TTL) return gatewayOnline
+   179→  gatewayCacheTime = now
+   180→  const result = await isGatewayOnline()
+   181→  gatewayOnline = result.online
+   182→  return gatewayOnline
+   183→}
+   184→
+   185→// Bước 2: Map agent model → x-openclaw-model header
+   186→function mapAgentModelToGatewayHeader(provider: string, model: string): string {
+   187→  // App dùng: nvidia/qwen/qwen3.5-397b-a17b
+   188→  // Gateway cần: nvidia/qwen/qwen3.5-397b-a17b (giữ nguyên)
+   189→  return `${provider}/${model}`
+   190→}
+   191→
+   192→// Bước 3: Route chat qua Gateway
+   193→async function routeThroughGateway(params: {
+   194→  messages: ChatMessage[]
+   195→  agentProvider: string
+   196→  agentModel: string
+   197→  sessionId?: string
+   198→  temperature?: number
+   199→  maxTokens?: number
+   200→  agentProfileId?: string
+   201→  agentProfileName?: string
+   202→  teamMode?: string
+   203→  teamName?: string
+   204→}): Promise<NextResponse | null> {
+   205→  const { messages, agentProvider, agentModel, sessionId, temperature, maxTokens,
+   206→          agentProfileId, agentProfileName, teamMode, teamName } = params
+   207→
+   208→  try {
+   209→    // Gọi Gateway với x-openclaw-model header để chỉ định model cho agent
+   210→    const gatewayModel = mapAgentModelToGatewayHeader(agentProvider, agentModel)
+   211→    
+   212→    const res = await gatewayFetch('/v1/chat/completions', {
+   213→      method: 'POST',
+   214→      headers: {
+   215→        'Content-Type': 'application/json',
+   216→        'x-openclaw-model': gatewayModel,  // ← Override model per agent
+   217→      },
+   218→      body: JSON.stringify({
+   219→        model: 'openclaw/default',
+   220→        messages,
+   221→        stream: false,
+   222→        ...(temperature !== undefined ? { temperature } : {}),
+   223→        ...(maxTokens !== undefined ? { max_tokens: maxTokens } : {}),
+   224→        // KHÔNG cần gửi tools — Gateway tự có 37 tools built-in
+   225→        // Gateway's agent loop tự động handle tool calling
+   226→      }),
+   227→      timeout: 120000,  // 2 phút timeout cho ReAct loop
+   228→    })
+   229→
+   230→    if (!res.ok) {
+   231→      console.warn(`[Gateway] Chat error ${res.status}`)
+   232→      return null
+   233→    }
+   234→
+   235→    const data = await res.json()
+   236→    const content = data.choices?.[0]?.message?.content || 'No response'
+   237→
+   238→    // Track token usage
+   239→    const usage = data.usage
+   240→    if (usage?.total_tokens) {
+   241→      addTokensUsed(usage.total_tokens, agentProvider, agentProfileId, agentModel)
+   242→    }
+   243→
+   244→    // Track session
+   245→    if (sessionId) {
+   246→      await db.agentSession.upsert({
+   247→        where: { sessionId },
+   248→        create: {
+   249→          sessionId, model: agentModel, provider: agentProvider,
+   250→          title: messages[0]?.content?.slice(0, 50) || 'New Chat',
+   251→          messageCount: messages.length + 1,
+   252→          agentProfileId: agentProfileId || null,
+   253→          teamMode: teamMode || null, teamName: teamName || null,
+   254→        },
+   255→        update: { messageCount: { increment: 1 } },
+   256→      }).catch(() => {})
+   257→    }
+   258→
+   259→    // Auto-learn, memory, etc. (giữ nguyên logic hiện tại)
+   260→    // ...
+   261→
+   262→    return NextResponse.json({
+   263→      content,
+   264→      model: agentModel,
+   265→      provider: agentProvider,
+   266→      sessionId: sessionId || `session-${Date.now()}`,
+   267→      agentProfileId,
+   268→      sources: [],
+   269→      confidence: 0.7,
+   270→      kbResults: 'gateway-react',
+   271→      gatewayToolsAvailable: true,
+   272→    })
+   273→  } catch (err) {
+   274→    console.warn('[Gateway] Error:', err)
+   275→    return null
+   276→  }
+   277→}
+   278→```
+   279→
+   280→**Thay đổi trong POST() handler:**
+   281→
+   282→```typescript
+   283→// TRƯỚC (line 542-648):
+   284→if (hasAgentProviderModel) {
+   285→  // Luôn chạy local ReAct loop → bypasses Gateway
+   286→  const reactResult = await runAgentReActLoop(...)
+   287→  return NextResponse.json(...)
+   288→}
+   289→if (!hasAgentProviderModel) {
+   290→  // Chỉ thử Gateway khi KHÔNG có agent config
+   291→  const onlineResult = await isGatewayOnline()
+   292→  if (onlineResult.online) { ... }
+   293→}
+   294→
+   295→// SAU:
+   296→// 1. Kiểm tra Gateway status
+   297→const gatewayAvailable = await isGatewayOnlineCached()
+   298→
+   299→if (gatewayAvailable) {
+   300→  // 2a. Gateway online → route QUA Gateway (ALL agents, không phân biệt)
+   301→  const gatewayResponse = await routeThroughGateway({
+   302→    messages: fullMessages,
+   303→    agentProvider: agentProvider || 'nvidia',
+   304→    agentModel: agentModel || 'nvidia/nemotron-3-super-120b-a12b',
+   305→    sessionId, temperature: agentTemperature, maxTokens: agentMaxTokens,
+   306→    agentProfileId, agentProfileName, teamMode, teamName,
+   307→  })
+   308→  
+   309→  if (gatewayResponse) return gatewayResponse
+   310→  // Nếu Gateway trả về null (error) → fall through to local
+   311→}
+   312→
+   313→// 2b. Gateway offline HOẶC Gateway error → fallback local ReAct loop
+   314→if (hasAgentProviderModel) {
+   315→  // Giữ nguyên runAgentReActLoop() hiện tại
+   316→  const reactResult = await runAgentReActLoop(...)
+   317→  return NextResponse.json(...)
+   318→}
+   319→
+   320→// 2c. Cuối cùng → /api/query fallback (giữ nguyên)
+   321→```
+   322→
+   323→**Kết quả P0.2:**
+   324→- Gateway online → 37 tools tự động khả dụng, không cần gửi tools trong request
+   325→- Gateway offline → Fallback local ReAct loop (7 tools)
+   326→- Mỗi Agent dùng model riêng qua `x-openclaw-model` header
+   327→- Không phá vỡ logic hiện tại
+   328→
+   329→---
+   330→
+   331→### P0.3: Sửa `callLLMForAgent()` — Thêm tools parameter (cho local fallback)
+   332→
+   333→**File cần sửa:** `src/lib/llm.ts`
+   334→
+   335→**Hiện tại (line 1730):**
+   336→```typescript
+   337→body: JSON.stringify({ model, messages, max_tokens: maxTokens, temperature })
+   338→// ❌ Không có tools parameter
+   339→```
+   340→
+   341→**Sửa thành:**
+   342→```typescript
+   343→// Thêm tools parameter vào tryProviderWithSlotKey function signature
+   344→async function tryProviderWithSlotKey(
+   345→  slotIndex: number,
+   346→  pool: ProviderKeyPool,
+   347→  endpoint: string,
+   348→  models: string[],
+   349→  prompt: string,
+   350→  systemPrompt: string | undefined,
+   351→  timeoutMs: number = 120000,
+   352→  extraHeaders: Record<string, string> = {},
+   353→  rateLimitCooldownMs: number = 60000,
+   354→  temperature: number = 0.1,
+   355→  maxTokens: number = 4096,
+   356→  agentId?: string,
+   357→  agentName?: string,
+   358→  tools?: Array<{ type: string; function: { name: string; description: string; parameters: Record<string, unknown> } }>,
+   359→  // ← THÊM tools parameter
+   360→): Promise<LLMResult | null> {
+   361→  // ...existing code...
+   362→
+   363→  // Sửa body JSON:
+   364→  body: JSON.stringify({
+   365→    model,
+   366→    messages,
+   367→    max_tokens: maxTokens ?? 4096,
+   368→    temperature: temperature ?? 0.1,
+   369→    ...(tools && tools.length > 0 ? { tools, tool_choice: 'auto' } : {}),
+   370→    // ← THÊM tools khi có
+   371→  }),
+   372→```
+   373→
+   374→**Cũng sửa `callLLMForAgent()` (line 2296):**
+   375→```typescript
+   376→export async function callLLMForAgent(
+   377→  prompt: string,
+   378→  agentConfig: { provider: string; model: string },
+   379→  systemPrompt?: string,
+   380→  options?: LLMCallOptions & {
+   381→    tools?: Array<{ type: string; function: { name: string; description: string; parameters: Record<string, unknown> } }>
+   382→  },
+   383→): Promise<LLMResult> {
+   384→  const { provider, model } = agentConfig
+   385→
+   386→  // Pass tools to provider call
+   387→  const agentResult = await callLLMWithSpecificProvider(
+   388→    prompt, provider, model, systemPrompt,
+   389→    { ...options, tools: options?.tools }  // ← THÊM
+   390→  )
+   391→  if (agentResult?.content) return agentResult
+   392→
+   393→  return callLLM(prompt, systemPrompt, 'agent-fallback', options)
+   394→}
+   395→```
+   396→
+   397→**Sửa `callLLMWithSpecificProvider()` (line 2238):**
+   398→```typescript
+   399→async function callLLMWithSpecificProvider(
+   400→  prompt: string,
+   401→  provider: string,
+   402→  model: string,
+   403→  systemPrompt?: string,
+   404→  options?: LLMCallOptions & {
+   405→    tools?: Array<{ type: string; function: { name: string; description: string; parameters: Record<string, unknown> } }>
+   406→  },
+   407→): Promise<LLMResult | null> {
+   408→  // ...existing code...
+   409→  
+   410→  const result = await tryProviderWithSlotKey(
+   411→    -1, config.pool, config.endpoint, [model],
+   412→    prompt, systemPrompt, config.timeout, config.extraHeaders,
+   413→    config.rateLimitCooldown,
+   414→    options?.temperature ?? 0.1,
+   415→    options?.maxTokens ?? 4096,
+   416→    options?.agentId, options?.agentName,
+   417→    options?.tools,  // ← THÊM
+   418→  )
+   419→  return result
+   420→}
+   421→```
+   422→
+   423→**Sửa response parsing trong tryProviderWithSlotKey:**
+   424→```typescript
+   425→// Hiện tại (line 1760):
+   426→const data = await response.json() as {
+   427→  choices: Array<{ message: { content: string } }>
+   428→  usage?: { ... }
+   429→}
+   430→
+   431→// Sửa thành:
+   432→const data = await response.json() as {
+   433→  choices: Array<{
+   434→    message: {
+   435→      content: string
+   436→      tool_calls?: Array<{
+   437→        id: string
+   438→        type: 'function'
+   439→        function: { name: string; arguments: string }
+   440→      }>
+   441→    }
+   442→    finish_reason?: string
+   443→  }>
+   444→  usage?: { ... }
+   445→}
+   446→
+   447→// Thêm tool_calls vào LLMResult:
+   448→const toolCalls = data.choices?.[0]?.message?.tool_calls
+   449→return {
+   450→  content: data.choices?.[0]?.message?.content || '',
+   451→  // ...existing fields...
+   452→  toolCalls,  // ← THÊM structured tool_calls
+   453→  finishReason: data.choices?.[0]?.finish_reason,
+   454→}
+   455→```
+   456→
+   457→**Cũng cần sửa LLMResult type:**
+   458→```typescript
+   459→// Thêm vào interface LLMResult:
+   460→export interface LLMResult {
+   461→  content: string
+   462→  error?: string
+   463→  // ...existing fields...
+   464→  toolCalls?: Array<{    // ← THÊM
+   465→    id: string
+   466→    type: 'function'
+   467→    function: { name: string; arguments: string }
+   468→  }>
+   469→  finishReason?: string  // ← THÊM
+   470→}
+   471→```
+   472→
+   473→---
+   474→
+   475→### P0.4: Sửa ReAct Loop — Dùng structured tool_calls
+   476→
+   477→**File cần sửa:** `src/app/api/openclaw/chat/route.ts` (runAgentReActLoop, line 64-189)
+   478→
+   479→**Hiện tại:**
+   480→```typescript
+   481→// Gọi LLM KHÔNG có tools
+   482→const result = await callLLMForAgent(formattedPrompt, { provider, model }, systemPrompt, options)
+   483→
+   484→// Parse tool calls bằng regex
+   485→const toolCalls = parseToolCallsFromOutput(result.content)
+   486→```
+   487→
+   488→**Sửa thành:**
+   489→```typescript
+   490→// 1. Lấy tool definitions cho agent
+   491→const toolDefs = agentTools.length > 0 
+   492→  ? getToolDefinitions(agentTools)  // existing function
+   493→  : []
+   494→
+   495→// 2. Gọi LLM CÓ tools parameter
+   496→const result = await callLLMForAgent(
+   497→  formattedPrompt, 
+   498→  { provider: agentProvider, model: agentModel },
+   499→  systemPrompt,
+   500→  {
+   501→    agentId, agentName,
+   502→    temperature: agentTemperature,
+   503→    maxTokens: agentMaxTokens,
+   504→    tools: toolDefs,  // ← GỬI tools cho LLM
+   505→  }
+   506→)
+   507→
+   508→// 3. Parse structured tool_calls (ưu tiên), fallback regex
+   509→let toolCalls: Array<{ id: string; name: string; args: Record<string, unknown> }> = []
+   510→
+   511→if (result.toolCalls && result.toolCalls.length > 0) {
+   512→  // ✅ Structured tool_calls từ LLM (preferred)
+   513→  toolCalls = result.toolCalls.map(tc => ({
+   514→    id: tc.id,
+   515→    name: tc.function.name,
+   516→    args: JSON.parse(tc.function.arguments),
+   517→  }))
+   518→} else {
+   519→  // ❌ Fallback regex (cho models không hỗ trợ tool calling)
+   520→  toolCalls = parseToolCallsFromOutput(result.content)
+   521→}
+   522→```
+   523→
+   524→**Thêm OpenAI-compliant tool result format:**
+   525→```typescript
+   526→// Khi thêm tool result vào messages:
+   527→for (const tc of toolCalls) {
+   528→  const toolResult = await executeTool(tc.name, tc.args)
+   529→  
+   530→  messages.push({
+   531→    role: 'tool',
+   532→    content: JSON.stringify({ tool: tc.name, success: toolResult.success, result: toolResult.result }),
+   533→    tool_call_id: tc.id,  // ← THÊM tool_call_id (cần cho OpenAI format)
+   534→  })
+   535→}
+   536→```
+   537→
+   538→---
+   539→
+   540→### P0.5: Mở Rộng executeTool() — Thêm Gateway Tools
+   541→
+   542→**File cần sửa:** `src/lib/code-team/tool-executor.ts`
+   543→
+   544→**Hiện tại:** switch/case chỉ handle 7 tools
+   545→
+   546→**Sửa thành: Thêm Gateway proxy tools**
+   547→
+   548→```typescript
+   549→// Thêm vào ALL_TOOL_DEFINITIONS:
+   550→const GATEWAY_TOOL_DEFINITIONS: Record<string, ToolDefinition> = {
+   551→  web_search: {
+   552→    type: 'function',
+   553→    function: {
+   554→      name: 'web_search',
+   555→      description: 'Tìm kiếm trên web. Trả về kết quả với nội dung tóm tắt.',
+   556→      parameters: {
+   557→        type: 'object',
+   558→        properties: {
+   559→          query: { type: 'string', description: 'Câu hỏi tìm kiếm' },
+   560→        },
+   561→        required: ['query'],
+   562→      },
+   563→    },
+   564→  },
+   565→  web_fetch: {
+   566→    type: 'function',
+   567→    function: {
+   568→      name: 'web_fetch',
+   569→      description: 'Fetch nội dung trang web từ URL. Trả về text content.',
+   570→      parameters: {
+   571→        type: 'object',
+   572→        properties: {
+   573→          url: { type: 'string', description: 'URL trang web cần đọc' },
+   574→        },
+   575→        required: ['url'],
+   576→      },
+   577→    },
+   578→  },
+   579→  // ... thêm các tools khác từ Gateway catalog
+   580→}
+   581→
+   582→// Thêm Gateway tool executor:
+   583→async function executeGatewayTool(name: string, args: Record<string, unknown>): Promise<unknown> {
+   584→  const res = await fetch('http://127.0.0.1:18789/tools/invoke', {
+   585→    method: 'POST',
+   586→    headers: { 'Content-Type': 'application/json' },
+   587→    body: JSON.stringify({ name, args }),
+   588→    signal: AbortSignal.timeout(30000),
+   589→  })
+   590→  
+   591→  if (!res.ok) {
+   592→    throw new Error(`Gateway tool error: ${res.status}`)
+   593→  }
+   594→  
+   595→  const data = await res.json()
+   596→  if (!data.ok) {
+   597→    throw new Error(`Tool error: ${data.error?.message || 'Unknown'}`)
+   598→  }
+   599→  
+   600→  return data.result
+   601→}
+   602→
+   603→// Sửa executeTool():
+   604→export async function executeTool(
+   605→  toolName: string,
+   606→  args: Record<string, unknown>
+   607→): Promise<ToolExecutionResult> {
+   608→  const startTime = Date.now()
+   609→
+   610→  try {
+   611→    let result: unknown
+   612→
+   613→    // 1. Thử local tools trước (7 tools hiện có)
+   614→    if (['opencode', 'knowledge_search', 'knowledge_graph', 
+   615→         'knowledge_write', 'tavily', 'serper', 'jina'].includes(toolName)) {
+   616→      // ... existing switch/case ...
+   617→    }
+   618→    
+   619→    // 2. Thử Gateway tools (37 tools, chỉ HTTP-allowed ones)
+   620→    else {
+   621→      result = await executeGatewayTool(toolName, args)
+   622→    }
+   623→
+   624→    return { success: true, result, duration: Date.now() - startTime }
+   625→  } catch (err) {
+   626→    // ...existing error handling...
+   627→  }
+   628→}
+   629→```
+   630→
+   631→**Lưu ý:** Gateway `/tools/invoke` chỉ cho phép các tools KHÔNG trong deny list:
+   632→- ✅ Available: `web_search`, `web_fetch`, `x_search`, `memory_search`, `memory_get`, `sessions_list`, `session_status`, `agents_list`, `message`, `image`, `tts`
+   633→- ❌ Denied: `exec`, `read`, `write`, `edit`, `apply_patch`, `sessions_spawn`, `sessions_send`, `cron`, `gateway`, `nodes`
+   634→
+   635→---
+   636→
+   637→### P0.6: Frontend — Hiển thị Gateway Tool Status
+   638→
+   639→**File cần sửa:** `src/app/page.tsx` (SmolabModule)
+   640→
+   641→**Chi tiết:**
+   642→- Thêm indicator "Gateway: Online/Offline" trong Smolab header
+   643→- Hiển thị số tools khả dụng (37 khi online, 7 khi offline)
+   644→- Khi tool được gọi qua Gateway, hiển thị "🔧 Tool: web_search" trong chat message
+   645→
+   646→```typescript
+   647→// Thêm state:
+   648→const [gatewayStatus, setGatewayStatus] = useState<{ online: boolean; tools: number }>({ online: false, tools: 7 })
+   649→
+   650→// Check gateway status on mount:
+   651→useEffect(() => {
+   652→  fetch('/api/openclaw/status').then(r => r.json()).then(data => {
+   653→    setGatewayStatus({ online: data.gatewayOnline, tools: data.toolsAvailable })
+   654→  }).catch(() => {})
+   655→}, [])
+   656→```
+   657→
+   658→**Thêm API endpoint:** `src/app/api/openclaw/status/route.ts`
+   659→```typescript
+   660→export async function GET() {
+   661→  const { online } = await isGatewayOnline()
+   662→  return NextResponse.json({
+   663→    gatewayOnline: online,
+   664→    toolsAvailable: online ? 37 : 7,
+   665→    gatewayUrl: process.env.OPENCLAW_GATEWAY_URL || 'http://127.0.0.1:18789',
+   666→  })
+   667→}
+   668→```
+   669→
+   670→---
+   671→
+   672→### P0 Checklist
+   673→
+   674→| # | Task | File | Mô Tả |
+   675→|---|------|------|-------|
+   676→| P0.1 | Cấu hình NVIDIA key cho Gateway | `mini-services/openclaw-gateway/index.ts` | Pass NVIDIA_API_KEY env cho child process |
+   677→| P0.2 | Gateway-First chat routing | `src/app/api/openclaw/chat/route.ts` | Route qua Gateway trước, fallback local |
+   678→| P0.3 | Thêm tools param cho callLLMForAgent | `src/lib/llm.ts` | Sửa 3 functions + LLMResult type |
+   679→| P0.4 | Structured tool_calls trong ReAct loop | `src/app/api/openclaw/chat/route.ts` | Ưu tiên structured, fallback regex |
+   680→| P0.5 | Mở rộng executeTool với Gateway proxy | `src/lib/code-team/tool-executor.ts` | Thêm Gateway tool executor |
+   681→| P0.6 | Frontend Gateway status indicator | `src/app/page.tsx` + API mới | Hiển thị online/offline + tool count |
+   682→
+   683→---
+   684→
+   685→## 4. P1: Skills → Tools Connection
+   686→
+   687→### Mục tiêu
+   688→ClawHub skills cài vào app tạo ra executable tools. Agent có thể gọi tools từ skills đã cài.
+   689→
+   690→### Thời gian dự kiến: 3-4 ngày
+   691→
+   692→### P1.1: Hiểu ClawHub Package Structure
+   693→
+   694→**Nghiên cứu trước khi code:**
+   695→- ClawHub API: `https://clawhub.ai/api/v1/packages/{id}` — trả về gì?
+   696→- Archive format: `.tar.gz`? `.zip`? Cấu trúc bên trong?
+   697→- Phân biệt: Skill (SKILL.md), Plugin (executable code), Tool (function schema + handler)
+   698→
+   699→**Khảo sát:**
+   700→```bash
+   701→# Test ClawHub API
+   702→curl https://clawhub.ai/api/v1/search?q=web
+   703→curl https://clawhub.ai/api/v1/packages/{package-id}
+   704→```
+   705→
+   706→### P1.2: Implement Archive Download
+   707→
+   708→**File cần sửa:** `src/app/api/openclaw/skills/route.ts`
+   709→
+   710→**Hiện tại (Install flow):**
+   711→```typescript
+   712→// Chỉ fetch SKILL.md từ ClawHub → lưu vào AgentSkill table
+   713→const skillRes = await fetch(`${CLAWHUB_API}/packages/${packageId}`)
+   714→const skillData = await skillRes.json()
+   715→// Lưu skillData.readme (SKILL.md content) vào DB
+   716→```
+   717→
+   718→**Sửa thành:**
+   719→```typescript
+   720→// 1. Fetch full package info
+   721→const packageRes = await fetch(`${CLAWHUB_API}/packages/${packageId}`)
+   722→const packageData = await packageRes.json()
+   723→
+   724→// 2. Download archive (nếu có)
+   725→if (packageData.archiveUrl) {
+   726→  const archiveRes = await fetch(packageData.archiveUrl)
+   727→  const archiveBuffer = await archiveRes.arrayBuffer()
+   728→  
+   729→  // 3. Extract archive
+   730→  const extracted = await extractArchive(archiveBuffer)
+   731→  
+   732→  // 4. Tìm Plugin/Tool definitions
+   733→  const pluginFiles = extracted.filter(f => f.name.endsWith('.plugin.js') || f.name.endsWith('.plugin.ts'))
+   734→  const toolFiles = extracted.filter(f => f.name.endsWith('.tool.json'))
+   735→  const skillMd = extracted.find(f => f.name === 'SKILL.md')
+   736→  
+   737→  // 5. Lưu vào filesystem
+   738→  const skillDir = path.join(process.cwd(), 'skills', packageId)
+   739→  await fs.mkdir(skillDir, { recursive: true })
+   740→  for (const file of extracted) {
+   741→    await fs.writeFile(path.join(skillDir, file.name), file.content)
+   742→  }
+   743→  
+   744→  // 6. Register tools vào Gateway (nếu Gateway online)
+   745→  for (const toolFile of toolFiles) {
+   746→    const toolSchema = JSON.parse(toolFile.content)
+   747→    await registerToolWithGateway(toolSchema)
+   748→  }
+   749→}
+   750→
+   751→// 7. Lưu metadata vào DB
+   752→await db.agentSkill.upsert({
+   753→  where: { id: packageId },
+   754→  create: {
+   755→    id: packageId,
+   756→    name: packageData.name,
+   757→    description: packageData.description,
+   758→    content: skillMd?.content || packageData.readme || '',
+   759→    enabled: true,
+   760→    source: 'clawhub',
+   761→    archiveUrl: packageData.archiveUrl,
+   762→    toolCount: toolFiles?.length || 0,
+   763→    hasPlugin: pluginFiles?.length > 0,
+   764→  },
+   765→  update: {
+   766→    archiveUrl: packageData.archiveUrl,
+   767→    toolCount: toolFiles?.length || 0,
+   768→    hasPlugin: pluginFiles?.length > 0,
+   769→  },
+   770→})
+   771→```
+   772→
+   773→### P1.3: Tool Schema Validation
+   774→
+   775→**File mới:** `src/lib/skill-tool-schema.ts`
+   776→
+   777→```typescript
+   778→/**
+   779→ * Validate tool schema theo OpenAI function calling format
+   780→ */
+   781→export interface SkillToolSchema {
+   782→  name: string
+   783→  description: string
+   784→  parameters: {
+   785→    type: 'object'
+   786→    properties: Record<string, {
+   787→      type: string
+   788→      description?: string
+   789→      enum?: string[]
+   790→      default?: unknown
+   791→    }>
+   792→    required?: string[]
+   793→  }
+   794→}
+   795→
+   796→export function validateToolSchema(schema: unknown): { valid: boolean; errors: string[] } {
+   797→  const errors: string[] = []
+   798→  
+   799→  if (!schema || typeof schema !== 'object') {
+   800→    return { valid: false, errors: ['Schema must be an object'] }
+   801→  }
+   802→  
+   803→  const s = schema as Record<string, unknown>
+   804→  
+   805→  if (!s.name || typeof s.name !== 'string') errors.push('Missing "name" field')
+   806→  if (!s.description || typeof s.description !== 'string') errors.push('Missing "description" field')
+   807→  if (!s.parameters || typeof s.parameters !== 'object') errors.push('Missing "parameters" field')
+   808→  
+   809→  return { valid: errors.length === 0, errors }
+   810→}
+   811→```
+   812→
+   813→### P1.4: Register Tools với Gateway
+   814→
+   815→**File mới:** `src/lib/gateway-tool-registry.ts`
+   816→
+   817→```typescript
+   818→/**
+   819→ * Register custom tools with OpenClaw Gateway
+   820→ * Uses Gateway's plugin system to add tools dynamically
+   821→ */
+   822→
+   823→const GATEWAY_URL = process.env.OPENCLAW_GATEWAY_URL || 'http://127.0.0.1:18789'
+   824→
+   825→export async function registerToolWithGateway(tool: {
+   826→  name: string
+   827→  description: string
+   828→  parameters: Record<string, unknown>
+   829→  handler?: string  // URL của tool handler endpoint
+   830→}): Promise<boolean> {
+   831→  try {
+   832→    // OpenClaw Gateway hỗ trợ dynamic tool registration qua plugin API
+   833→    const res = await fetch(`${GATEWAY_URL}/v1/tools/register`, {
+   834→      method: 'POST',
+   835→      headers: { 'Content-Type': 'application/json' },
+   836→      body: JSON.stringify({
+   837→        type: 'function',
+   838→        function: {
+   839→          name: tool.name,
+   840→          description: tool.description,
+   841→          parameters: tool.parameters,
+   842→        },
+   843→        // Handler URL — Gateway sẽ gọi endpoint này khi tool được invoke
+   844→        ...(tool.handler ? { handler: { type: 'http', url: tool.handler } } : {}),
+   845→      }),
+   846→    })
+   847→    return res.ok
+   848→  } catch {
+   849→    return false
+   850→  }
+   851→}
+   852→
+   853→export async function unregisterToolFromGateway(toolName: string): Promise<boolean> {
+   854→  try {
+   855→    const res = await fetch(`${GATEWAY_URL}/v1/tools/unregister`, {
+   856→      method: 'POST',
+   857→      headers: { 'Content-Type': 'application/json' },
+   858→      body: JSON.stringify({ name: toolName }),
+   859→    })
+   860→    return res.ok
+   861→  } catch {
+   862→    return false
+   863→  }
+   864→}
+   865→```
+   866→
+   867→### P1.5: Skill Install UI — Hiển thị Tool Count
+   868→
+   869→**File cần sửa:** `src/app/page.tsx` (SkillsTabContent)
+   870→
+   871→**Chi tiết:**
+   872→- Khi search ClawHub, hiển thị số tools trong mỗi package
+   873→- Nút "Install" → download archive + register tools
+   874→- Tab "Installed Skills" → hiển thị tools đã register
+   875→- Nút "Uninstall" → unregister tools + xóa files
+   876→
+   877→### P1 Checklist
+   878→
+   879→| # | Task | File | Mô Tả |
+   880→|---|------|------|-------|
+   881→| P1.1 | Nghiên cứu ClawHub API | N/A | Test archive download, package structure |
+   882→| P1.2 | Archive download + extract | `skills/route.ts` | Download, extract, save to filesystem |
+   883→| P1.3 | Tool schema validation | `skill-tool-schema.ts` (mới) | Validate tool definitions |
+   884→| P1.4 | Gateway tool registry | `gateway-tool-registry.ts` (mới) | Register/unregister tools |
+   885→| P1.5 | UI: Tool count + install | `page.tsx` | Hiển thị tools trong skills |
+   886→
+   887→---
+   888→
+   889→## 5. P2: Full Archive Download & Execution
+   890→
+   891→### Mục tiêu
+   892→ClawHub packages có đầy đủ Skill + Plugin + Tool. Tools chạy trong sandbox an toàn.
+   893→
+   894→### Thời gian dự kiến: 3-5 ngày
+   895→
+   896→### P2.1: Plugin Execution Engine
+   897→
+   898→**File mới:** `src/lib/plugin-runner.ts`
+   899→
+   900→**Chi tiết:**
+   901→- Load plugin JS files từ `skills/{packageId}/` directory
+   902→- Execute trong sandboxed context (VM2 hoặc similar)
+   903→- Expose safe APIs cho plugin (fetch, db read, etc.)
+   904→- Catch errors, timeout, resource limits
+   905→
+   906→```typescript
+   907→interface PluginExecutionContext {
+   908→  toolName: string
+   909→  args: Record<string, unknown>
+   910→  allowedApis: string[]  // ['fetch', 'db.read', 'memory.search']
+   911→  timeout: number        // ms
+   912→  maxMemory: number      // bytes
+   913→}
+   914→
+   915→async function executePlugin(
+   916→  pluginPath: string,
+   917→  context: PluginExecutionContext
+   918→): Promise<unknown> {
+   919→  // 1. Load plugin module
+   920→  // 2. Call handler function with args
+   921→  // 3. Apply timeout
+   922→  // 4. Return result
+   923→}
+   924→```
+   925→
+   926→### P2.2: Tool Permission System
+   927→
+   928→**File cần sửa:** `prisma/schema.prisma`
+   929→
+   930→```prisma
+   931→model ToolPermission {
+   932→  id          String   @id @default(cuid())
+   933→  agentProfileId String?  /// FK → AgentProfile (null = global)
+   934→  toolName    String   /// Tool name (e.g., "web_search", "exec")
+   935→  source      String   @default("builtin") /// "builtin" | "gateway" | "skill" | "custom"
+   936→  allowed     Boolean  @default(true)
+   937→  requiresApproval Boolean @default(false) /// Cần user approval trước khi chạy
+   938→  maxCallsPerHour  Int?     /// Rate limit
+   939→  createdAt   DateTime @default(now())
+   940→
+   941→  agentProfile AgentProfile? @relation(fields: [agentProfileId], references: [id], onDelete: Cascade)
+   942→
+   943→  @@unique([agentProfileId, toolName])
+   944→  @@index([toolName])
+   945→}
+   946→```
+   947→
+   948→### P2.3: Security & Sandboxing
+   949→
+   950→**Chi tiết:**
+   951→- File operations: Chỉ cho phép trong project directory
+   952→- Exec: Whitelist commands, block dangerous ones (`rm -rf /`, `sudo`, etc.)
+   953→- Network: Chỉ cho phép HTTP/HTTPS, block internal IPs
+   954→- Memory/CPU: Limits per tool execution
+   955→- Timeout: Default 30s, configurable per tool
+   956→
+   957→### P2.4: Tool Marketplace UI Improvements
+   958→
+   959→**File cần sửa:** `src/app/page.tsx`
+   960→
+   961→**Chi tiết:**
+   962→- Rating/reviews cho skills
+   963→- "Popular" và "Featured" tabs
+   964→- Auto-update check cho installed skills
+   965→- Dependency management (skill A requires skill B)
+   966→
+   967→### P2 Checklist
+   968→
+   969→| # | Task | File | Mô Tả |
+   970→|---|------|------|-------|
+   971→| P2.1 | Plugin execution engine | `plugin-runner.ts` (mới) | Sandbox, timeout, resource limits |
+   972→| P2.2 | Tool permission system | `schema.prisma` + API | Per-agent tool permissions |
+   973→| P2.3 | Security & sandboxing | Multiple | File/exec/network limits |
+   974→| P2.4 | Marketplace UI | `page.tsx` | Rating, auto-update, dependencies |
+   975→
+   976→---
+   977→
+   978→## 6. P3: Extensible Tool System
+   979→
+   980→### Mục tiêu
+   981→Hệ thống tools mở rộng, dễ thêm/bớt, per-agent permissions, analytics.
+   982→
+   983→### Thời gian dự kiến: 5-7 ngày
+   984→
+   985→### P3.1: Dynamic Tool Registration/Deregistration
+   986→
+   987→**Chi tiết:**
+   988→- API endpoint: `POST /api/tools/register` — Đăng ký tool mới
+   989→- API endpoint: `DELETE /api/tools/{name}` — Gỡ tool
+   990→- Tool hot-reload — Không cần restart server
+   991→- Tool versioning — Nhiều version cùng tồn tại
+   992→
+   993→### P3.2: Tool Permissions per Agent
+   994→
+   995→**Chi tiết:**
+   996→- UI: Mỗi Agent có trang "Tools" riêng
+   997→- Toggle on/off cho từng tool
+   998→- Quota system: max calls per hour/day
+   999→- Approval queue: Tools cần approval chạy qua UI trước
+  1000→
+  1001→### P3.3: Tool Usage Analytics
+  1002→
+  1003→**Chi tiết:**
+  1004→- Log mọi tool call: timestamp, agent, tool, args, result, duration
+  1005→- Dashboard: Top tools, success rate, avg duration
+  1006→- Alert: Tool failure rate > threshold → notification
+  1007→- Export: CSV/JSON data cho analysis
+  1008→
+  1009→### P3.4: Custom Tool Creation UI
+  1010→
+  1011→**Chi tiết:**
+  1012→- Visual tool builder: Name, description, parameters (type, required, enum)
+  1013→- Code editor cho tool handler (JavaScript)
+  1014→- Test panel: Chạy thử tool với args
+  1015→- Publish: Đăng lên ClawHub hoặc giữ private
+  1016→
+  1017→### P3 Checklist
+  1018→
+  1019→| # | Task | File | Mô Tả |
+  1020→|---|------|------|-------|
+  1021→| P3.1 | Dynamic registration | `api/tools/` (mới) | Hot-reload, versioning |
+  1022→| P3.2 | Per-agent permissions | UI + API | Toggle, quota, approval |
+  1023→| P3.3 | Usage analytics | Dashboard | Logs, metrics, alerts |
+  1024→| P3.4 | Custom tool builder | UI (mới) | Visual builder, test, publish |
+  1025→
+  1026→---
+  1027→
+  1028→## 7. Dependency Map
+  1029→
+  1030→```
+  1031→P0.1 (NVIDIA key cho Gateway)
+  1032→  └──→ P0.2 (Gateway-First routing) ← DEPENDS ON P0.1
+  1033→  
+  1034→P0.3 (tools param cho callLLMForAgent) ← INDEPENDENT
+  1035→P0.4 (Structured tool_calls) ← DEPENDS ON P0.3
+  1036→P0.5 (Gateway tool proxy) ← DEPENDS ON P0.2
+  1037→P0.6 (Frontend status) ← DEPENDS ON P0.2
+  1038→
+  1039→P1.1 (ClawHub research) ← INDEPENDENT (có thể song song P0)
+  1040→P1.2 (Archive download) ← DEPENDS ON P1.1
+  1041→P1.3 (Schema validation) ← INDEPENDENT
+  1042→P1.4 (Gateway registry) ← DEPENDS ON P1.2 + P1.3
+  1043→P1.5 (UI) ← DEPENDS ON P1.4
+  1044→
+  1045→P2.1 (Plugin runner) ← DEPENDS ON P1.4
+  1046→P2.2 (Permissions) ← DEPENDS ON P0.5
+  1047→P2.3 (Security) ← DEPENDS ON P2.1
+  1048→P2.4 (Marketplace UI) ← DEPENDS ON P1.5
+  1049→
+  1050→P3.1 (Dynamic registration) ← DEPENDS ON P2.1
+  1051→P3.2 (Per-agent permissions) ← DEPENDS ON P2.2
+  1052→P3.3 (Analytics) ← DEPENDS ON P2.1
+  1053→P3.4 (Custom tool builder) ← DEPENDS ON P3.1
+  1054→```
+  1055→
+  1056→### Song song khả thi:
+  1057→- **P0.1 + P0.3** có thể làm song song
+  1058→- **P1.1** (research) có thể làm song song với P0
+  1059→- **P1.3** (schema validation) có thể làm song song với P1.2
+  1060→
+  1061→---
+  1062→
+  1063→## 8. Risk & Mitigation
+  1064→
+  1065→| Risk | Impact | Probability | Mitigation |
+  1066→|------|--------|-------------|------------|
+  1067→| Gateway NVIDIA key không work | P0 blocked | Medium | Test trước bằng curl; fallback local ReAct |
+  1068→| Gateway crash khi load cao | Tools mất | Medium | Local fallback đã implement trong P0.2 |
+  1069→| x-openclaw-model header không route đúng model | Agent dùng sai model | Low | Test từng model trước; log model trong response |
+  1070→| ClawHub archive format không như expected | P1 blocked | Medium | Research kỹ (P1.1) trước khi code; fallback SKILL.md-only |
+  1071→| Plugin sandbox escape | Security breach | Low | Dùng VM2; whitelist APIs; limit resources |
+  1072→| Tool calling chậm (nhiều iterations) | UX kém | Medium | Timeout per iteration; streaming UI; max 5 iterations |
+  1073→| NVIDIA rate limit (4 keys) | Agent không gọi được | Medium | Round-robin keys; exponential backoff; queue system |
+  1074→
+  1075→---
+  1076→
+  1077→## Phụ Lục: Files Impact Summary
+  1078→
+  1079→### P0 — Files cần sửa/tạo:
+  1080→
+  1081→| File | Action | Mô Tả |
+  1082→|------|--------|-------|
+  1083→| `mini-services/openclaw-gateway/index.ts` | SỬA | Thêm NVIDIA_API_KEY env cho child process |
+  1084→| `src/app/api/openclaw/chat/route.ts` | SỬA | Gateway-First routing + structured tool_calls |
+  1085→| `src/lib/llm.ts` | SỬA | Thêm tools param (3 functions + LLMResult type) |
+  1086→| `src/lib/code-team/tool-executor.ts` | SỬA | Thêm Gateway proxy tools |
+  1087→| `src/app/page.tsx` | SỬA | Gateway status indicator |
+  1088→| `src/app/api/openclaw/status/route.ts` | TẠO MỚI | Gateway status API |
+  1089→
+  1090→### P1 — Files cần sửa/tạo:
+  1091→
+  1092→| File | Action | Mô Tả |
+  1093→|------|--------|-------|
+  1094→| `src/app/api/openclaw/skills/route.ts` | SỬA | Archive download + extract |
+  1095→| `src/lib/skill-tool-schema.ts` | TẠO MỚI | Tool schema validation |
+  1096→| `src/lib/gateway-tool-registry.ts` | TẠO MỚI | Gateway tool registration |
+  1097→| `src/app/page.tsx` | SỬA | Skills UI improvements |
+  1098→
+  1099→### P2 — Files cần sửa/tạo:
+  1100→
+  1101→| File | Action | Mô Tả |
+  1102→|------|--------|-------|
+  1103→| `src/lib/plugin-runner.ts` | TẠO MỚI | Plugin sandbox execution |
+  1104→| `prisma/schema.prisma` | SỬA | ToolPermission model |
+  1105→| Multiple files | SỬA | Security middleware |
+  1106→
+  1107→### P3 — Files cần sửa/tạo:
+  1108→
+  1109→| File | Action | Mô Tả |
+  1110→|------|--------|-------|
+  1111→| `src/app/api/tools/` | TẠO MỚI | Tool CRUD API |
+  1112→| `src/app/page.tsx` | SỬA | Tool management UI |
+  1113→| Analytics files | TẠO MỚI | Usage tracking + dashboard |
+  1114→

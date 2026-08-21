@@ -1,0 +1,25 @@
+# Qdrant Configuration for Theopusflashlite GraphRAG
+# Port: 6333 (REST API + gRPC)
+
+log_level: INFO
+
+storage:
+  storage_path: ./qdrant-storage
+  snapshots_path: ./qdrant-snapshots
+  
+  # Performance settings
+  wal:
+    wal_capacity_mb: 32
+    wal_segments_ahead: 0
+  
+  performance:
+    max_search_threads: 4
+    max_optimization_threads: 2
+
+service:
+  # REST API port
+  grpc_port: 6334
+  http_port: 6333
+  
+  # Enable CORS for development
+  enable_cors: true

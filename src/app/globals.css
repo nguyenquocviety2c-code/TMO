@@ -1,0 +1,593 @@
+@import "tailwindcss";
+@import "tw-animate-css";
+
+@custom-variant dark (&:is(.dark *));
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --font-sans: var(--font-geist-sans);
+  --font-mono: var(--font-geist-mono);
+  --color-sidebar-ring: var(--sidebar-ring);
+  --color-sidebar-border: var(--sidebar-border);
+  --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
+  --color-sidebar-accent: var(--sidebar-accent);
+  --color-sidebar-primary-foreground: var(--sidebar-primary-foreground);
+  --color-sidebar-primary: var(--sidebar-primary);
+  --color-sidebar-foreground: var(--sidebar-foreground);
+  --color-sidebar: var(--sidebar);
+  --color-chart-5: var(--chart-5);
+  --color-chart-4: var(--chart-4);
+  --color-chart-3: var(--chart-3);
+  --color-chart-2: var(--chart-2);
+  --color-chart-1: var(--chart-1);
+  --color-ring: var(--ring);
+  --color-input: var(--input);
+  --color-border: var(--border);
+  --color-destructive: var(--destructive);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-accent: var(--accent);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-muted: var(--muted);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-secondary: var(--secondary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-primary: var(--primary);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-popover: var(--popover);
+  --color-card-foreground: var(--card-foreground);
+  --color-card: var(--card);
+  --radius-sm: calc(var(--radius) - 4px);
+  --radius-md: calc(var(--radius) - 2px);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) + 4px);
+}
+
+:root {
+  --radius: 0.625rem;
+  --background: oklch(1 0 0);
+  --foreground: oklch(0.145 0 0);
+  --card: oklch(1 0 0);
+  --card-foreground: oklch(0.145 0 0);
+  --popover: oklch(1 0 0);
+  --popover-foreground: oklch(0.145 0 0);
+  --primary: oklch(0.205 0 0);
+  --primary-foreground: oklch(0.985 0 0);
+  --secondary: oklch(0.97 0 0);
+  --secondary-foreground: oklch(0.205 0 0);
+  --muted: oklch(0.97 0 0);
+  --muted-foreground: oklch(0.556 0 0);
+  --accent: oklch(0.97 0 0);
+  --accent-foreground: oklch(0.205 0 0);
+  --destructive: oklch(0.577 0.245 27.325);
+  --border: oklch(0.922 0 0);
+  --input: oklch(0.922 0 0);
+  --ring: oklch(0.708 0 0);
+  --chart-1: oklch(0.646 0.222 41.116);
+  --chart-2: oklch(0.6 0.118 184.704);
+  --chart-3: oklch(0.398 0.07 227.392);
+  --chart-4: oklch(0.828 0.189 84.429);
+  --chart-5: oklch(0.769 0.188 70.08);
+  --sidebar: oklch(0.985 0 0);
+  --sidebar-foreground: oklch(0.145 0 0);
+  --sidebar-primary: oklch(0.205 0 0);
+  --sidebar-primary-foreground: oklch(0.985 0 0);
+  --sidebar-accent: oklch(0.97 0 0);
+  --sidebar-accent-foreground: oklch(0.205 0 0);
+  --sidebar-border: oklch(0.922 0 0);
+  --sidebar-ring: oklch(0.708 0 0);
+}
+
+.dark {
+  --background: oklch(0.145 0 0);
+  --foreground: oklch(0.985 0 0);
+  --card: oklch(0.205 0 0);
+  --card-foreground: oklch(0.985 0 0);
+  --popover: oklch(0.205 0 0);
+  --popover-foreground: oklch(0.985 0 0);
+  --primary: oklch(0.922 0 0);
+  --primary-foreground: oklch(0.205 0 0);
+  --secondary: oklch(0.269 0 0);
+  --secondary-foreground: oklch(0.985 0 0);
+  --muted: oklch(0.269 0 0);
+  --muted-foreground: oklch(0.708 0 0);
+  --accent: oklch(0.269 0 0);
+  --accent-foreground: oklch(0.985 0 0);
+  --destructive: oklch(0.704 0.191 22.216);
+  --border: oklch(1 0 0 / 10%);
+  --input: oklch(1 0 0 / 15%);
+  --ring: oklch(0.556 0 0);
+  --chart-1: oklch(0.488 0.243 264.376);
+  --chart-2: oklch(0.696 0.17 162.48);
+  --chart-3: oklch(0.769 0.188 70.08);
+  --chart-4: oklch(0.627 0.265 303.9);
+  --chart-5: oklch(0.645 0.246 16.439);
+  --sidebar: oklch(0.205 0 0);
+  --sidebar-foreground: oklch(0.985 0 0);
+  --sidebar-primary: oklch(0.488 0.243 264.376);
+  --sidebar-primary-foreground: oklch(0.985 0 0);
+  --sidebar-accent: oklch(0.269 0 0);
+  --sidebar-accent-foreground: oklch(0.985 0 0);
+  --sidebar-border: oklch(1 0 0 / 10%);
+  --sidebar-ring: oklch(0.556 0 0);
+}
+
+@layer base {
+  * {
+    @apply border-border outline-ring/50;
+  }
+  html, body {
+    @apply bg-background text-foreground;
+    overflow-x: hidden !important;
+    max-width: 100vw !important;
+  }
+}
+
+
+
+/* ==================== FUTURISTIC ANGULAR DESIGN SYSTEM ==================== */
+
+/* --- Kill ALL rounded corners globally — sharp angular geometry --- */
+*, *::before, *::after {
+  border-radius: 0 !important;
+}
+
+/* --- Kill ALL scrollbars completely (horizontal + vertical) --- */
+*, *::before, *::after {
+  scrollbar-width: none !important;  /* Firefox */
+}
+*::-webkit-scrollbar {
+  width: 0 !important;
+  height: 0 !important;
+  display: none !important;          /* Chrome, Safari, Edge */
+}
+
+/* --- Dialog scrollbar override: thin visible scrollbar for scrollable dialogs --- */
+.dialog-scrollbar {
+  scrollbar-width: thin !important;            /* Firefox */
+  scrollbar-color: rgba(217, 70, 239, 0.35) transparent !important;  /* Firefox: thumb + track */
+}
+.dialog-scrollbar::-webkit-scrollbar {
+  width: 6px !important;
+  display: block !important;
+}
+.dialog-scrollbar::-webkit-scrollbar-track {
+  background: transparent;
+}
+.dialog-scrollbar::-webkit-scrollbar-thumb {
+  background: rgba(217, 70, 239, 0.35);
+  border-radius: 3px;
+}
+.dialog-scrollbar::-webkit-scrollbar-thumb:hover {
+  background: rgba(217, 70, 239, 0.55);
+}
+
+/* --- Chamfered corner clip-paths (ALL 4 corners chamfered — 8-point polygon) --- */
+.chamfer-sm {
+  clip-path: polygon(6px 0, calc(100% - 6px) 0, 100% 6px, 100% calc(100% - 6px), calc(100% - 6px) 100%, 6px 100%, 0 calc(100% - 6px), 0 6px);
+}
+.chamfer-md {
+  clip-path: polygon(10px 0, calc(100% - 10px) 0, 100% 10px, 100% calc(100% - 10px), calc(100% - 10px) 100%, 10px 100%, 0 calc(100% - 10px), 0 10px);
+}
+.chamfer-lg {
+  clip-path: polygon(14px 0, calc(100% - 14px) 0, 100% 14px, 100% calc(100% - 14px), calc(100% - 14px) 100%, 14px 100%, 0 calc(100% - 14px), 0 14px);
+}
+
+/* ==================== CHAMFERED PANEL SYSTEM ====================
+
+  clip-path cuts chamfered corners on ALL 4 corners.
+  Border is visible on straight edges, naturally gaps at chamfer corners.
+
+  Usage:
+    <div className="nc-wrap nc-cyan">
+      <div className="nc-panel nc-md nc-border-cyan">
+        content...
+      </div>
+    </div>
+*/
+
+/* --- Wrapper --- */
+.nc-wrap {
+  position: relative;
+  line-height: 0; /* prevent extra space below panel */
+}
+
+/* --- Color markers (no glow — just semantic class for future use) --- */
+.nc-cyan {}
+.nc-magenta {}
+.nc-amber {}
+.nc-lime {}
+.nc-orange {}
+.nc-violet {}
+.nc-emerald {}
+.nc-teal {}
+.nc-cyan-soft {}
+.nc-violet-soft {}
+
+/* --- Panel: the actual box with clip-path + neon border + dark background --- */
+.nc-panel {
+  position: relative;
+  background: rgba(2, 6, 23, 0.7);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  line-height: normal;
+  z-index: 1;
+}
+
+/* Chamfer sizes for .nc-panel */
+.nc-sm {
+  clip-path: polygon(6px 0, calc(100% - 6px) 0, 100% 6px, 100% calc(100% - 6px), calc(100% - 6px) 100%, 6px 100%, 0 calc(100% - 6px), 0 6px);
+}
+.nc-md {
+  clip-path: polygon(10px 0, calc(100% - 10px) 0, 100% 10px, 100% calc(100% - 10px), calc(100% - 10px) 100%, 10px 100%, 0 calc(100% - 10px), 0 10px);
+}
+.nc-lg {
+  clip-path: polygon(14px 0, calc(100% - 14px) 0, 100% 14px, 100% calc(100% - 14px), calc(100% - 14px) 100%, 14px 100%, 0 calc(100% - 14px), 0 14px);
+}
+
+/* Neon border line — visible on straight edges, naturally gaps at chamfer corners
+   where only the diffuse glow from filter: drop-shadow() is visible.
+   This creates the "neon light bar" effect on edges + "glow concentration" at corners. */
+.nc-panel.nc-border-cyan   { border: 1px solid rgba(6, 182, 212, 0.7); }
+.nc-panel.nc-border-magenta { border: 1px solid rgba(217, 70, 239, 0.7); }
+.nc-panel.nc-border-amber   { border: 1px solid rgba(251, 191, 36, 0.7); }
+.nc-panel.nc-border-lime    { border: 1px solid rgba(132, 204, 22, 0.7); }
+.nc-panel.nc-border-orange  { border: 1px solid rgba(249, 115, 22, 0.7); }
+.nc-panel.nc-border-violet  { border: 1px solid rgba(139, 92, 246, 0.7); }
+.nc-panel.nc-border-emerald { border: 1px solid rgba(16, 185, 129, 0.7); }
+.nc-panel.nc-border-teal    { border: 1px solid rgba(20, 184, 166, 0.7); }
+
+/* Subtle border variants */
+.nc-panel.nc-border-cyan-soft   { border: 1px solid rgba(6, 182, 212, 0.5); }
+.nc-panel.nc-border-violet-soft { border: 1px solid rgba(139, 92, 246, 0.5); }
+
+/* --- Border-only classes (no glow) --- */
+.neon-cyan {
+  border: 1px solid rgba(6, 182, 212, 0.65);
+}
+.neon-magenta {
+  border: 1px solid rgba(217, 70, 239, 0.65);
+}
+.neon-card {
+  border: 1px solid rgba(6, 182, 212, 0.45);
+}
+.neon-btn {
+  border: 1px solid rgba(6, 182, 212, 0.55);
+  transition: all 200ms ease;
+}
+.neon-btn:hover {
+  border-color: rgba(6, 182, 212, 0.8);
+}
+
+/* --- LENS FLARE & SPARKLE EFFECTS (disabled) --- */
+
+/* Lens flare — disabled */
+.lens-flare {}
+
+/* Sparkle particles — disabled */
+.sparkle-container {}
+
+/* Waveform shimmer — disabled */
+.waveform-shimmer {}
+
+/* --- PIPELINE CONNECTOME EFFECTS (disabled) --- */
+
+/* Pipeline pod — disabled glow */
+.pod-glow {
+  transition: all 300ms ease;
+}
+
+/* Interlink line — disabled */
+.interlink-glow {}
+
+/* Flowing data particle — disabled */
+.interlink-flow {}
+
+/* --- METRIC CARD SPARKLE EFFECT (disabled) --- */
+.metric-sparkle {}
+
+/* ==================== GOLDEN TITLE ANIMATION ==================== */
+
+@keyframes goldenSweep {
+  0% {
+    background-position: -200% center;
+  }
+  100% {
+    background-position: 200% center;
+  }
+}
+
+.golden-title {
+  font-family: var(--font-cormorant-infant), 'Cormorant Infant', 'Georgia', serif;
+  background: linear-gradient(
+    90deg,
+    #8b6914 0%,
+    #b8860b 10%,
+    #daa520 20%,
+    #ffd700 30%,
+    #fffacd 40%,
+    #fff8dc 45%,
+    #ffd700 50%,
+    #daa520 60%,
+    #b8860b 70%,
+    #8b6914 80%,
+    #daa520 90%,
+    #ffd700 100%
+  );
+  background-size: 200% auto;
+  -webkit-background-clip: text;
+  background-clip: text;
+  -webkit-text-fill-color: transparent;
+  animation: goldenSweep 6s ease-in-out infinite;
+  filter: drop-shadow(0 0 12px rgba(255, 215, 0, 0.4)) drop-shadow(0 0 30px rgba(255, 215, 0, 0.15));
+  position: relative;
+}
+
+/* Glow pseudo-element behind the text */
+.golden-title::after {
+  content: 'THE MAGNUM OPUS';
+  position: absolute;
+  left: 0;
+  top: 0;
+  width: 100%;
+  height: 100%;
+  font-family: var(--font-cormorant-infant), 'Cormorant Infant', 'Georgia', serif;
+  font-size: inherit;
+  font-weight: inherit;
+  letter-spacing: inherit;
+  text-transform: uppercase;
+  color: rgba(255, 215, 0, 0.08);
+  filter: blur(8px);
+  z-index: -1;
+  animation: goldenPulse 6s ease-in-out infinite;
+}
+
+@keyframes goldenPulse {
+  0%, 100% {
+    opacity: 0.3;
+    filter: blur(8px);
+  }
+  50% {
+    opacity: 0.7;
+    filter: blur(14px);
+  }
+}
+
+/* ===== Tech Title - futuristic high-tech style ===== */
+.tech-title {
+  font-family: 'Inter', 'SF Pro Display', system-ui, sans-serif;
+  background: linear-gradient(
+    90deg,
+    #06b6d4 0%,
+    #22d3ee 15%,
+    #67e8f9 30%,
+    #a5f3fc 45%,
+    #ffffff 50%,
+    #c4b5fd 55%,
+    #a78bfa 70%,
+    #8b5cf6 85%,
+    #06b6d4 100%
+  );
+  background-size: 200% auto;
+  -webkit-background-clip: text;
+  background-clip: text;
+  -webkit-text-fill-color: transparent;
+  animation: techSweep 8s linear infinite;
+  filter: drop-shadow(0 0 6px rgba(6, 182, 212, 0.8)) drop-shadow(0 0 16px rgba(139, 92, 246, 0.5)) drop-shadow(0 0 40px rgba(6, 182, 212, 0.3));
+  position: relative;
+}
+
+@keyframes techSweep {
+  0% { background-position: 0% center; }
+  100% { background-position: 200% center; }
+}
+
+/* Glow pseudo-element behind the tech text */
+.tech-title::after {
+  content: 'THE MAGNUM OPUS';
+  position: absolute;
+  left: 0;
+  top: 0;
+  width: 100%;
+  height: 100%;
+  font-family: 'Inter', 'SF Pro Display', system-ui, sans-serif;
+  font-size: inherit;
+  font-weight: inherit;
+  letter-spacing: inherit;
+  text-transform: uppercase;
+  color: rgba(6, 182, 212, 0.15);
+  filter: blur(12px);
+  z-index: -1;
+  animation: techPulse 3s ease-in-out infinite;
+}
+
+@keyframes techPulse {
+  0%, 100% {
+    opacity: 0.5;
+    filter: blur(12px);
+  }
+  50% {
+    opacity: 1;
+    filter: blur(22px);
+  }
+}
+
+/* ===== Tech Frame glow ===== */
+.tech-frame-glow {
+  animation: frameGlow 3s ease-in-out infinite;
+}
+
+@keyframes frameGlow {
+  0%, 100% {
+    filter: drop-shadow(0 0 6px rgba(6, 182, 212, 0.4)) drop-shadow(0 0 14px rgba(139, 92, 246, 0.25));
+  }
+  50% {
+    filter: drop-shadow(0 0 12px rgba(6, 182, 212, 0.7)) drop-shadow(0 0 28px rgba(139, 92, 246, 0.45)) drop-shadow(0 0 50px rgba(6, 182, 212, 0.2));
+  }
+}
+
+/* Health bar - dark theme variant */
+.health-bar-dark {
+  color: #d6d3d1;
+}
+.health-bar-dark .health-label {
+  color: #a8a29e;
+}
+.health-bar-dark .health-ok {
+  color: #34d399;
+}
+.health-bar-dark .health-err {
+  color: #f87171;
+}
+.health-bar-dark .health-detail {
+  color: #a8a29e;
+}
+
+/* Connection Status Footer */
+.connection-status-bar {
+  background: linear-gradient(180deg, rgba(15, 23, 42, 0.85) 0%, rgba(15, 23, 42, 0.95) 100%);
+  backdrop-filter: blur(12px);
+  border-top: 1px solid rgba(6, 182, 212, 0.2);
+  z-index: 40;
+  position: relative;
+}
+.connection-status-bar::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 1px;
+  background: linear-gradient(90deg, transparent 0%, rgba(6, 182, 212, 0.3) 20%, rgba(139, 92, 246, 0.2) 50%, rgba(6, 182, 212, 0.3) 80%, transparent 100%);
+}
+
+/* ==================== SIDEBAR ==================== */
+
+.sidebar-transition {
+  transition: width 300ms cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+.sidebar-module-btn {
+  transition: all 200ms ease;
+}
+
+/* Sidebar amber logo mini */
+.sidebar-logo-mini {
+  background: linear-gradient(135deg, #f59e0b, #fbbf24);
+  -webkit-background-clip: text;
+  background-clip: text;
+  -webkit-text-fill-color: transparent;
+  filter: drop-shadow(0 0 6px rgba(251, 191, 36, 0.5)) drop-shadow(0 0 14px rgba(251, 191, 36, 0.2));
+}
+
+/* ==================== BUTTON HOVER ==================== */
+
+.btn-glow {
+  transition: all 200ms ease;
+}
+
+.btn-glow:hover {
+  filter: brightness(1.1);
+}
+
+/* Sidebar module button hover */
+.sidebar-module-btn:hover {
+  background: rgba(6, 182, 212, 0.06);
+}
+
+.sidebar-module-btn.active {
+  background: rgba(6, 182, 212, 0.1);
+  border-color: rgba(6, 182, 212, 0.35);
+}
+
+/* ==================== DARK THEME CALENDAR FIX ==================== */
+
+.dark .rdp {
+  --rdp-bg-color: oklch(0.269 0 0);
+  --rdp-accent-color: oklch(0.488 0.243 264.376);
+  --rdp-accent-background-color: oklch(0.205 0 0);
+}
+
+.dark .rdp-day_button:hover {
+  background: oklch(0.269 0 0) !important;
+}
+
+.dark .rdp-selected {
+  background: oklch(0.488 0.243 264.376) !important;
+}
+
+.dark .rdp-selected .rdp-day_button {
+  color: white !important;
+}
+
+/* Dark theme popover/card overrides */
+.dark [data-radix-popper-content-wrapper] > div {
+  background: oklch(0.205 0 0 / 80%);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  border-color: oklch(1 0 0 / 15%);
+}
+
+/* ==================== GLASS EFFECT SUPPORT ==================== */
+
+/* Glass panel - deep space blue-black with border */
+.glass-panel {
+  background: rgba(2, 6, 23, 0.65);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  border: 1px solid rgba(6, 182, 212, 0.45);
+}
+
+.glass-panel-light {
+  background: rgba(2, 6, 23, 0.55);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  border: 1px solid rgba(59, 130, 246, 0.4);
+}
+
+/* Ensure dark mode cards have deep space effect — BUT don't override nc-panel borders */
+.dark [data-slot="card"]:not(.nc-panel) {
+  background: rgba(2, 6, 23, 0.65) !important;
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  border: 1px solid rgba(6, 182, 212, 0.45) !important;
+}
+/* nc-panel cards keep their own border/background from nc-panel + nc-border-* classes */
+.dark [data-slot="card"].nc-panel {
+  background: rgba(2, 6, 23, 0.7) !important;
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+}
+
+/* Dark theme file input fix — ensure "No file chosen" text is light */
+.dark input[type="file"] {
+  color: oklch(0.85 0 0);
+}
+.dark input[type="file"]::file-selector-button {
+  color: inherit;
+}
+
+/* Dark theme Select dropdown — ensure item text is light */
+.dark [data-radix-select-item] {
+  color: oklch(0.85 0 0);
+}
+.dark [data-radix-select-item]:focus {
+  color: oklch(0.95 0 0);
+}
+
+/* Dark theme Badge secondary — ensure text is light */
+.dark [data-slot="badge"].bg-secondary {
+  color: oklch(0.85 0 0);
+}
+
+/* ==================== TAB HOVER COLORS ==================== */
+
+.tab-glow-chat:hover {}
+
+.tab-glow-explorer:hover {}
+
+.tab-glow-documents:hover {}
+
+.tab-glow-analytics:hover {}
+
+.tab-glow-token:hover {}

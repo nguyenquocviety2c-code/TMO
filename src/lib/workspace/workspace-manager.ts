@@ -1,0 +1,539 @@
+// ============================================
+// WorkspaceManager — workspace lifecycle, pending edits, file ops
+// ============================================
+
+import { db } from "@/lib/db";
+import * as fs from "node:fs";
+import * as path from "node:path";
+import type {
+  Workspace,
+  PendingEdit,
+  CreateWorkspaceInput,
+} from "./types";
+
+// ============================================
+// WorkspaceManager
+// ============================================
+
+export class WorkspaceManager {
+  // ---------------------------------------------------------------------------
+  // Active workspace cache (TTL 10s)
+  // ---------------------------------------------------------------------------
+  private _activeCache: { ws: Workspace; ts: number } | null = null;
+  private readonly CACHE_TTL_MS = 10_000;
+
+  // ---------------------------------------------------------------------------
+  // Workspace lifecycle
+  // ---------------------------------------------------------------------------
+
+  /** Lấy workspace đang active (isActive = true).
+   *  Nếu chưa có workspace nào → tự tạo default workspace từ process.cwd().
+   *  Cache TTL 10s để tránh query DB liên tục. */
+  async getActiveWorkspace(): Promise<Workspace> {
+    // Check cache
+    if (this._activeCache && (Date.now() - this._activeCache.ts) < this.CACHE_TTL_MS) {
+      return this._activeCache.ws;
+    }
+
+    try {
+      const record = await db.workspace.findFirst({
+        where: { isActive: true },
+      });
+      if (record) {
+        const ws = this._mapWorkspace(record);
+        this._activeCache = { ws, ts: Date.now() };
+        return ws;
+      }
+    } catch {
+      // DB error — fall through to default
+    }
+
+    // No active workspace → auto-create default from process.cwd()
+    const defaultPath = process.cwd();
+    const defaultWs = await this.createWorkspace({
+      name: 'Default Workspace',
+      rootPath: defaultPath,
+    });
+    this._activeCache = { ws: defaultWs, ts: Date.now() };
+    return defaultWs;
+  }
+
+  /** Invalidate active workspace cache (gọi sau khi setActiveWorkspace/deleteWorkspace) */
+  private _invalidateCache(): void {
+    this._activeCache = null;
+  }
+
+  /**
+   * Resolve relative path against active workspace rootPath.
+   * Guards against path traversal (../../etc/passwd) and absolute paths outside root.
+   * @returns resolved absolute path, guaranteed to be within workspace root.
+   * @throws if resolved path escapes workspace root.
+   */
+  async resolveInWorkspace(relPath: string): Promise<string> {
+    const ws = await this.getActiveWorkspace();
+    const resolved = path.resolve(ws.rootPath, relPath);
+
+    // Guard: resolved path must start with workspace rootPath
+    // This blocks ../../etc/passwd and absolute paths outside root
+    const normalizedRoot = path.resolve(ws.rootPath) + path.sep;
+    const normalizedResolved = path.resolve(resolved) + path.sep;
+
+    if (!normalizedResolved.startsWith(normalizedRoot)) {
+      throw new Error(
+        `Path traversal blocked: "${relPath}" resolves to "${resolved}" which is outside workspace root "${ws.rootPath}"`
+      );
+    }
+
+    return resolved;
+  }
+
+  /** Liệt kê tất cả workspaces, active first */
+  async listWorkspaces(): Promise<Workspace[]> {
+    const records = await db.workspace.findMany({
+      orderBy: [{ isActive: "desc" }, { createdAt: "desc" }],
+    });
+    return records.map((r) => this._mapWorkspace(r));
+  }
+
+  /** Lấy workspace theo id */
+  async getWorkspaceById(id: string): Promise<Workspace | null> {
+    try {
+      const record = await db.workspace.findUnique({ where: { id } });
+      if (!record) return null;
+      return this._mapWorkspace(record);
+    } catch {
+      return null;
+    }
+  }
+
+  /** Lấy workspace theo rootPath */
+  async getWorkspaceByPath(rootPath: string): Promise<Workspace | null> {
+    try {
+      const record = await db.workspace.findUnique({ where: { rootPath } });
+      if (!record) return null;
+      return this._mapWorkspace(record);
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Tạo workspace mới.
+   * - Validate rootPath tồn tại trên filesystem
+   * - Deactivate workspace đang active (nếu có)
+   * - Tạo mới + set isActive = true
+   */
+  async createWorkspace(input: CreateWorkspaceInput): Promise<Workspace> {
+    // Validate rootPath
+    const resolved = path.resolve(input.rootPath);
+    if (!fs.existsSync(resolved)) {
+      throw new Error(`Workspace root path does not exist: ${resolved}`);
+    }
+    if (!fs.statSync(resolved).isDirectory()) {
+      throw new Error(`Workspace root path is not a directory: ${resolved}`);
+    }
+
+    // Deactivate current active workspace
+    const currentActive = await db.workspace.findFirst({
+      where: { isActive: true },
+    });
+    if (currentActive) {
+      await db.workspace.update({
+        where: { id: currentActive.id },
+        data: { isActive: false },
+      });
+    }
+
+    // Create new workspace (active by default)
+    const record = await db.workspace.create({
+      data: {
+        name: input.name,
+        rootPath: resolved,
+        isActive: true,
+      },
+    });
+
+    return this._mapWorkspace(record);
+  }
+
+  /**
+   * Kích hoạt một workspace khác (deactivate active cũ).
+   * Nếu workspace đã là active → no-op.
+   */
+  async setActiveWorkspace(id: string): Promise<Workspace> {
+    // Verify workspace exists
+    const target = await db.workspace.findUnique({ where: { id } });
+    if (!target) {
+      throw new Error(`Workspace not found: ${id}`);
+    }
+
+    // If already active, return as-is
+    if (target.isActive) {
+      return this._mapWorkspace(target);
+    }
+
+    // Deactivate current active
+    const currentActive = await db.workspace.findFirst({
+      where: { isActive: true },
+    });
+    if (currentActive) {
+      await db.workspace.update({
+        where: { id: currentActive.id },
+        data: { isActive: false },
+      });
+    }
+
+    // Activate target
+    const updated = await db.workspace.update({
+      where: { id },
+      data: { isActive: true },
+    });
+
+    this._invalidateCache();
+    return this._mapWorkspace(updated);
+  }
+
+  /**
+   * Xóa workspace.
+   * - Không cho phép xóa active workspace.
+   * - Không xóa filesystem (chỉ xóa record trong DB).
+   */
+  async deleteWorkspace(id: string): Promise<void> {
+    const target = await db.workspace.findUnique({ where: { id } });
+    if (!target) {
+      throw new Error(`Workspace not found: ${id}`);
+    }
+    if (target.isActive) {
+      throw new Error(`Cannot delete the active workspace. Deactivate it first.`);
+    }
+
+    await db.workspace.delete({ where: { id } });
+    this._invalidateCache();
+  }
+
+  // ---------------------------------------------------------------------------
+  // PendingEdit management
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Tạo pending edit từ agent proposal.
+   * - oldContent lấy từ file hiện tại ("" nếu file mới)
+   * - diff được tính từ oldContent → newContent
+   */
+  async createPendingEdit(params: {
+    sessionId: string;
+    filePath: string;
+    newContent: string;
+    agentName: string;
+    workspaceRootPath: string;
+  }): Promise<PendingEdit> {
+    const { sessionId, filePath, newContent, agentName, workspaceRootPath } = params;
+
+    // Resolve absolute path
+    const absPath = path.join(workspaceRootPath, filePath);
+
+    // Read old content (empty string if file doesn't exist)
+    let oldContent = "";
+    try {
+      if (fs.existsSync(absPath) && fs.statSync(absPath).isFile()) {
+        oldContent = fs.readFileSync(absPath, "utf-8");
+      }
+    } catch {
+      oldContent = "";
+    }
+
+    // Compute simple diff
+    const diff = this._computeDiff(oldContent, newContent, filePath);
+
+    const record = await db.pendingEdit.create({
+      data: {
+        sessionId,
+        filePath,
+        oldContent,
+        newContent,
+        diff,
+        status: "pending",
+        agentName,
+      },
+    });
+
+    return this._mapPendingEdit(record);
+  }
+
+  /** Liệt kê pending edits — optional filter theo sessionId */
+  async listPendingEdits(sessionId?: string): Promise<PendingEdit[]> {
+    const where = sessionId
+      ? { sessionId, status: "pending" as const }
+      : { status: "pending" as const };
+
+    const records = await db.pendingEdit.findMany({
+      where,
+      orderBy: { createdAt: "desc" },
+    });
+    return records.map((r) => this._mapPendingEdit(r));
+  }
+
+  /** Lấy một pending edit theo id */
+  async getPendingEdit(id: string): Promise<PendingEdit | null> {
+    try {
+      const record = await db.pendingEdit.findUnique({ where: { id } });
+      if (!record) return null;
+      return this._mapPendingEdit(record);
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Approve pending edit → apply to filesystem.
+   * - Ghi newContent vào filePath trong workspace root
+   * - Cập nhật status → "applied" (hoặc "failed" nếu lỗi)
+   */
+  async approvePendingEdit(id: string, workspaceRootPath: string): Promise<PendingEdit> {
+    const edit = await db.pendingEdit.findUnique({ where: { id } });
+    if (!edit) {
+      throw new Error(`PendingEdit not found: ${id}`);
+    }
+    if (edit.status !== "pending") {
+      throw new Error(`Cannot approve edit with status: ${edit.status}`);
+    }
+
+    // Apply to filesystem
+    const absPath = path.join(workspaceRootPath, edit.filePath);
+    try {
+      // Ensure directory exists
+      const dir = path.dirname(absPath);
+      fs.mkdirSync(dir, { recursive: true });
+      // Write content
+      fs.writeFileSync(absPath, edit.newContent, "utf-8");
+
+      // Update status
+      const updated = await db.pendingEdit.update({
+        where: { id },
+        data: {
+          status: "applied",
+          resolvedAt: new Date(),
+        },
+      });
+      return this._mapPendingEdit(updated);
+    } catch (err) {
+      // Update status to failed
+      const updated = await db.pendingEdit.update({
+        where: { id },
+        data: {
+          status: "failed",
+          resolvedAt: new Date(),
+        },
+      });
+      // Re-throw for caller to handle
+      throw new Error(
+        `Failed to apply edit to ${absPath}: ${err instanceof Error ? err.message : "Unknown error"}`,
+      );
+    }
+  }
+
+  /**
+   * Reject pending edit → discard.
+   * - Cập nhật status → "rejected"
+   * - Không thay đổi filesystem
+   */
+  async rejectPendingEdit(id: string): Promise<PendingEdit> {
+    const edit = await db.pendingEdit.findUnique({ where: { id } });
+    if (!edit) {
+      throw new Error(`PendingEdit not found: ${id}`);
+    }
+    if (edit.status !== "pending") {
+      throw new Error(`Cannot reject edit with status: ${edit.status}`);
+    }
+
+    const updated = await db.pendingEdit.update({
+      where: { id },
+      data: {
+        status: "rejected",
+        resolvedAt: new Date(),
+      },
+    });
+    return this._mapPendingEdit(updated);
+  }
+
+  /** Lấy tất cả pending edits theo sessionId (bất kể status) */
+  async getPendingEditsBySession(sessionId: string): Promise<PendingEdit[]> {
+    const records = await db.pendingEdit.findMany({
+      where: { sessionId },
+      orderBy: { createdAt: "desc" },
+    });
+    return records.map((r) => this._mapPendingEdit(r));
+  }
+
+  // ---------------------------------------------------------------------------
+  // FsCheckpoint management
+  // ---------------------------------------------------------------------------
+
+  /** Tạo fs checkpoint record (shadow git commit hash) */
+  async createCheckpoint(params: {
+    sessionId: string;
+    workspaceId: string;
+    commitHash: string;
+    label: string;
+  }): Promise<{ id: string; commitHash: string }> {
+    const record = await db.fsCheckpoint.create({
+      data: {
+        sessionId: params.sessionId,
+        workspaceId: params.workspaceId,
+        commitHash: params.commitHash,
+        label: params.label,
+      },
+    });
+    return { id: record.id, commitHash: record.commitHash };
+  }
+
+  /** Liệt kê checkpoints theo session (mới nhất trước) */
+  async listCheckpoints(sessionId: string): Promise<
+    Array<{ id: string; commitHash: string; label: string; createdAt: Date }>
+  > {
+    const records = await db.fsCheckpoint.findMany({
+      where: { sessionId },
+      orderBy: { createdAt: "desc" },
+    });
+    return records.map((r) => ({
+      id: r.id,
+      commitHash: r.commitHash,
+      label: r.label,
+      createdAt: r.createdAt,
+    }));
+  }
+
+  // ---------------------------------------------------------------------------
+  // AgentModelOverride management
+  // ---------------------------------------------------------------------------
+
+  /** Lấy model override cho một agent */
+  async getAgentModelOverride(
+    agentName: string,
+  ): Promise<{ provider: string; model: string } | null> {
+    const record = await db.agentModelOverride.findUnique({
+      where: { agentName },
+    });
+    if (!record) return null;
+    return { provider: record.provider, model: record.model };
+  }
+
+  /** Set/cập nhật model override cho agent */
+  async setAgentModelOverride(
+    agentName: string,
+    provider: string,
+    model: string,
+  ): Promise<void> {
+    await db.agentModelOverride.upsert({
+      where: { agentName },
+      update: { provider, model, updatedAt: new Date() },
+      create: { agentName, provider, model },
+    });
+  }
+
+  // ---------------------------------------------------------------------------
+  // Private helpers
+  // ---------------------------------------------------------------------------
+
+  private _mapWorkspace(record: {
+    id: string;
+    name: string;
+    rootPath: string;
+    isActive: boolean;
+    createdAt: Date;
+    updatedAt: Date;
+  }): Workspace {
+    return {
+      id: record.id,
+      name: record.name,
+      rootPath: record.rootPath,
+      isActive: record.isActive,
+      createdAt: record.createdAt,
+      updatedAt: record.updatedAt,
+    };
+  }
+
+  private _mapPendingEdit(record: {
+    id: string;
+    sessionId: string;
+    filePath: string;
+    oldContent: string;
+    newContent: string;
+    diff: string;
+    status: string;
+    agentName: string;
+    createdAt: Date;
+    resolvedAt: Date | null;
+  }): PendingEdit {
+    return {
+      id: record.id,
+      sessionId: record.sessionId,
+      filePath: record.filePath,
+      oldContent: record.oldContent,
+      newContent: record.newContent,
+      diff: record.diff,
+      status: record.status as PendingEdit["status"],
+      agentName: record.agentName,
+      createdAt: record.createdAt,
+      resolvedAt: record.resolvedAt,
+    };
+  }
+
+  /**
+   * Simple line-based diff (không cần thư viện external).
+   * Format: unified-style với --- / +++ header.
+   */
+  private _computeDiff(
+    oldContent: string,
+    newContent: string,
+    filePath: string,
+  ): string {
+    const oldLines = oldContent.split("\n");
+    const newLines = newContent.split("\n");
+
+    // Build diff lines
+    const diffLines: string[] = [];
+    diffLines.push(`--- a/${filePath}`);
+    diffLines.push(`+++ b/${filePath}`);
+
+    // Simple algorithm: walk both arrays
+    let i = 0;
+    let j = 0;
+    const maxLen = Math.max(oldLines.length, newLines.length);
+
+    while (i < oldLines.length || j < newLines.length) {
+      if (i < oldLines.length && j < newLines.length && oldLines[i] === newLines[j]) {
+        // Context line (unchanged)
+        diffLines.push(` ${oldLines[i]}`);
+        i++;
+        j++;
+      } else if (i < oldLines.length && j >= newLines.length) {
+        // Remaining old lines (removed)
+        diffLines.push(`-${oldLines[i]}`);
+        i++;
+      } else if (i >= oldLines.length && j < newLines.length) {
+        // Remaining new lines (added)
+        diffLines.push(`+${newLines[j]}`);
+        j++;
+      } else {
+        // Line changed — old removed, new added
+        diffLines.push(`-${oldLines[i]}`);
+        diffLines.push(`+${newLines[j]}`);
+        i++;
+        j++;
+      }
+    }
+
+    return diffLines.join("\n");
+  }
+}
+
+/** Singleton instance */
+let _instance: WorkspaceManager | null = null;
+
+export function getWorkspaceManager(): WorkspaceManager {
+  if (!_instance) {
+    _instance = new WorkspaceManager();
+  }
+  return _instance;
+}

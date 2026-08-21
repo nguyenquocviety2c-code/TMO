@@ -1,0 +1,1 @@
+Khi phải đọc nhiều file với nội dung dài vượt quá lượng ngữ cảnh để hiểu cấu trúc, hãy tạo một file để tóm tắt những gì cần thiết, đảm bảo vừa đủ để hiểu nhưng không gây quá tải ngữ cảnh khi làm việc. Sau đó thực hiện công việc bám sát theo nội dung đã tóm tắt 

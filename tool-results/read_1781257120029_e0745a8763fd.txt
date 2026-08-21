@@ -1,0 +1,1338 @@
+     1→/**
+     2→ * Code Team — Tool Execution Layer
+     3→ *
+     4→ * Central place to execute all tools that agents can call via LLM function calling.
+     5→ * Supports ReAct loop: LLM returns tool_call → execute → feed result back → repeat.
+     6→ *
+     7→ * Tools available (per-agent permissions from agents.ts):
+     8→ *   - opencode:         Code operations (read/write/bash) — via internal API
+     9→ *   - knowledge_search:  Semantic search in KB (Qdrant) — via knowledge-bridge
+    10→ *   - knowledge_graph:   Graph query (Neo4j Cypher) — via knowledge-bridge
+    11→ *   - knowledge_write:   Write entity/relationship to KB — via knowledge-bridge
+    12→ *   - tavily:           AI-optimized web search — via Tavily API + z-ai-sdk fallback
+    13→ *   - serper:           Google search — via Serper API + z-ai-sdk fallback
+    14→ *   - jina:             Web page reader — via Jina API + z-ai-sdk fallback
+    15→ *
+    16→ * Architecture:
+    17→ *   Workflow Engine → callLLMForAgent() with tool definitions
+    18→ *   → LLM returns tool_call → executeTool() → feed result back
+    19→ *   → Repeat until LLM outputs text (no more tool_calls)
+    20→ *
+    21→ * Phase 5 Enhancement:
+    22→ *   - Tavily/Serper/Jina use direct API keys (from .env)
+    23→ *   - z-ai-web-dev-sdk provides automatic fallback when API keys fail
+    24→ *   - Skills installed from Clawhub Market (web_search + page_reader)
+    25→ */
+    26→
+    27→import { getAgentTools } from './agents'
+    28→import { tavilyKeyPool, jinaKeyPool, serperKeyPool } from '@/lib/service-key-pool'
+    29→import { GATEWAY_TOOL_MAP as UNIFIED_GATEWAY_TOOL_MAP, ALL_GATEWAY_TOOL_NAMES, HTTP_TOOL_NAMES, BRIDGE_TOOL_NAMES } from '@/lib/gateway-tool-definitions'
+    30→import { sanitizeToolArgs } from '@/lib/tool-security'
+    31→
+    32→// ==================== GATEWAY TOOL PROXY (V2 — BRIDGE ENHANCED) ====================
+    33→//
+    34→// Gateway provides 36 tools. Previously only ~17 were accessible via HTTP /tools/invoke.
+    35→// Now with the Gateway Bridge (WebSocket → REST, port 18791), ALL 36 tools are accessible.
+    36→//
+    37→// Access paths:
+    38→//   1. Local tools: opencode, knowledge_search, knowledge_graph, knowledge_write, tavily, serper, jina
+    39→//   2. Gateway HTTP tools (~17): web_search, web_fetch, memory_*, sessions_*, agents_list, message, tts, etc.
+    40→//   3. Gateway Bridge tools (~19 session-context): exec, read, write, edit, image_generate, etc.
+    41→//
+    42→// The Bridge connects to the Gateway via WebSocket (with full session context)
+    43→// and exposes a REST API that proxies tool invocations.
+    44→//
+    45→// Architecture:
+    46→//   executeTool() → local switch → Gateway HTTP /tools/invoke → Bridge /tools/invoke
+    47→
+    48→const GATEWAY_URL = process.env.OPENCLAW_GATEWAY_URL || 'http://127.0.0.1:18789'
+    49→const BRIDGE_URL = process.env.OPENCLAW_BRIDGE_URL || 'http://127.0.0.1:18791'
+    50→
+    51→/** Tools that are accessible via Gateway HTTP /tools/invoke endpoint.
+    52→ *  Sourced from unified gateway-tool-definitions.ts */
+    53→export const GATEWAY_HTTP_ALLOWED_TOOLS = new Set(HTTP_TOOL_NAMES)
+    54→
+    55→/** Session-context tools that require the Gateway Bridge.
+    56→ *  Sourced from unified gateway-tool-definitions.ts */
+    57→export const GATEWAY_BRIDGE_TOOLS = new Set(BRIDGE_TOOL_NAMES)
+    58→
+    59→/** All Gateway tools = HTTP + Bridge */
+    60→export const ALL_GATEWAY_TOOLS = new Set(ALL_GATEWAY_TOOL_NAMES)
+    61→
+    62→/** Gateway tool definitions for LLM tool calling.
+    63→ *  Sourced from unified gateway-tool-definitions.ts — ALL 36 Gateway tools. */
+    64→export const GATEWAY_TOOL_DEFINITIONS: Record<string, { type: string; function: { name: string; description: string; parameters: Record<string, unknown> } }> = Object.fromEntries(
+    65→  Object.entries(UNIFIED_GATEWAY_TOOL_MAP).map(([name, def]) => [name, {
+    66→    type: def.type,
+    67→    function: {
+    68→      name: def.function.name,
+    69→      description: def.function.description,
+    70→      parameters: def.function.parameters as Record<string, unknown>,
+    71→    },
+    72→  }])
+    73→)
+    74→
+    75→/**
+    76→ * Execute a tool via Gateway HTTP /tools/invoke endpoint.
+    77→ * Only works for HTTP-allowed tools (web_search, web_fetch, etc.).
+    78→ */
+    79→async function executeGatewayTool(name: string, args: Record<string, unknown>): Promise<unknown> {
+    80→  if (!GATEWAY_HTTP_ALLOWED_TOOLS.has(name)) {
+    81→    throw new Error(`Tool "${name}" requires Gateway session context. Try the Bridge instead.`)
+    82→  }
+    83→
+    84→  const res = await fetch(`${GATEWAY_URL}/tools/invoke`, {
+    85→    method: 'POST',
+    86→    headers: { 'Content-Type': 'application/json' },
+    87→    body: JSON.stringify({ name, args }),
+    88→    signal: AbortSignal.timeout(30000),
+    89→  })
+    90→
+    91→  if (!res.ok) {
+    92→    const errorText = await res.text().catch(() => 'Unknown error')
+    93→    throw new Error(`Gateway tool error ${res.status}: ${errorText.slice(0, 200)}`)
+    94→  }
+    95→
+    96→  const data = await res.json()
+    97→  if (!data.ok && data.error) {
+    98→    throw new Error(`Tool error: ${data.error?.message || data.error || 'Unknown'}`)
+    99→  }
+   100→
+   101→  return data.result ?? data
+   102→}
+   103→
+   104→/**
+   105→ * Execute a tool via the Gateway Bridge (port 18791).
+   106→ * The Bridge connects to the Gateway via WebSocket with full session context,
+   107→ * enabling access to ALL 36 Gateway tools including session-context ones
+   108→ * (exec, read, write, edit, image_generate, etc.).
+   109→ */
+   110→async function executeBridgeTool(name: string, args: Record<string, unknown>): Promise<unknown> {
+   111→  const res = await fetch(`${BRIDGE_URL}/tools/invoke`, {
+   112→    method: 'POST',
+   113→    headers: { 'Content-Type': 'application/json' },
+   114→    body: JSON.stringify({ name, args }),
+   115→    signal: AbortSignal.timeout(60000),
+   116→  })
+   117→
+   118→  if (!res.ok) {
+   119→    const errorText = await res.text().catch(() => 'Unknown error')
+   120→    throw new Error(`Bridge tool error ${res.status}: ${errorText.slice(0, 200)}`)
+   121→  }
+   122→
+   123→  const data = await res.json()
+   124→  if (!data.ok && data.error) {
+   125→    throw new Error(`Bridge tool error: ${typeof data.error === 'string' ? data.error : data.error?.message || 'Unknown'}`)
+   126→  }
+   127→
+   128→  return data.result ?? data
+   129→}
+   130→
+   131→/**
+   132→ * Check if the Gateway Bridge is online and authenticated.
+   133→ */
+   134→export async function isBridgeOnline(): Promise<boolean> {
+   135→  try {
+   136→    const res = await fetch(`${BRIDGE_URL}/health`, { signal: AbortSignal.timeout(3000) })
+   137→    if (res.ok) {
+   138→      const data = await res.json()
+   139→      return data?.bridge?.authenticated === true
+   140→    }
+   141→  } catch {}
+   142→  return false
+   143→}
+   144→
+   145→// ==================== Z-AI-SDK LAZY INITIALIZATION ====================
+   146→//
+   147→// ⚠️  IMPORTANT: z-ai-web-dev-sdk is an OPTIONAL dependency!
+   148→//
+   149→// This SDK ONLY works inside the z.ai sandbox environment where backend
+   150→// services (web_search, page_reader) are available. If you clone this
+   151→// project and run locally, the SDK will not initialize — this is expected
+   152→// and NOT an error. Direct API keys (TAVILY_API_KEY, SERPER_API_KEY,
+   153→// JINA_API_KEY) in .env will be used instead.
+   154→//
+   155→// Fallback chain: Direct API key → z-ai-sdk → error with helpful hint
+   156→//
+   157→
+   158→let zaiInstance: any = null
+   159→let zaiInitPromise: Promise<any> | null = null
+   160→let zaiAvailable: boolean | null = null // null = not yet checked
+   161→
+   162→async function getZAI(): Promise<any> {
+   163→  if (zaiInstance) return zaiInstance
+   164→  if (zaiInitPromise) return zaiInitPromise
+   165→
+   166→  zaiInitPromise = (async () => {
+   167→    try {
+   168→      const ZAI = (await import('z-ai-web-dev-sdk')).default
+   169→      const instance = await ZAI.create()
+   170→      console.log('[ToolExecutor] ✅ z-ai-web-dev-sdk initialized — web_search + page_reader available as fallback')
+   171→      zaiInstance = instance
+   172→      zaiAvailable = true
+   173→      return instance
+   174→    } catch (err) {
+   175→      zaiAvailable = false
+   176→      console.warn(
+   177→        '[ToolExecutor] z-ai-web-dev-sdk not available (this is normal for local deployment — direct API keys will be used).',
+   178→        `Detail: ${err instanceof Error ? err.message : String(err)}`
+   179→      )
+   180→      return null
+   181→    }
+   182→  })()
+   183→
+   184→  return zaiInitPromise
+   185→}
+   186→
+   187→// ==================== TOOL DEFINITIONS (OpenAI function calling format) ====================
+   188→// Each agent receives tools according to its permissions from agents.ts
+   189→
+   190→export interface ToolDefinition {
+   191→  type: 'function'
+   192→  function: {
+   193→    name: string
+   194→    description: string
+   195→    parameters: {
+   196→      type: 'object'
+   197→      properties: Record<string, unknown>
+   198→      required: string[]
+   199→    }
+   200→  }
+   201→}
+   202→
+   203→const ALL_TOOL_DEFINITIONS: Record<string, ToolDefinition> = {
+   204→  opencode: {
+   205→    type: 'function',
+   206→    function: {
+   207→      name: 'opencode',
+   208→      description: 'Thực hiện code operations: đọc file, viết file, chạy terminal command, tạo thư mục. Dùng để implement code theo architecture spec.',
+   209→      parameters: {
+   210→        type: 'object',
+   211→        properties: {
+   212→          action: {
+   213→            type: 'string',
+   214→            enum: ['read', 'write', 'bash', 'mkdir'],
+   215→            description: 'Hành động cần thực hiện',
+   216→          },
+   217→          path: {
+   218→            type: 'string',
+   219→            description: 'Đường dẫn file hoặc thư mục (cho read/write/mkdir). Phải là đường dẫn tương đối từ project root.',
+   220→          },
+   221→          content: {
+   222→            type: 'string',
+   223→            description: 'Nội dung file (cho write action). Code đầy đủ, có error handling và comments.',
+   224→          },
+   225→          command: {
+   226→            type: 'string',
+   227→            description: 'Terminal command (cho bash action). Ví dụ: "npm run build", "npm test".',
+   228→          },
+   229→        },
+   230→        required: ['action'],
+   231→      },
+   232→    },
+   233→  },
+   234→  knowledge_search: {
+   235→    type: 'function',
+   236→    function: {
+   237→      name: 'knowledge_search',
+   238→      description: 'Tìm kiếm semantic trong Knowledge Base (Qdrant + Neo4j). Trả về relevant chunks, entities, relationships. Dùng khi cần tra cứu kiến thức đã học, best practices, hoặc thông tin về project.',
+   239→      parameters: {
+   240→        type: 'object',
+   241→        properties: {
+   242→          query: {
+   243→            type: 'string',
+   244→            description: 'Câu hỏi hoặc từ khóa cần tìm kiếm',
+   245→          },
+   246→          topK: {
+   247→            type: 'number',
+   248→            description: 'Số kết quả trả về (default: 5, max: 20)',
+   249→            default: 5,
+   250→          },
+   251→        },
+   252→        required: ['query'],
+   253→      },
+   254→    },
+   255→  },
+   256→  knowledge_graph: {
+   257→    type: 'function',
+   258→    function: {
+   259→      name: 'knowledge_graph',
+   260→      description: 'Truy vấn đồ thị Neo4j bằng Cypher query. CHỈ CHO PHÉP MATCH (read-only). Dùng khi cần tìm relationships giữa entities, phân tích graph structure.',
+   261→      parameters: {
+   262→        type: 'object',
+   263→        properties: {
+   264→          query: {
+   265→            type: 'string',
+   266→            description: 'Cypher query (chỉ MATCH, không CREATE/DELETE/SET). Ví dụ: "MATCH (n:Entity)-[r:DEPENDS_ON]->(m) RETURN n,m,r LIMIT 10"',
+   267→          },
+   268→        },
+   269→        required: ['query'],
+   270→      },
+   271→    },
+   272→  },
+   273→  knowledge_write: {
+   274→    type: 'function',
+   275→    function: {
+   276→      name: 'knowledge_write',
+   277→      description: 'Ghi entity hoặc relationship mới vào Knowledge Base. Dùng bởi G3 (CATALYST) để ghi self-evolving lessons. Entity sẽ được sync lên Neo4j sau.',
+   278→      parameters: {
+   279→        type: 'object',
+   280→        properties: {
+   281→          entityName: {
+   282→            type: 'string',
+   283→            description: 'Tên entity (ví dụ: "N+1 Query Pattern", "Prisma Include Strategy")',
+   284→          },
+   285→          entityType: {
+   286→            type: 'string',
+   287→            description: 'Loại entity (ví dụ: "AntiPattern", "BestPractice", "Concept", "Component")',
+   288→          },
+   289→          description: {
+   290→            type: 'string',
+   291→            description: 'Mô tả chi tiết entity',
+   292→          },
+   293→          category: {
+   294→            type: 'string',
+   295→            description: 'Category: Database | API Design | Frontend | Security | Anti-Patterns | Performance',
+   296→          },
+   297→          relationshipType: {
+   298→            type: 'string',
+   299→            description: 'Loại relationship nếu cần tạo relationship (ví dụ: "IMPROVES", "PREVENTS", "DEPENDS_ON")',
+   300→          },
+   301→          targetEntityName: {
+   302→            type: 'string',
+   303→            description: 'Tên target entity cho relationship (nếu có)',
+   304→          },
+   305→        },
+   306→        required: ['entityName', 'entityType', 'description', 'category'],
+   307→      },
+   308→    },
+   309→  },
+   310→  tavily: {
+   311→    type: 'function',
+   312→    function: {
+   313→      name: 'tavily',
+   314→      description: 'Web search AI-optimized — tìm kiếm thông tin trên internet. Trả về kết quả có nội dung tóm tắt. Dùng khi cần research best practices, docs, hoặc thông tin mới.',
+   315→      parameters: {
+   316→        type: 'object',
+   317→        properties: {
+   318→          query: {
+   319→            type: 'string',
+   320→            description: 'Câu hỏi tìm kiếm',
+   321→          },
+   322→        },
+   323→        required: ['query'],
+   324→      },
+   325→    },
+   326→  },
+   327→  serper: {
+   328→    type: 'function',
+   329→    function: {
+   330→      name: 'serper',
+   331→      description: 'Google Search API — tìm kiếm trên Google. Trả về search results với titles, snippets, links. Dùng khi cần tìm docs, packages, solutions.',
+   332→      parameters: {
+   333→        type: 'object',
+   334→        properties: {
+   335→          query: {
+   336→            type: 'string',
+   337→            description: 'Câu hỏi tìm kiếm trên Google',
+   338→          },
+   339→        },
+   340→        required: ['query'],
+   341→      },
+   342→    },
+   343→  },
+   344→  jina: {
+   345→    type: 'function',
+   346→    function: {
+   347→      name: 'jina',
+   348→      description: 'Web page reader — đọc nội dung trang web từ URL. Trả về text content của trang. Dùng khi cần đọc docs, articles, hoặc API references.',
+   349→      parameters: {
+   350→        type: 'object',
+   351→        properties: {
+   352→          url: {
+   353→            type: 'string',
+   354→            description: 'URL trang web cần đọc',
+   355→          },
+   356→        },
+   357→        required: ['url'],
+   358→      },
+   359→    },
+   360→  },
+   361→}
+   362→
+   363→/**
+   364→ * Get tool definitions for a given position.
+   365→ * Each agent only sees tools it has permission to use.
+   366→ */
+   367→export function getToolDefinitionsForPosition(position: string): ToolDefinition[] {
+   368→  const tools = getAgentTools(position)
+   369→  return tools
+   370→    .map(t => ALL_TOOL_DEFINITIONS[t])
+   371→    .filter((def): def is ToolDefinition => def !== undefined)
+   372→}
+   373→
+   374→/**
+   375→ * Get tool definitions for a given list of tool names.
+   376→ * Used when building context for LLM with specific tools.
+   377→ */
+   378→export function getToolDefinitions(tools: string[]): ToolDefinition[] {
+   379→  return tools
+   380→    .map(t => ALL_TOOL_DEFINITIONS[t])
+   381→    .filter((def): def is ToolDefinition => def !== undefined)
+   382→}
+   383→
+   384→// ==================== TOOL EXECUTION ====================
+   385→
+   386→export interface ToolExecutionResult {
+   387→  success: boolean
+   388→  result: unknown
+   389→  duration: number
+   390→}
+   391→
+   392→/**
+   393→ * Execute a tool call from LLM.
+   394→ * Called in the ReAct loop when LLM returns a tool_call.
+   395→ *
+   396→ * @param toolName - Name of the tool to execute
+   397→ * @param args - Arguments from LLM's tool_call
+   398→ * @returns Execution result with success status
+   399→ */
+   400→export async function executeTool(
+   401→  toolName: string,
+   402→  args: Record<string, unknown>
+   403→): Promise<ToolExecutionResult> {
+   404→  const startTime = Date.now()
+   405→
+   406→  // P2.3: Security check — validate tool arguments before execution
+   407→  const securityCheck = sanitizeToolArgs(toolName, args)
+   408→  if (!securityCheck.safe) {
+   409→    return {
+   410→      success: false,
+   411→      result: `Security blocked: ${securityCheck.warnings.join('; ')}`,
+   412→      duration: Date.now() - startTime,
+   413→    }
+   414→  }
+   415→
+   416→  // Use sanitized args for all subsequent operations
+   417→  const safeArgs = securityCheck.sanitizedArgs
+   418→
+   419→  try {
+   420→    let result: unknown
+   421→
+   422→    switch (toolName) {
+   423→      case 'opencode':
+   424→        result = await executeOpenCode(safeArgs)
+   425→        break
+   426→      case 'knowledge_search':
+   427→        result = await executeKnowledgeSearch(safeArgs)
+   428→        break
+   429→      case 'knowledge_graph':
+   430→        result = await executeKnowledgeGraph(safeArgs)
+   431→        break
+   432→      case 'knowledge_write':
+   433→        result = await executeKnowledgeWrite(safeArgs)
+   434→        break
+   435→      case 'tavily':
+   436→        result = await executeTavily(safeArgs)
+   437→        break
+   438→      case 'serper':
+   439→        result = await executeSerper(safeArgs)
+   440→        break
+   441→      case 'jina':
+   442→        result = await executeJina(safeArgs)
+   443→        break
+   444→      default: {
+   445→        // V2: Route to Gateway HTTP, Bridge, or error
+   446→        // 1. Try Gateway HTTP for HTTP-accessible tools
+   447→        if (GATEWAY_HTTP_ALLOWED_TOOLS.has(toolName)) {
+   448→          try {
+   449→            const gwResult = await executeGatewayTool(toolName, safeArgs)
+   450→            return { success: true, result: gwResult, duration: Date.now() - startTime }
+   451→          } catch (gwErr) {
+   452→            return {
+   453→              success: false,
+   454→              result: `Gateway tool "${toolName}" failed: ${gwErr instanceof Error ? gwErr.message : String(gwErr)}`,
+   455→              duration: Date.now() - startTime,
+   456→            }
+   457→          }
+   458→        }
+   459→        // 2. Try Gateway Bridge for session-context tools (exec, read, write, image_generate, etc.)
+   460→        if (GATEWAY_BRIDGE_TOOLS.has(toolName)) {
+   461→          try {
+   462→            const bridgeResult = await executeBridgeTool(toolName, safeArgs)
+   463→            return { success: true, result: bridgeResult, duration: Date.now() - startTime }
+   464→          } catch (bridgeErr) {
+   465→            return {
+   466→              success: false,
+   467→              result: `Bridge tool "${toolName}" failed: ${bridgeErr instanceof Error ? bridgeErr.message : String(bridgeErr)}`,
+   468→              duration: Date.now() - startTime,
+   469→            }
+   470→          }
+   471→        }
+   472→        return { success: false, result: `Unknown tool: ${toolName}. Available: local(7) + Gateway HTTP(${GATEWAY_HTTP_ALLOWED_TOOLS.size}) + Bridge(${GATEWAY_BRIDGE_TOOLS.size}) = ${7 + GATEWAY_HTTP_ALLOWED_TOOLS.size + GATEWAY_BRIDGE_TOOLS.size} tools total`, duration: Date.now() - startTime }
+   473→      }
+   474→    }
+   475→
+   476→    return {
+   477→      success: true,
+   478→      result,
+   479→      duration: Date.now() - startTime,
+   480→    }
+   481→  } catch (err) {
+   482→    const errorMsg = err instanceof Error ? err.message : String(err)
+   483→    console.error(`[ToolExecutor] Error executing ${toolName}:`, errorMsg)
+   484→    return {
+   485→      success: false,
+   486→      result: `Tool error: ${errorMsg}`,
+   487→      duration: Date.now() - startTime,
+   488→    }
+   489→  }
+   490→}
+   491→
+   492→// ==================== INDIVIDUAL TOOL IMPLEMENTATIONS ====================
+   493→
+   494→/**
+   495→ * OpenCode — Code operations (read, write, bash, mkdir)
+   496→ *
+   497→ * Uses the OpenCode API server (configured via OPENCODE_SERVER_URL env var) if available,
+   498→ * otherwise falls back to direct file system operations via the project API.
+   499→ */
+   500→async function executeOpenCode(args: Record<string, unknown>): Promise<unknown> {
+   501→  const action = args.action as string
+   502→  const path = args.path as string | undefined
+   503→  const content = args.content as string | undefined
+   504→  const command = args.command as string | undefined
+   505→
+   506→  // Try OpenCode server first
+   507→  try {
+   508→    const opencodeUrl = process.env.OPENCODE_SERVER_URL || 'http://localhost:18790'
+   509→    const res = await fetch(`${opencodeUrl}/api/execute`, {
+   510→      method: 'POST',
+   511→      headers: { 'Content-Type': 'application/json' },
+   512→      body: JSON.stringify({ action, path, content, command }),
+   513→      signal: AbortSignal.timeout(30000),
+   514→    })
+   515→
+   516→    if (res.ok) {
+   517→      const data = await res.json()
+   518→      return data
+   519→    }
+   520→  } catch {
+   521→    // OpenCode server not available, fall through to direct implementation
+   522→  }
+   523→
+   524→  // Fallback: Use the project's own API for file operations
+   525→  switch (action) {
+   526→    case 'read':
+   527→      return await executeFileRead(path || '')
+   528→    case 'write':
+   529→      return await executeFileWrite(path || '', content || '')
+   530→    case 'bash':
+   531→      return await executeBash(command || '')
+   532→    case 'mkdir':
+   533→      return { success: true, message: `mkdir not needed — write will create parent dirs` }
+   534→    default:
+   535→      return { success: false, error: `Unknown opencode action: ${action}` }
+   536→  }
+   537→}
+   538→
+   539→/**
+   540→ * Read a file from the project directory.
+   541→ * Security: Only allows reading files within the project root.
+   542→ * Uses path.resolve + startsWith check to prevent path traversal.
+   543→ */
+   544→async function executeFileRead(filePath: string): Promise<{ success: boolean; content?: string; error?: string }> {
+   545→  if (!filePath) return { success: false, error: 'Path is required' }
+   546→
+   547→  try {
+   548→    const pathModule = await import('path')
+   549→    const projectRoot = process.cwd()
+   550→    const resolvedPath = pathModule.resolve(projectRoot, filePath)
+   551→
+   552→    // Security: Prevent path traversal — resolved path must be within project root
+   553→    if (!resolvedPath.startsWith(projectRoot + pathModule.sep) && resolvedPath !== projectRoot) {
+   554→      return { success: false, error: `Access denied: path escapes project root` }
+   555→    }
+   556→
+   557→    const fs = await import('fs/promises')
+   558→    const content = await fs.readFile(resolvedPath, 'utf-8')
+   559→
+   560→    // Limit output to prevent overwhelming LLM context
+   561→    const maxChars = 50000
+   562→    const truncated = content.length > maxChars
+   563→    const output = truncated ? content.slice(0, maxChars) + '\n\n... [TRUNCATED — file too large]' : content
+   564→
+   565→    return { success: true, content: output }
+   566→  } catch (err) {
+   567→    return {
+   568→      success: false,
+   569→      error: `Failed to read ${filePath}: ${err instanceof Error ? err.message : String(err)}`,
+   570→    }
+   571→  }
+   572→}
+   573→
+   574→/**
+   575→ * Write a file to the project directory.
+   576→ * Security: Only allows writing within the project root. Uses path.resolve to prevent traversal.
+   577→ * Auto-creates parent directories.
+   578→ */
+   579→async function executeFileWrite(filePath: string, content: string): Promise<{ success: boolean; message: string; error?: string }> {
+   580→  if (!filePath) return { success: false, message: '', error: 'Path is required' }
+   581→  if (!content) return { success: false, message: '', error: 'Content is required' }
+   582→
+   583→  try {
+   584→    const pathModule = await import('path')
+   585→    const projectRoot = process.cwd()
+   586→    const resolvedPath = pathModule.resolve(projectRoot, filePath)
+   587→
+   588→    // Security: Prevent path traversal — resolved path must be within project root
+   589→    if (!resolvedPath.startsWith(projectRoot + pathModule.sep) && resolvedPath !== projectRoot) {
+   590→      return { success: false, message: '', error: 'Access denied: path escapes project root' }
+   591→    }
+   592→
+   593→    const fs = await import('fs/promises')
+   594→
+   595→    // Auto-create parent directories
+   596→    const dir = pathModule.dirname(resolvedPath)
+   597→    await fs.mkdir(dir, { recursive: true })
+   598→
+   599→    // Write file
+   600→    await fs.writeFile(resolvedPath, content, 'utf-8')
+   601→
+   602→    return { success: true, message: `File written: ${filePath} (${content.length} chars)` }
+   603→  } catch (err) {
+   604→    return {
+   605→      success: false,
+   606→      message: '',
+   607→      error: `Failed to write ${filePath}: ${err instanceof Error ? err.message : String(err)}`,
+   608→    }
+   609→  }
+   610→}
+   611→
+   612→/**
+   613→ * Execute a bash command safely.
+   614→ * Security: Only allows pre-approved commands.
+   615→ */
+   616→async function executeBash(command: string): Promise<{ success: boolean; output?: string; error?: string }> {
+   617→  if (!command) return { success: false, error: 'Command is required' }
+   618→
+   619→  // Security: Whitelist of allowed commands
+   620→  // NOTE: 'node' is excluded because `node -e "..."` can execute arbitrary code.
+   621→  //       'cat'/'head'/'tail'/'grep' are excluded — use opencode read instead.
+   622→  //       'npx'/'bunx' are excluded — can download+execute arbitrary npm packages.
+   623→  const allowedPrefixes = [
+   624→    'npm run',
+   625→    'npm test',
+   626→    'npm lint',
+   627→    'bun run',
+   628→    'bun test',
+   629→    'bun lint',
+   630→    'tsc',
+   631→    'eslint',
+   632→    'prettier',
+   633→    'echo',
+   634→    'ls',
+   635→    'wc',
+   636→    'rg',       // ripgrep — search only
+   637→    'which',
+   638→    'pwd',
+   639→    'prisma',
+   640→    'git status',
+   641→    'git diff',
+   642→    'git log',
+   643→  ]
+   644→
+   645→  // Block dangerous flags that could allow code execution or file access
+   646→  const dangerousFlags = ['-e ', '--eval ', '-r ', '--require ', '-p ', '--print ']
+   647→  const normalizedCmd = command.trim()
+   648→  const isAllowed = allowedPrefixes.some(prefix => normalizedCmd.startsWith(prefix))
+   649→  const usesDangerousFlag = dangerousFlags.some(flag => normalizedCmd.includes(flag))
+   650→
+   651→  // Security: Block shell metacharacters that enable command chaining/injection
+   652→  // These allow bypassing the whitelist by chaining additional commands:
+   653→  //   "npm run build; rm -rf /"   →  ;  chains commands
+   654→  //   "git status && cat /etc/p"  →  && chains on success
+   655→  //   "echo hi | bash"            →  |  pipes output
+   656→  //   "tsc || rm -rf /"           →  || chains on failure
+   657→  //   "echo $(cat /etc/passwd)"   →  $() command substitution
+   658→  //   "echo `cat /etc/passwd`"    →  backtick command substitution
+   659→  //   "echo hi > /etc/passwd"     →  >  redirect write
+   660→  //   "echo hi >> /etc/passwd"    →  >> redirect append
+   661→  const shellMetacharacters = /(;|&&|\|\||\||`|\$\(|\$\{|>|>>)/
+   662→  const usesShellMetacharacters = shellMetacharacters.test(normalizedCmd)
+   663→
+   664→  if (!isAllowed || usesDangerousFlag || usesShellMetacharacters) {
+   665→    return {
+   666→      success: false,
+   667→      error: `Command not allowed: "${normalizedCmd.slice(0, 100)}". ${!isAllowed ? 'Prefix not in whitelist.' : ''} ${usesDangerousFlag ? 'Dangerous flag detected.' : ''} ${usesShellMetacharacters ? 'Shell metacharacter (;, &&, ||, |, `, $(), >, >>) detected — command chaining is forbidden.' : ''}`,
+   668→    }
+   669→  }
+   670→
+   671→  try {
+   672→    const { exec } = await import('child_process')
+   673→    const { promisify } = await import('util')
+   674→    const execAsync = promisify(exec)
+   675→
+   676→    const { stdout, stderr } = await execAsync(normalizedCmd, {
+   677→      cwd: process.cwd(),
+   678→      timeout: 30000,
+   679→      maxBuffer: 1024 * 1024, // 1MB
+   680→    })
+   681→
+   682→    const output = [
+   683→      stdout ? `STDOUT:\n${stdout}` : '',
+   684→      stderr ? `STDERR:\n${stderr}` : '',
+   685→    ].filter(Boolean).join('\n')
+   686→
+   687→    return { success: true, output: output || '(no output)' }
+   688→  } catch (err) {
+   689→    const error = err as { stdout?: string; stderr?: string; message?: string }
+   690→    const output = [
+   691→      error.stdout ? `STDOUT:\n${error.stdout}` : '',
+   692→      error.stderr ? `STDERR:\n${error.stderr}` : '',
+   693→    ].filter(Boolean).join('\n')
+   694→
+   695→    return {
+   696→      success: false,
+   697→      output: output || undefined,
+   698→      error: `Command failed: ${error.message}`,
+   699→    }
+   700→  }
+   701→}
+   702→
+   703→/**
+   704→ * Knowledge Search — Semantic search in KB (Qdrant + Neo4j)
+   705→ * Uses knowledge-bridge which already handles embedding + search.
+   706→ */
+   707→async function executeKnowledgeSearch(args: Record<string, unknown>): Promise<unknown> {
+   708→  const query = args.query as string
+   709→  const topK = Math.min((args.topK as number) || 5, 20)
+   710→
+   711→  if (!query) return { error: 'Query is required' }
+   712→
+   713→  try {
+   714→    const { agentKnowledgeSearch } = await import('@/lib/knowledge-bridge')
+   715→    const result = await agentKnowledgeSearch(query, { topK })
+   716→
+   717→    return {
+   718→      results: result.results.slice(0, topK),
+   719→      answer: result.answer,
+   720→      totalFound: result.results.length,
+   721→    }
+   722→  } catch (err) {
+   723→    return { error: `Knowledge search failed: ${err instanceof Error ? err.message : String(err)}` }
+   724→  }
+   725→}
+   726→
+   727→/**
+   728→ * Knowledge Graph — Neo4j Cypher query (read-only)
+   729→ * Enforces read-only at client level BEFORE sending to knowledge-bridge.
+   730→ * Only MATCH, RETURN, WHERE, WITH, ORDER BY, LIMIT, SKIP, DISTINCT are allowed.
+   731→ */
+   732→async function executeKnowledgeGraph(args: Record<string, unknown>): Promise<unknown> {
+   733→  const query = args.query as string
+   734→
+   735→  if (!query) return { error: 'Cypher query is required' }
+   736→
+   737→  // Security: Enforce read-only at client level
+   738→  // Block any write/mutation Cypher keywords (case-insensitive)
+   739→  const writeKeywords = /\b(CREATE|DELETE|SET|MERGE|DROP|REMOVE|DETACH|CALL\s*\{.*\}\s*IN\s+TRANSACTION)\b/i
+   740→  if (writeKeywords.test(query)) {
+   741→    return { error: 'Only read-only Cypher queries (MATCH) are allowed. Write operations (CREATE, DELETE, SET, MERGE, DROP, REMOVE) are forbidden.' }
+   742→  }
+   743→
+   744→  try {
+   745→    const { agentGraphQuery } = await import('@/lib/knowledge-bridge')
+   746→    const result = await agentGraphQuery(query)
+   747→
+   748→    return {
+   749→      records: result.records,
+   750→      count: result.count,
+   751→      error: result.error,
+   752→    }
+   753→  } catch (err) {
+   754→    return { error: `Graph query failed: ${err instanceof Error ? err.message : String(err)}` }
+   755→  }
+   756→}
+   757→
+   758→/**
+   759→ * Knowledge Write — Write entity/relationship to KB
+   760→ * Uses knowledge-bridge which writes to SQLite buffer (syncs to Neo4j later).
+   761→ * Only G3 (CATALYST) has this permission.
+   762→ */
+   763→async function executeKnowledgeWrite(args: Record<string, unknown>): Promise<unknown> {
+   764→  const entityName = args.entityName as string
+   765→  const entityType = args.entityType as string
+   766→  const description = args.description as string
+   767→  const category = args.category as string
+   768→  const relationshipType = args.relationshipType as string | undefined
+   769→  const targetEntityName = args.targetEntityName as string | undefined
+   770→
+   771→  if (!entityName || !entityType || !description || !category) {
+   772→    return { error: 'entityName, entityType, description, and category are required' }
+   773→  }
+   774→
+   775→  try {
+   776→    const { agentWriteEntity, agentWriteRelationship } = await import('@/lib/knowledge-bridge')
+   777→
+   778→    // Write entity
+   779→    const entity = await agentWriteEntity({
+   780→      entityName,
+   781→      entityType,
+   782→      description,
+   783→      domain: category,
+   784→    })
+   785→
+   786→    // Write relationship if specified
+   787→    let relationship: { id: string; type: string } | null = null
+   788→    if (relationshipType && targetEntityName) {
+   789→      const rel = await agentWriteRelationship({
+   790→        sourceEntityName: entityName,
+   791→        targetEntityName,
+   792→        relationshipType,
+   793→        description: `${entityName} ${relationshipType} ${targetEntityName}`,
+   794→      })
+   795→      relationship = { id: rel.id, type: rel.type }
+   796→    }
+   797→
+   798→    return {
+   799→      entity: { id: entity.id, name: entity.entityName },
+   800→      relationship,
+   801→      message: `Đã ghi entity "${entityName}" vào KB${relationship ? ` + relationship "${relationshipType}" → ${targetEntityName}` : ''}`,
+   802→    }
+   803→  } catch (err) {
+   804→    return { error: `Knowledge write failed: ${err instanceof Error ? err.message : String(err)}` }
+   805→  }
+   806→}
+   807→
+   808→// ==================== KEY RETRY HELPER ====================
+   809→
+   810→/**
+   811→ * Retry a service call with the next available key from the pool.
+   812→ * Called when the first key fails — tries remaining keys before falling back to SDK.
+   813→ *
+   814→ * @param service - 'tavily' | 'serper' | 'jina'
+   815→ * @param param - The query (for search) or URL (for reader)
+   816→ * @returns Result if a key succeeds, null if all keys fail
+   817→ */
+   818→async function retryWithNextKey(
+   819→  service: 'tavily' | 'serper' | 'jina',
+   820→  param: string
+   821→): Promise<unknown | null> {
+   822→  const pool = service === 'tavily' ? tavilyKeyPool : service === 'serper' ? serperKeyPool : jinaKeyPool
+   823→  const maxRetries = pool.getTotalCount() - 1 // Already tried 1 key
+   824→
+   825→  for (let i = 0; i < maxRetries; i++) {
+   826→    const nextKey = pool.getNextKey()
+   827→    if (!nextKey || nextKey.isLastResort) break // No more healthy keys
+   828→
+   829→    console.log(`[ToolExecutor] ${service} retrying with key ${nextKey.index + 1}...`)
+   830→
+   831→    try {
+   832→      let res: Response
+   833→
+   834→      if (service === 'tavily') {
+   835→        res = await fetch('https://api.tavily.com/search', {
+   836→          method: 'POST',
+   837→          headers: { 'Content-Type': 'application/json' },
+   838→          body: JSON.stringify({
+   839→            api_key: nextKey.key,
+   840→            query: param,
+   841→            search_depth: 'advanced',
+   842→            include_answer: true,
+   843→            max_results: 5,
+   844→          }),
+   845→          signal: AbortSignal.timeout(30000),
+   846→        })
+   847→      } else if (service === 'serper') {
+   848→        res = await fetch('https://google.serper.dev/search', {
+   849→          method: 'POST',
+   850→          headers: {
+   851→            'X-API-KEY': nextKey.key,
+   852→            'Content-Type': 'application/json',
+   853→          },
+   854→          body: JSON.stringify({ q: param, num: 5 }),
+   855→          signal: AbortSignal.timeout(15000),
+   856→        })
+   857→      } else {
+   858→        // Jina
+   859→        const headers: Record<string, string> = { 'Accept': 'text/plain' }
+   860→        if (nextKey.key) headers['Authorization'] = `Bearer ${nextKey.key}`
+   861→        res = await fetch(`https://r.jina.ai/${param}`, {
+   862→          method: 'GET',
+   863→          headers,
+   864→          signal: AbortSignal.timeout(30000),
+   865→        })
+   866→      }
+   867→
+   868→      if (res.ok) {
+   869→        pool.reportResult(nextKey.index, true, res.status)
+   870→        console.log(`[ToolExecutor] ${service} key ${nextKey.index + 1} succeeded on retry`)
+   871→
+   872→        if (service === 'tavily') {
+   873→          const data = await res.json()
+   874→          return {
+   875→            answer: data.answer,
+   876→            results: (data.results || []).map((r: Record<string, unknown>) => ({
+   877→              title: r.title, url: r.url, content: r.content, score: r.score,
+   878→            })),
+   879→            source: `tavily-key${nextKey.index + 1}`,
+   880→          }
+   881→        } else if (service === 'serper') {
+   882→          const data = await res.json()
+   883→          return {
+   884→            organic: (data.organic || []).map((r: Record<string, unknown>) => ({
+   885→              title: r.title, link: r.link, snippet: r.snippet,
+   886→            })),
+   887→            knowledgeGraph: data.knowledgeGraph || null,
+   888→            source: `serper-key${nextKey.index + 1}`,
+   889→          }
+   890→        } else {
+   891→          // Jina
+   892→          const text = await res.text()
+   893→          const maxChars = 30000
+   894→          const truncated = text.length > maxChars
+   895→          const content = truncated ? text.slice(0, maxChars) + '\n\n... [TRUNCATED — page too long]' : text
+   896→          return {
+   897→            url: param, content, length: text.length, truncated,
+   898→            source: `jina-key${nextKey.index + 1}`,
+   899→          }
+   900→        }
+   901→      }
+   902→
+   903→      // This key also failed — report and try next
+   904→      const errorBody = await res.text().catch(() => '')
+   905→      pool.reportResult(nextKey.index, false, res.status, `HTTP ${res.status}: ${errorBody.slice(0, 200)}`)
+   906→      console.warn(`[ToolExecutor] ${service} key ${nextKey.index + 1} also failed: ${res.status}`)
+   907→    } catch (err) {
+   908→      const errMsg = err instanceof Error ? err.message : String(err)
+   909→      pool.reportResult(nextKey.index, false, undefined, errMsg)
+   910→      console.warn(`[ToolExecutor] ${service} key ${nextKey.index + 1} exception: ${errMsg}`)
+   911→    }
+   912→  }
+   913→
+   914→  return null // All keys failed
+   915→}
+   916→
+   917→/**
+   918→ * Tavily — AI-optimized web search
+   919→ * Uses ServiceKeyPool for multi-key rotation with automatic fallback.
+   920→ * Primary: Direct Tavily API with rotating keys from pool
+   921→ * Fallback: z-ai-web-dev-sdk web_search function (Clawhub Market skill)
+   922→ */
+   923→async function executeTavily(args: Record<string, unknown>): Promise<unknown> {
+   924→  const query = args.query as string
+   925→  if (!query) return { error: 'Query is required' }
+   926→
+   927→  // Primary: Direct Tavily API with key pool rotation
+   928→  if (tavilyKeyPool.hasKeys()) {
+   929→    const keySelection = tavilyKeyPool.getNextKey()
+   930→    if (keySelection) {
+   931→      try {
+   932→        const res = await fetch('https://api.tavily.com/search', {
+   933→          method: 'POST',
+   934→          headers: { 'Content-Type': 'application/json' },
+   935→          body: JSON.stringify({
+   936→            api_key: keySelection.key,
+   937→            query,
+   938→            search_depth: 'advanced',
+   939→            include_answer: true,
+   940→            max_results: 5,
+   941→          }),
+   942→          signal: AbortSignal.timeout(30000),
+   943→        })
+   944→
+   945→        if (res.ok) {
+   946→          tavilyKeyPool.reportResult(keySelection.index, true, res.status)
+   947→          const data = await res.json()
+   948→          return {
+   949→            answer: data.answer,
+   950→            results: (data.results || []).map((r: Record<string, unknown>) => ({
+   951→              title: r.title,
+   952→              url: r.url,
+   953→              content: r.content,
+   954→              score: r.score,
+   955→            })),
+   956→            source: `tavily-key${keySelection.index + 1}`,
+   957→          }
+   958→        }
+   959→
+   960→        // API returned error status — report to pool and try next key
+   961→        const errorBody = await res.text().catch(() => '')
+   962→        tavilyKeyPool.reportResult(keySelection.index, false, res.status, `HTTP ${res.status}: ${errorBody.slice(0, 200)}`)
+   963→        console.warn(`[ToolExecutor] Tavily key ${keySelection.index + 1} error: ${res.status}`)
+   964→
+   965→        // Try remaining keys before falling back to SDK
+   966→        const retryResult = await retryWithNextKey('tavily', query)
+   967→        if (retryResult) return retryResult
+   968→      } catch (err) {
+   969→        const errMsg = err instanceof Error ? err.message : String(err)
+   970→        tavilyKeyPool.reportResult(keySelection.index, false, undefined, errMsg)
+   971→        console.warn(`[ToolExecutor] Tavily key ${keySelection.index + 1} failed: ${errMsg}`)
+   972→
+   973→        // Try remaining keys before falling back to SDK
+   974→        const retryResult = await retryWithNextKey('tavily', query)
+   975→        if (retryResult) return retryResult
+   976→      }
+   977→    }
+   978→  }
+   979→
+   980→  // Fallback: z-ai-web-dev-sdk web_search
+   981→  try {
+   982→    const zai = await getZAI()
+   983→    if (zai) {
+   984→      const results = await zai.functions.invoke('web_search', { query, num: 5 })
+   985→      if (Array.isArray(results) && results.length > 0) {
+   986→        return {
+   987→          answer: null,
+   988→          results: results.map((r: any) => ({
+   989→            title: r.name || r.title,
+   990→            url: r.url,
+   991→            content: r.snippet || r.content,
+   992→            score: r.rank || null,
+   993→          })),
+   994→          source: 'z-ai-sdk-web_search',
+   995→        }
+   996→      }
+   997→    }
+   998→  } catch (err) {
+   999→    console.warn(`[ToolExecutor] z-ai-sdk web_search fallback failed: ${err instanceof Error ? err.message : String(err)}`)
+  1000→  }
+  1001→
+  1002→  return {
+  1003→    error: 'Tavily search failed and no fallback available.',
+  1004→    hint: !tavilyKeyPool.hasKeys() ? 'Add TAVILY_API_KEY_1..4 to .env' : `All ${tavilyKeyPool.getTotalCount()} keys failed (${tavilyKeyPool.getAvailableCount()} available)`,
+  1005→    poolStatus: tavilyKeyPool.getSummary(),
+  1006→  }
+  1007→}
+  1008→
+  1009→/**
+  1010→ * Serper — Google Search API
+  1011→ * Uses ServiceKeyPool for multi-key rotation with automatic fallback.
+  1012→ * Primary: Direct Serper API with rotating keys from pool
+  1013→ * Fallback: z-ai-web-dev-sdk web_search function (Clawhub Market skill)
+  1014→ */
+  1015→async function executeSerper(args: Record<string, unknown>): Promise<unknown> {
+  1016→  const query = args.query as string
+  1017→  if (!query) return { error: 'Query is required' }
+  1018→
+  1019→  // Primary: Direct Serper API with key pool rotation
+  1020→  if (serperKeyPool.hasKeys()) {
+  1021→    const keySelection = serperKeyPool.getNextKey()
+  1022→    if (keySelection) {
+  1023→      try {
+  1024→        const res = await fetch('https://google.serper.dev/search', {
+  1025→          method: 'POST',
+  1026→          headers: {
+  1027→            'X-API-KEY': keySelection.key,
+  1028→            'Content-Type': 'application/json',
+  1029→          },
+  1030→          body: JSON.stringify({
+  1031→            q: query,
+  1032→            num: 5,
+  1033→          }),
+  1034→          signal: AbortSignal.timeout(15000),
+  1035→        })
+  1036→
+  1037→        if (res.ok) {
+  1038→          serperKeyPool.reportResult(keySelection.index, true, res.status)
+  1039→          const data = await res.json()
+  1040→          return {
+  1041→            organic: (data.organic || []).map((r: Record<string, unknown>) => ({
+  1042→              title: r.title,
+  1043→              link: r.link,
+  1044→              snippet: r.snippet,
+  1045→            })),
+  1046→            knowledgeGraph: data.knowledgeGraph || null,
+  1047→            source: `serper-key${keySelection.index + 1}`,
+  1048→          }
+  1049→        }
+  1050→
+  1051→        // API returned error status — report to pool and try next key
+  1052→        const errorBody = await res.text().catch(() => '')
+  1053→        serperKeyPool.reportResult(keySelection.index, false, res.status, `HTTP ${res.status}: ${errorBody.slice(0, 200)}`)
+  1054→        console.warn(`[ToolExecutor] Serper key ${keySelection.index + 1} error: ${res.status}`)
+  1055→
+  1056→        // Try remaining keys before falling back to SDK
+  1057→        const retryResult = await retryWithNextKey('serper', query)
+  1058→        if (retryResult) return retryResult
+  1059→      } catch (err) {
+  1060→        const errMsg = err instanceof Error ? err.message : String(err)
+  1061→        serperKeyPool.reportResult(keySelection.index, false, undefined, errMsg)
+  1062→        console.warn(`[ToolExecutor] Serper key ${keySelection.index + 1} failed: ${errMsg}`)
+  1063→
+  1064→        // Try remaining keys before falling back to SDK
+  1065→        const retryResult = await retryWithNextKey('serper', query)
+  1066→        if (retryResult) return retryResult
+  1067→      }
+  1068→    }
+  1069→  }
+  1070→
+  1071→  // Fallback: z-ai-web-dev-sdk web_search
+  1072→  try {
+  1073→    const zai = await getZAI()
+  1074→    if (zai) {
+  1075→      const results = await zai.functions.invoke('web_search', { query, num: 5 })
+  1076→      if (Array.isArray(results) && results.length > 0) {
+  1077→        return {
+  1078→          organic: results.map((r: any) => ({
+  1079→            title: r.name || r.title,
+  1080→            link: r.url,
+  1081→            snippet: r.snippet || '',
+  1082→          })),
+  1083→          knowledgeGraph: null,
+  1084→          source: 'z-ai-sdk-web_search',
+  1085→        }
+  1086→      }
+  1087→    }
+  1088→  } catch (err) {
+  1089→    console.warn(`[ToolExecutor] z-ai-sdk web_search fallback failed: ${err instanceof Error ? err.message : String(err)}`)
+  1090→  }
+  1091→
+  1092→  return {
+  1093→    error: 'Serper search failed and no fallback available.',
+  1094→    hint: !serperKeyPool.hasKeys() ? 'Add SERPER_API_KEY_1..4 to .env' : `All ${serperKeyPool.getTotalCount()} keys failed (${serperKeyPool.getAvailableCount()} available)`,
+  1095→    poolStatus: serperKeyPool.getSummary(),
+  1096→  }
+  1097→}
+  1098→
+  1099→/**
+  1100→ * Jina — Web page reader
+  1101→ * Uses ServiceKeyPool for multi-key rotation with automatic fallback.
+  1102→ * Primary: Direct Jina API with rotating keys from pool
+  1103→ * Fallback: z-ai-web-dev-sdk page_reader function (Clawhub Market skill)
+  1104→ */
+  1105→async function executeJina(args: Record<string, unknown>): Promise<unknown> {
+  1106→  const url = args.url as string
+  1107→  if (!url) return { error: 'URL is required' }
+  1108→
+  1109→  // Validate URL
+  1110→  try {
+  1111→    new URL(url)
+  1112→  } catch {
+  1113→    return { error: `Invalid URL: ${url}` }
+  1114→  }
+  1115→
+  1116→  // Primary: Direct Jina API with key pool rotation
+  1117→  if (jinaKeyPool.hasKeys()) {
+  1118→    const keySelection = jinaKeyPool.getNextKey()
+  1119→    if (keySelection) {
+  1120→      try {
+  1121→        const headers: Record<string, string> = {
+  1122→          'Accept': 'text/plain',
+  1123→        }
+  1124→        if (keySelection.key) {
+  1125→          headers['Authorization'] = `Bearer ${keySelection.key}`
+  1126→        }
+  1127→
+  1128→        const res = await fetch(`https://r.jina.ai/${url}`, {
+  1129→          method: 'GET',
+  1130→          headers,
+  1131→          signal: AbortSignal.timeout(30000),
+  1132→        })
+  1133→
+  1134→        if (res.ok) {
+  1135→          jinaKeyPool.reportResult(keySelection.index, true, res.status)
+  1136→          const text = await res.text()
+  1137→
+  1138→          // Limit output to prevent overwhelming LLM context
+  1139→          const maxChars = 30000
+  1140→          const truncated = text.length > maxChars
+  1141→          const content = truncated ? text.slice(0, maxChars) + '\n\n... [TRUNCATED — page too long]' : text
+  1142→
+  1143→          return {
+  1144→            url,
+  1145→            content,
+  1146→            length: text.length,
+  1147→            truncated,
+  1148→            source: `jina-key${keySelection.index + 1}`,
+  1149→          }
+  1150→        }
+  1151→
+  1152→        // API returned error status — report to pool and try next key
+  1153→        const errorBody = await res.text().catch(() => '')
+  1154→        jinaKeyPool.reportResult(keySelection.index, false, res.status, `HTTP ${res.status}: ${errorBody.slice(0, 200)}`)
+  1155→        console.warn(`[ToolExecutor] Jina key ${keySelection.index + 1} error: ${res.status}`)
+  1156→
+  1157→        // Try remaining keys before falling back to SDK
+  1158→        const retryResult = await retryWithNextKey('jina', url)
+  1159→        if (retryResult) return retryResult
+  1160→      } catch (err) {
+  1161→        const errMsg = err instanceof Error ? err.message : String(err)
+  1162→        jinaKeyPool.reportResult(keySelection.index, false, undefined, errMsg)
+  1163→        console.warn(`[ToolExecutor] Jina key ${keySelection.index + 1} failed: ${errMsg}`)
+  1164→
+  1165→        // Try remaining keys before falling back to SDK
+  1166→        const retryResult = await retryWithNextKey('jina', url)
+  1167→        if (retryResult) return retryResult
+  1168→      }
+  1169→    }
+  1170→  }
+  1171→
+  1172→  // Fallback: z-ai-web-dev-sdk page_reader
+  1173→  try {
+  1174→    const zai = await getZAI()
+  1175→    if (zai) {
+  1176→      const result = await zai.functions.invoke('page_reader', { url })
+  1177→      if (result?.data?.html) {
+  1178→        // Convert HTML to clean text
+  1179→        const text = result.data.html
+  1180→          .replace(/<script[^>]*>[\s\S]*?<\/script>/gi, '')
+  1181→          .replace(/<style[^>]*>[\s\S]*?<\/style>/gi, '')
+  1182→          .replace(/<[^>]*>/g, ' ')
+  1183→          .replace(/&nbsp;/g, ' ')
+  1184→          .replace(/&amp;/g, '&')
+  1185→          .replace(/&lt;/g, '<')
+  1186→          .replace(/&gt;/g, '>')
+  1187→          .replace(/\s+/g, ' ')
+  1188→          .trim()
+  1189→
+  1190→        const maxChars = 30000
+  1191→        const truncated = text.length > maxChars
+  1192→        const content = truncated ? text.slice(0, maxChars) + '\n\n... [TRUNCATED — page too long]' : text
+  1193→
+  1194→        return {
+  1195→          url,
+  1196→          title: result.data.title || null,
+  1197→          content,
+  1198→          length: text.length,
+  1199→          truncated,
+  1200→          source: 'z-ai-sdk-page_reader',
+  1201→        }
+  1202→      }
+  1203→    }
+  1204→  } catch (err) {
+  1205→    console.warn(`[ToolExecutor] z-ai-sdk page_reader fallback failed: ${err instanceof Error ? err.message : String(err)}`)
+  1206→  }
+  1207→
+  1208→  return {
+  1209→    error: 'Jina reader failed and no fallback available.',
+  1210→    hint: !jinaKeyPool.hasKeys() ? 'Add JINA_API_KEY_1..2 to .env' : `All ${jinaKeyPool.getTotalCount()} keys failed (${jinaKeyPool.getAvailableCount()} available)`,
+  1211→    poolStatus: jinaKeyPool.getSummary(),
+  1212→  }
+  1213→}
+  1214→
+  1215→// ==================== SKILL STATUS CHECK ====================
+  1216→
+  1217→/**
+  1218→ * Check which skills are available based on environment configuration.
+  1219→ * Used by the test endpoint and diagnostics.
+  1220→ *
+  1221→ * Skills are available if:
+  1222→ *   - Direct API key is set in .env (primary method)
+  1223→ *   - z-ai-web-dev-sdk is initialized (fallback method)
+  1224→ */
+  1225→export interface SkillStatus {
+  1226→  skill: string
+  1227→  directKey: boolean      // At least one API key available in pool
+  1228→  totalKeys: number       // Total keys in pool
+  1229→  availableKeys: number   // Keys not in cooldown/disabled
+  1230→  zaiFallback: boolean | null  // null = not yet checked, true/false = checked
+  1231→  available: boolean      // true if either direct key or z-ai fallback works
+  1232→  keyHint: string         // Hint about which env var to set
+  1233→  poolSummary?: string    // Key pool status summary
+  1234→}
+  1235→
+  1236→export function getSkillStatus(): SkillStatus[] {
+  1237→  return [
+  1238→    {
+  1239→      skill: 'tavily',
+  1240→      directKey: tavilyKeyPool.hasKeys(),
+  1241→      totalKeys: tavilyKeyPool.getTotalCount(),
+  1242→      availableKeys: tavilyKeyPool.getAvailableCount(),
+  1243→      zaiFallback: zaiAvailable,
+  1244→      available: tavilyKeyPool.getAvailableCount() > 0 || zaiAvailable === true,
+  1245→      keyHint: 'TAVILY_API_KEY_1..4',
+  1246→      poolSummary: tavilyKeyPool.getSummary(),
+  1247→    },
+  1248→    {
+  1249→      skill: 'serper',
+  1250→      directKey: serperKeyPool.hasKeys(),
+  1251→      totalKeys: serperKeyPool.getTotalCount(),
+  1252→      availableKeys: serperKeyPool.getAvailableCount(),
+  1253→      zaiFallback: zaiAvailable,
+  1254→      available: serperKeyPool.getAvailableCount() > 0 || zaiAvailable === true,
+  1255→      keyHint: 'SERPER_API_KEY_1..4',
+  1256→      poolSummary: serperKeyPool.getSummary(),
+  1257→    },
+  1258→    {
+  1259→      skill: 'jina',
+  1260→      directKey: jinaKeyPool.hasKeys(),
+  1261→      totalKeys: jinaKeyPool.getTotalCount(),
+  1262→      availableKeys: jinaKeyPool.getAvailableCount(),
+  1263→      zaiFallback: zaiAvailable,
+  1264→      available: jinaKeyPool.getAvailableCount() > 0 || zaiAvailable === true,
+  1265→      keyHint: 'JINA_API_KEY_1..2',
+  1266→      poolSummary: jinaKeyPool.getSummary(),
+  1267→    },
+  1268→  ]
+  1269→}
+  1270→
+  1271→/**
+  1272→ * Check if z-ai-web-dev-sdk has been initialized and is available.
+  1273→ * Returns null if not yet checked, true/false otherwise.
+  1274→ */
+  1275→export function getZaiAvailable(): boolean | null {
+  1276→  return zaiAvailable
+  1277→}
+  1278→
+  1279→// ==================== REACT LOOP HELPER ====================
+  1280→
+  1281→/**
+  1282→ * Process a single LLM response — check for tool_calls and execute them.
+  1283→ * Returns array of tool execution results for feeding back to LLM.
+  1284→ *
+  1285→ * This is the core of the ReAct loop:
+  1286→ * 1. LLM returns response with tool_calls
+  1287→ * 2. We execute each tool_call
+  1288→ * 3. Results are fed back as tool messages
+  1289→ * 4. LLM generates next response (may have more tool_calls or final text)
+  1290→ */
+  1291→export async function processToolCalls(
+  1292→  toolCalls: Array<{ id: string; function: { name: string; arguments: string } }>,
+  1293→): Promise<Array<{ toolCallId: string; toolName: string; result: ToolExecutionResult }>> {
+  1294→  const results: Array<{ toolCallId: string; toolName: string; result: ToolExecutionResult }> = []
+  1295→
+  1296→  for (const tc of toolCalls) {
+  1297→    let args: Record<string, unknown> = {}
+  1298→    try {
+  1299→      args = JSON.parse(tc.function.arguments)
+  1300→    } catch {
+  1301→      args = { _parseError: tc.function.arguments }
+  1302→    }
+  1303→
+  1304→    console.log(`[ToolExecutor] Executing: ${tc.function.name}(${JSON.stringify(args).slice(0, 200)})`)
+  1305→
+  1306→    const result = await executeTool(tc.function.name, args)
+  1307→
+  1308→    results.push({
+  1309→      toolCallId: tc.id,
+  1310→      toolName: tc.function.name,
+  1311→      result,
+  1312→    })
+  1313→
+  1314→    console.log(`[ToolExecutor] Result: ${tc.function.name} → ${result.success ? 'OK' : 'FAIL'} (${result.duration}ms)`)
+  1315→  }
+  1316→
+  1317→  return results
+  1318→}
+  1319→
+  1320→/**
+  1321→ * Format tool results into messages for the LLM.
+  1322→ * Each tool result becomes a "tool" role message.
+  1323→ * Note: Duration is excluded from LLM messages to save tokens — LLM doesn't need timing info.
+  1324→ */
+  1325→export function formatToolResultsAsMessages(
+  1326→  results: Array<{ toolCallId: string; toolName: string; result: ToolExecutionResult }>,
+  1327→): Array<{ role: 'tool'; tool_call_id: string; content: string }> {
+  1328→  return results.map(r => ({
+  1329→    role: 'tool' as const,
+  1330→    tool_call_id: r.toolCallId,
+  1331→    content: JSON.stringify({
+  1332→      tool: r.toolName,
+  1333→      success: r.result.success,
+  1334→      result: r.result.result,
+  1335→    }),
+  1336→  }))
+  1337→}
+  1338→

@@ -1,0 +1,11 @@
+{
+  "name": "opencode-server",
+  "version": "1.0.0",
+  "description": "OpenCode-compatible server for Magnum Opus — file ops, bash, LSP diagnostics, MCP bridge",
+  "scripts": {
+    "dev": "bun --hot index.ts"
+  },
+  "dependencies": {
+    "hono": "^4.7.0"
+  }
+}

@@ -1,0 +1,43 @@
+src/lib/execution/process-manager.ts(206,9): error TS2769: No overload matches this call.
+  The last overload gave the following error.
+    Property 'NODE_ENV' is missing in type '{ FORCE_COLOR: string; }' but required in type 'ProcessEnv'.
+src/lib/execution/process-manager.ts(214,13): error TS2339: Property 'stdout' does not exist on type 'never'.
+  The intersection 'ChildProcessWithoutNullStreams & ChildProcessByStdio<Writable, Readable, Readable> & ... 7 more ... & ChildProcess' was reduced to 'never' because property 'stdin' has conflicting types in some constituents.
+src/lib/execution/process-manager.ts(219,13): error TS2339: Property 'stderr' does not exist on type 'never'.
+  The intersection 'ChildProcessWithoutNullStreams & ChildProcessByStdio<Writable, Readable, Readable> & ... 7 more ... & ChildProcess' was reduced to 'never' because property 'stdin' has conflicting types in some constituents.
+src/lib/execution/process-manager.ts(227,19): error TS2339: Property 'pid' does not exist on type 'never'.
+  The intersection 'ChildProcessWithoutNullStreams & ChildProcessByStdio<Writable, Readable, Readable> & ... 7 more ... & ChildProcess' was reduced to 'never' because property 'stdin' has conflicting types in some constituents.
+src/lib/execution/process-manager.ts(228,32): error TS2339: Property 'pid' does not exist on type 'never'.
+  The intersection 'ChildProcessWithoutNullStreams & ChildProcessByStdio<Writable, Readable, Readable> & ... 7 more ... & ChildProcess' was reduced to 'never' because property 'stdin' has conflicting types in some constituents.
+src/lib/execution/process-manager.ts(232,13): error TS2339: Property 'on' does not exist on type 'never'.
+  The intersection 'ChildProcessWithoutNullStreams & ChildProcessByStdio<Writable, Readable, Readable> & ... 7 more ... & ChildProcess' was reduced to 'never' because property 'stdin' has conflicting types in some constituents.
+src/lib/execution/process-manager.ts(254,13): error TS2339: Property 'on' does not exist on type 'never'.
+  The intersection 'ChildProcessWithoutNullStreams & ChildProcessByStdio<Writable, Readable, Readable> & ... 7 more ... & ChildProcess' was reduced to 'never' because property 'stdin' has conflicting types in some constituents.
+src/lib/execution/process-manager.ts(288,9): error TS2769: No overload matches this call.
+  The last overload gave the following error.
+    Property 'NODE_ENV' is missing in type '{ FORCE_COLOR: string; }' but required in type 'ProcessEnv'.
+src/lib/execution/process-manager.ts(302,20): error TS2339: Property 'pid' does not exist on type 'never'.
+  The intersection 'ChildProcessWithoutNullStreams & ChildProcessByStdio<Writable, Readable, Readable> & ... 7 more ... & ChildProcess' was reduced to 'never' because property 'stdin' has conflicting types in some constituents.
+src/lib/execution/process-manager.ts(309,13): error TS2339: Property 'stdout' does not exist on type 'never'.
+  The intersection 'ChildProcessWithoutNullStreams & ChildProcessByStdio<Writable, Readable, Readable> & ... 7 more ... & ChildProcess' was reduced to 'never' because property 'stdin' has conflicting types in some constituents.
+src/lib/execution/process-manager.ts(310,13): error TS2339: Property 'stderr' does not exist on type 'never'.
+  The intersection 'ChildProcessWithoutNullStreams & ChildProcessByStdio<Writable, Readable, Readable> & ... 7 more ... & ChildProcess' was reduced to 'never' because property 'stdin' has conflicting types in some constituents.
+src/lib/execution/process-manager.ts(312,13): error TS2339: Property 'on' does not exist on type 'never'.
+  The intersection 'ChildProcessWithoutNullStreams & ChildProcessByStdio<Writable, Readable, Readable> & ... 7 more ... & ChildProcess' was reduced to 'never' because property 'stdin' has conflicting types in some constituents.
+src/lib/execution/process-manager.ts(314,26): error TS2339: Property 'pid' does not exist on type 'never'.
+  The intersection 'ChildProcessWithoutNullStreams & ChildProcessByStdio<Writable, Readable, Readable> & ... 7 more ... & ChildProcess' was reduced to 'never' because property 'stdin' has conflicting types in some constituents.
+src/lib/execution/process-manager.ts(319,13): error TS2339: Property 'on' does not exist on type 'never'.
+  The intersection 'ChildProcessWithoutNullStreams & ChildProcessByStdio<Writable, Readable, Readable> & ... 7 more ... & ChildProcess' was reduced to 'never' because property 'stdin' has conflicting types in some constituents.
+src/lib/execution/process-manager.ts(326,13): error TS2339: Property 'on' does not exist on type 'never'.
+  The intersection 'ChildProcessWithoutNullStreams & ChildProcessByStdio<Writable, Readable, Readable> & ... 7 more ... & ChildProcess' was reduced to 'never' because property 'stdin' has conflicting types in some constituents.
+src/lib/execution/process-manager.ts(341,28): error TS2339: Property 'pid' does not exist on type 'never'.
+  The intersection 'ChildProcessWithoutNullStreams & ChildProcessByStdio<Writable, Readable, Readable> & ... 7 more ... & ChildProcess' was reduced to 'never' because property 'stdin' has conflicting types in some constituents.
+src/lib/learning/historical-feedback.ts(17,31): error TS2339: Property 'executionMetrics' does not exist on type 'PrismaClient<PrismaClientOptions, never, DefaultArgs>'.
+src/lib/learning/metrics-collector.ts(126,18): error TS2339: Property 'executionMetrics' does not exist on type 'PrismaClient<PrismaClientOptions, never, DefaultArgs>'.
+src/lib/learning/strategy-adapter.ts(234,14): error TS2339: Property 'failurePattern' does not exist on type 'PrismaClient<PrismaClientOptions, never, DefaultArgs>'.
+src/lib/learning/strategy-adapter.ts(268,14): error TS2339: Property 'strategyAdaptationLog' does not exist on type 'PrismaClient<PrismaClientOptions, never, DefaultArgs>'.
+src/lib/state-management/checkpoint-manager.ts(113,31): error TS2339: Property 'codeTeamCheckpoint' does not exist on type 'PrismaClient<PrismaClientOptions, never, DefaultArgs>'.
+src/lib/state-management/checkpoint-manager.ts(147,31): error TS2339: Property 'codeTeamCheckpoint' does not exist on type 'PrismaClient<PrismaClientOptions, never, DefaultArgs>'.
+src/lib/state-management/checkpoint-manager.ts(174,32): error TS2339: Property 'codeTeamCheckpoint' does not exist on type 'PrismaClient<PrismaClientOptions, never, DefaultArgs>'.
+src/lib/state-management/checkpoint-manager.ts(196,31): error TS2339: Property 'codeTeamCheckpoint' does not exist on type 'PrismaClient<PrismaClientOptions, never, DefaultArgs>'.
+src/tests/security/command-validator.test.ts(11,3): error TS2305: Module '"@/lib/security/command-validator"' has no exported member 'ALLOWED_PREFIXES'.
