@@ -5758,24 +5758,116 @@ function SmolabModule({ sidebarOpen }: { sidebarOpen: boolean }) {
   const [activeTaskIds, setActiveTaskIds] = useState<Map<string, string>>(new Map()) // sessionId → taskId
   const [taskPolling, setTaskPolling] = useState(false)
 
-  // Voice mode state — mic recording + TTS playback + voice selection
-  const [isRecording, setIsRecording] = useState(false)
+  // Voice mode state — Live mode with VAD + "Xin hết" command detection
+  const [isLiveMode, setIsLiveMode] = useState(false) // Live toggle (on/off)
+  const [isRecording, setIsRecording] = useState(false) // Currently recording user speech
   const [voiceError, setVoiceError] = useState<string | null>(null)
   const [selectedVoice, setSelectedVoice] = useState<string>(() => {
     try { return localStorage.getItem('smolab-voice') || 'tongtong' } catch { return 'tongtong' }
   })
-  const [isPlaying, setIsPlaying] = useState(false)
+  const [isPlaying, setIsPlaying] = useState(false) // Agent TTS playing
+  const [liveStatus, setLiveStatus] = useState<string>('') // Status text: "Đang nghe...", "Đang xử lý...", "Agent đang trả lời..."
   const mediaRecorderRef = useRef<MediaRecorder | null>(null)
   const audioChunksRef = useRef<Blob[]>([])
   const audioPlaybackRef = useRef<HTMLAudioElement | null>(null)
   const [showVoiceSelect, setShowVoiceSelect] = useState(false)
+  const audioContextRef = useRef<AudioContext | null>(null)
+  const analyserRef = useRef<AnalyserNode | null>(null)
+  const vadIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null)
+  const silenceStartRef = useRef<number>(0) // timestamp when silence started
+  const vadStreamRef = useRef<MediaStream | null>(null) // persistent stream for VAD
+  const isLiveModeRef = useRef(false) // ref mirror for async callbacks
+  const isAgentRespondingRef = useRef(false) // true while waiting for agent / playing TTS
 
-  // Start mic recording
-  const startRecording = useCallback(async () => {
+  const SILENCE_THRESHOLD = 0.01 // audio level below this = silence
+  const SILENCE_DURATION_MS = 1000 // 1s silence → auto-stop + send
+  const STOP_COMMAND = 'xin hết' // lowercase — detected at end of transcription
+
+  // Start VAD (Voice Activity Detection) on the persistent stream
+  const startVAD = useCallback(() => {
+    if (!analyserRef.current || !isLiveModeRef.current) return
+
+    const buffer = new Uint8Array(analyserRef.current.frequencyBinCount)
+    silenceStartRef.current = 0
+
+    vadIntervalRef.current = setInterval(() => {
+      if (!isLiveModeRef.current || isAgentRespondingRef.current) return
+      if (!analyserRef.current) return
+
+      analyserRef.current.getByteFrequencyData(buffer)
+      const avg = buffer.reduce((sum, v) => sum + v, 0) / buffer.length / 255
+
+      if (avg < SILENCE_THRESHOLD) {
+        // Silence detected
+        if (silenceStartRef.current === 0) {
+          silenceStartRef.current = Date.now()
+        } else if (Date.now() - silenceStartRef.current >= SILENCE_DURATION_MS) {
+          // 1s silence reached → stop recording
+          if (mediaRecorderRef.current && mediaRecorderRef.current.state === 'recording') {
+            console.log('[Live] 1s silence detected — stopping recording')
+            mediaRecorderRef.current.stop()
+            setIsRecording(false)
+          }
+        }
+      } else {
+        // Sound detected — reset silence timer
+        silenceStartRef.current = 0
+      }
+    }, 100) // check every 100ms
+  }, [])
+
+  // Stop VAD
+  const stopVAD = useCallback(() => {
+    if (vadIntervalRef.current) {
+      clearInterval(vadIntervalRef.current)
+      vadIntervalRef.current = null
+    }
+  }, [])
+
+  // Start Live mode — opens mic + VAD, continuous listening
+  const startLiveMode = useCallback(async () => {
     setVoiceError(null)
+    setLiveStatus('Đang bật mic...')
+    isLiveModeRef.current = true
+    isAgentRespondingRef.current = false
+
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true })
-      const mediaRecorder = new MediaRecorder(stream, { mimeType: 'audio/webm' })
+      vadStreamRef.current = stream
+
+      // Setup AudioContext for VAD
+      const audioCtx = new AudioContext()
+      audioContextRef.current = audioCtx
+      const source = audioCtx.createMediaStreamSource(stream)
+      const analyser = audioCtx.createAnalyser()
+      analyser.fftSize = 512
+      source.connect(analyser)
+      analyserRef.current = analyser
+
+      // Start VAD
+      startVAD()
+      setIsLiveMode(true)
+      setLiveStatus('🔴 LIVE — Nói vào mic, kết thúc bằng "Xin hết"')
+
+      // Auto-start first recording
+      setTimeout(() => startLiveRecording(), 500)
+    } catch (err) {
+      setVoiceError('Không truy cập được mic: ' + (err instanceof Error ? err.message : String(err)))
+      setLiveStatus('')
+      isLiveModeRef.current = false
+    }
+  }, [startVAD])
+
+  // Start a single recording segment within Live mode
+  const startLiveRecording = useCallback(async () => {
+    if (!isLiveModeRef.current || isAgentRespondingRef.current) return
+    if (!vadStreamRef.current) return
+
+    setVoiceError(null)
+    setLiveStatus('🔴 LIVE — Đang nghe... (kết thúc bằng "Xin hết")')
+
+    try {
+      const mediaRecorder = new MediaRecorder(vadStreamRef.current, { mimeType: 'audio/webm' })
       mediaRecorderRef.current = mediaRecorder
       audioChunksRef.current = []
 
@@ -5784,60 +5876,146 @@ function SmolabModule({ sidebarOpen }: { sidebarOpen: boolean }) {
       }
 
       mediaRecorder.onstop = async () => {
-        // Stop all tracks to release mic
-        stream.getTracks().forEach(t => t.stop())
-
+        // DON'T stop stream tracks — keep mic open for Live mode
         const audioBlob = new Blob(audioChunksRef.current, { type: 'audio/webm' })
+
+        // DELETE user audio immediately (per requirement — no storage)
+        audioChunksRef.current = []
+
         if (audioBlob.size === 0) {
-          setVoiceError('Không ghi được audio. Thử lại.')
+          setVoiceError('Không ghi được audio')
+          // Continue listening if still in Live mode
+          if (isLiveModeRef.current && !isAgentRespondingRef.current) {
+            setTimeout(() => startLiveRecording(), 500)
+          }
           return
         }
 
-        // Send to ASR endpoint
+        // Send to ASR
         const formData = new FormData()
         formData.append('audio', audioBlob, 'voice-input.webm')
 
         try {
-          setVoiceError('Đang chuyển giọng nói thành văn bản...')
+          setLiveStatus('Đang chuyển giọng nói thành văn bản...')
           const res = await fetch('/api/voice/transcribe', { method: 'POST', body: formData })
           if (!res.ok) throw new Error(`ASR error: ${res.status}`)
           const data = await res.json()
+
           if (data.success && data.text) {
-            setInput(data.text)
-            setVoiceError(null)
+            let text = data.text.trim()
+            const textLower = text.toLowerCase()
+
+            // Check for "Xin hết" command
+            if (textLower.endsWith(STOP_COMMAND) || textLower.includes(STOP_COMMAND)) {
+              // Strip "Xin hết" from the text
+              text = text.replace(new RegExp(STOP_COMMAND, 'gi'), '').trim()
+
+              if (text.length > 0) {
+                // Auto-send the message
+                setLiveStatus('Đang gửi tin nhắn...')
+                isAgentRespondingRef.current = true
+                setInput(text)
+                // Trigger send — sendMessage reads from input
+                // Use setTimeout to let setInput take effect
+                setTimeout(() => {
+                  sendMessage(text)
+                }, 100)
+              } else {
+                // Only "Xin hết" was spoken — restart listening
+                if (isLiveModeRef.current) {
+                  setTimeout(() => startLiveRecording(), 500)
+                }
+              }
+            } else {
+              // No "Xin hết" — append to input (accumulating)
+              // This allows multi-segment speech
+              setInput(prev => prev ? `${prev} ${text}` : text)
+              setLiveStatus('🔴 LIVE — Tiếp tục nói... (kết thúc bằng "Xin hết")')
+              // Restart recording for next segment
+              if (isLiveModeRef.current && !isAgentRespondingRef.current) {
+                setTimeout(() => startLiveRecording(), 300)
+              }
+            }
           } else {
-            setVoiceError(data.error || 'Không nhận diện được giọng nói')
+            setVoiceError(data.error || 'Không nhận diện được')
+            // Restart listening
+            if (isLiveModeRef.current && !isAgentRespondingRef.current) {
+              setTimeout(() => startLiveRecording(), 500)
+            }
           }
         } catch (err) {
-          setVoiceError('Lỗi chuyển giọng nói: ' + (err instanceof Error ? err.message : String(err)))
+          setVoiceError('Lỗi ASR: ' + (err instanceof Error ? err.message : String(err)))
+          if (isLiveModeRef.current && !isAgentRespondingRef.current) {
+            setTimeout(() => startLiveRecording(), 1000)
+          }
         }
       }
 
       mediaRecorder.start()
       setIsRecording(true)
+      silenceStartRef.current = 0 // reset silence timer for new segment
     } catch (err) {
-      setVoiceError('Không truy cập được mic: ' + (err instanceof Error ? err.message : String(err)))
+      setVoiceError('Lỗi ghi âm: ' + (err instanceof Error ? err.message : String(err)))
     }
-  }, [])
+  }, [startVAD])
 
-  // Stop mic recording
-  const stopRecording = useCallback(() => {
-    if (mediaRecorderRef.current && isRecording) {
+  // Stop Live mode — cleanup everything
+  const stopLiveMode = useCallback(() => {
+    isLiveModeRef.current = false
+    isAgentRespondingRef.current = false
+    setIsLiveMode(false)
+    setIsRecording(false)
+    setLiveStatus('')
+    setVoiceError(null)
+
+    // Stop recording if active
+    if (mediaRecorderRef.current && mediaRecorderRef.current.state === 'recording') {
       mediaRecorderRef.current.stop()
-      setIsRecording(false)
     }
-  }, [isRecording])
 
-  // Play TTS audio for assistant response
+    // Stop VAD
+    stopVAD()
+
+    // Stop mic stream
+    if (vadStreamRef.current) {
+      vadStreamRef.current.getTracks().forEach(t => t.stop())
+      vadStreamRef.current = null
+    }
+
+    // Close AudioContext
+    if (audioContextRef.current) {
+      audioContextRef.current.close().catch(() => {})
+      audioContextRef.current = null
+    }
+    analyserRef.current = null
+
+    // Stop + DELETE agent audio
+    if (audioPlaybackRef.current) {
+      audioPlaybackRef.current.pause()
+      audioPlaybackRef.current.src = ''
+      audioPlaybackRef.current = null
+    }
+
+    setIsPlaying(false)
+    console.log('[Live] Mode stopped — all audio cleaned up')
+  }, [stopVAD])
+
+  // Play TTS with "Xin hết" appended + auto-cleanup after playback
   const playTTS = useCallback(async (text: string) => {
-    if (!text || text.length < 5) return // skip very short responses
+    if (!text || text.length < 5) return
 
     try {
       setIsPlaying(true)
+      isAgentRespondingRef.current = true
+      setLiveStatus('Agent đang trả lời...')
+
+      // Append "Xin hết" to mark end of response (per requirement)
+      const textWithEnd = text + '. Xin hết.'
+
       const res = await fetch('/api/voice/speak', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ text: text.slice(0, 1000), voice: selectedVoice, speed: 1.0 }),
+        body: JSON.stringify({ text: textWithEnd.slice(0, 1100), voice: selectedVoice, speed: 1.0 }),
       })
 
       if (!res.ok) throw new Error(`TTS error: ${res.status}`)
@@ -5845,35 +6023,55 @@ function SmolabModule({ sidebarOpen }: { sidebarOpen: boolean }) {
       const audioBlob = await res.blob()
       const audioUrl = URL.createObjectURL(audioBlob)
 
-      // Create or reuse audio element
-      if (!audioPlaybackRef.current) {
-        audioPlaybackRef.current = new Audio()
+      // Create new audio element (delete old if exists)
+      if (audioPlaybackRef.current) {
+        audioPlaybackRef.current.pause()
+        audioPlaybackRef.current.src = ''
       }
+      audioPlaybackRef.current = new Audio()
       const audio = audioPlaybackRef.current
       audio.src = audioUrl
 
       audio.onended = () => {
-        setIsPlaying(false)
+        // DELETE agent audio after playback (per requirement)
         URL.revokeObjectURL(audioUrl)
+        audio.src = ''
+        setIsPlaying(false)
+        isAgentRespondingRef.current = false
+        console.log('[Live] Agent audio deleted after playback')
+
+        // Continue Live mode — start listening again
+        if (isLiveModeRef.current) {
+          setLiveStatus('🔴 LIVE — Đang nghe... (kết thúc bằng "Xin hết")')
+          setTimeout(() => startLiveRecording(), 500)
+        }
       }
       audio.onerror = () => {
-        setIsPlaying(false)
         URL.revokeObjectURL(audioUrl)
+        setIsPlaying(false)
+        isAgentRespondingRef.current = false
+        if (isLiveModeRef.current) {
+          setTimeout(() => startLiveRecording(), 500)
+        }
       }
 
       await audio.play()
     } catch (err) {
       console.warn('[Voice] TTS playback failed:', err instanceof Error ? err.message : String(err))
       setIsPlaying(false)
+      isAgentRespondingRef.current = false
+      if (isLiveModeRef.current) {
+        setTimeout(() => startLiveRecording(), 500)
+      }
     }
-  }, [selectedVoice])
+  }, [selectedVoice, startLiveRecording])
 
   // Save voice selection to localStorage
   useEffect(() => {
     try { localStorage.setItem('smolab-voice', selectedVoice) } catch {}
   }, [selectedVoice])
 
-  // Auto-play TTS when a new assistant message arrives
+  // Auto-play TTS when a new assistant message arrives (in Live mode)
   const lastMessageRef = useRef<string | null>(null)
   useEffect(() => {
     if (!messages || messages.length === 0) return
@@ -5883,10 +6081,19 @@ function SmolabModule({ sidebarOpen }: { sidebarOpen: boolean }) {
       lastMessageRef.current = lastMsg.id
       // Only auto-play if not currently loading (response is complete)
       if (!isLoading) {
+        // In Live mode: play TTS (with "Xin hết" appended)
+        // In non-Live mode: also play TTS for convenience
         playTTS(lastMsg.content)
       }
     }
   }, [messages, isLoading, playTTS])
+
+  // Cleanup on unmount
+  useEffect(() => {
+    return () => {
+      stopLiveMode()
+    }
+  }, [stopLiveMode])
 
   // canChat — PHẢI chọn Agent/Team trước khi chat (Phase 5)
   const canChat = (chatMode === 'single' && !!selectedAgentId) || (chatMode === 'multi' && !!selectedTeam)
@@ -7945,21 +8152,27 @@ function SmolabModule({ sidebarOpen }: { sidebarOpen: boolean }) {
                     </div>
                   )}
                 </div>
-                {/* Mic button — hold to record, click to stop */}
+                {/* Live button — toggle continuous conversation mode */}
                 <Button
-                  onClick={() => isRecording ? stopRecording() : startRecording()}
-                  disabled={isLoading}
-                  className={`chamfer-sm h-8 w-8 p-0 text-white transition-colors ${
-                    isRecording
+                  onClick={() => isLiveMode ? stopLiveMode() : startLiveMode()}
+                  disabled={isLoading && !isLiveMode}
+                  className={`chamfer-sm h-8 px-2 text-white transition-all text-[10px] font-bold ${
+                    isLiveMode
                       ? 'bg-red-600 hover:bg-red-700 animate-pulse'
                       : 'bg-slate-700/60 hover:bg-slate-600/60'
                   }`}
-                  title={isRecording ? 'Dừng ghi âm' : 'Ghi âm (nói vào mic)'}
+                  title={isLiveMode ? 'Tắt chế độ Live' : 'Bật chế độ Live — nói vào mic, kết thúc bằng "Xin hết"'}
                 >
-                  {isRecording ? (
-                    <span className="h-3 w-3 bg-white rounded-full inline-block" />
+                  {isLiveMode ? (
+                    <>
+                      <span className="h-2 w-2 bg-white rounded-full inline-block mr-1 animate-pulse" />
+                      LIVE
+                    </>
                   ) : (
-                    <Mic className="h-3.5 w-3.5" />
+                    <>
+                      <Mic className="h-3 w-3 mr-1" />
+                      Live
+                    </>
                   )}
                 </Button>
                 <Button
@@ -7970,11 +8183,14 @@ function SmolabModule({ sidebarOpen }: { sidebarOpen: boolean }) {
                   {isLoading ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Send className="h-3.5 w-3.5" />}
                 </Button>
               </div>
-              {/* Voice error/status display */}
+              {/* Live mode status + errors */}
+              {liveStatus && (
+                <div className="mt-1 text-[9px] text-cyan-400/90 px-1 font-medium">{liveStatus}</div>
+              )}
               {voiceError && (
                 <div className="mt-1 text-[9px] text-amber-400/80 px-1">{voiceError}</div>
               )}
-              {isPlaying && (
+              {isPlaying && !liveStatus && (
                 <div className="mt-1 text-[9px] text-cyan-400/80 px-1 flex items-center gap-1">
                   <Loader2 className="h-2.5 w-2.5 animate-spin" /> Đang đọc phản hồi...
                 </div>
