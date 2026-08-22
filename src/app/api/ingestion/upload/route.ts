@@ -23,7 +23,7 @@ import path from 'path'
 import crypto from 'crypto'
 import { qdrant, COLLECTION_DOCUMENTS, COLLECTION_CHUNKS, deleteChunksByDocument, deleteDocument } from '@/lib/qdrant'
 import { db } from '@/lib/db'
-import { uploadPdfToR2, deleteFromR2, r2KeyForPdf, isR2Configured } from '@/lib/r2-storage'
+import { uploadPdfToR2, deleteFromR2, r2KeyForPdf, isR2Configured, listR2Objects } from '@/lib/r2-storage'
 
 export const dynamic = 'force-dynamic'
 
@@ -239,11 +239,89 @@ export async function GET(request: NextRequest) {
       }
     }
 
-    // List documents — use Qdrant scroll API for pagination
+    // List documents — R2 is the PRIMARY source.
+    // Strategy: list all R2 PDFs (canonical), then enrich with Qdrant metadata
+    // where available. This ensures documents uploaded to R2 always show in the
+    // UI even if Qdrant metadata was lost (sandbox reset, fresh Qdrant, etc.).
+    // Fallback: if R2 not configured, fall back to Qdrant-only scroll (legacy).
     try {
       const limit = Math.min(pageSize, 100) // cap at 100 per page
       const offset = (page - 1) * limit
 
+      // --- PRIMARY: list from R2 ---
+      if (isR2Configured()) {
+        const r2List = await listR2Objects('pdfs/', 500)
+        if (!r2List.success) {
+          console.error('[Upload] R2 list failed:', r2List.error)
+          // Fall through to Qdrant fallback below
+        } else {
+          // Build Qdrant metadata map (id → payload) for enrichment
+          const qdrantMeta = new Map<string, Record<string, unknown>>()
+          try {
+            let scrollOffset: string | number | undefined = undefined
+            do {
+              const result = await qdrant.scroll(COLLECTION_DOCUMENTS, {
+                limit: 100,
+                offset: scrollOffset,
+                with_payload: true,
+                with_vector: false,
+              })
+              for (const p of result.points) {
+                qdrantMeta.set(String(p.id), (p.payload as Record<string, unknown>) || {})
+              }
+              scrollOffset = result.next_page_offset
+            } while (scrollOffset)
+          } catch (qErr) {
+            console.warn('[Upload] Qdrant enrichment scroll failed (non-fatal):', qErr instanceof Error ? qErr.message : String(qErr))
+            // Continue — R2 docs still show, just without enrichment
+          }
+
+          // Parse docId from R2 key: "pdfs/<docId>_<filename>"
+          const allDocs = r2List.objects.map(obj => {
+            const basename = obj.key.split('/').pop() || obj.key
+            const underscoreIdx = basename.indexOf('_')
+            const docId = underscoreIdx > 0 ? basename.substring(0, underscoreIdx) : basename.replace(/\.pdf$/i, '')
+            const filename = underscoreIdx > 0 ? basename.substring(underscoreIdx + 1) : basename
+            const r2Key = obj.key
+            // Find Qdrant metadata by matching r2_key or docId
+            const meta = qdrantMeta.get(docId) ||
+              [...qdrantMeta.values()].find((m) => (m.r2_key as string) === r2Key) || {}
+
+            return {
+              id: docId,
+              title: (meta.title as string) || filename.replace(/\.pdf$/i, ''),
+              file_path: (meta.file_path as string) || `${UPLOAD_DIR}/${basename}`,
+              domain: (meta.domain as string) || 'mixed',
+              page_count: (meta.page_count as number) ?? null,
+              status: (meta.status as string) || 'uploaded',
+              error_message: (meta.error_message as string) ?? null,
+              processing_steps: (meta.processing_steps as unknown[]) || [],
+              processing_percent: (meta.processing_percent as number) ?? 0,
+              created_at: (meta.created_at as string) || obj.lastModified.toISOString(),
+              updated_at: (meta.updated_at as string) || obj.lastModified.toISOString(),
+              r2_key: r2Key,
+              r2_size: obj.size,
+              // chunk_coverage intentionally omitted (lite mode)
+            }
+          })
+
+          // Pagination
+          const hasMore = allDocs.length > offset + limit
+          const documents = allDocs.slice(offset, offset + limit)
+
+          return NextResponse.json({
+            documents,
+            total: allDocs.length,
+            page,
+            pageSize: limit,
+            hasMore,
+            lite,
+            source: 'r2',
+          })
+        }
+      }
+
+      // --- FALLBACK: Qdrant-only scroll (when R2 not configured) ---
       const scrollResult = await qdrant.scroll(COLLECTION_DOCUMENTS, {
         limit: limit + 1, // fetch 1 extra to know if there's a next page
         offset: offset > 0 ? offset : undefined,
@@ -266,6 +344,7 @@ export async function GET(request: NextRequest) {
         pageSize: limit,
         hasMore,
         lite,
+        source: 'qdrant',
       })
     } catch (err) {
       console.error('[Upload] GET list error:', err instanceof Error ? err.message : String(err))

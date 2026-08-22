@@ -125,6 +125,11 @@ interface AgentMemoryPayload {
  * Uses the same embedding dimension as theopus_chunks (2048).
  */
 export async function ensureAgentMemoryCollection(): Promise<boolean> {
+  // Trigger cloud memory restore once per process (non-blocking if it fails)
+  // This runs before any recallMemories/storeMemory call, ensuring local SQLite
+  // is populated from Supabase cloud backup before serving the first chat request.
+  restoreMemoriesFromCloud().catch(() => { /* non-critical */ })
+
   try {
     const collections = await qdrant.getCollections()
     const existingNames = new Set(collections.collections.map(c => c.name))
@@ -504,6 +509,18 @@ export async function storeMemory(params: StoreMemoryParams): Promise<StoreMemor
       })
 
       console.log(`[AgentMemory] Stored ${category} memory for agent ${agentName} (importance: ${importance}, domain: ${domain})`)
+
+      // Step 5: Non-blocking push to Supabase (cloud persistence for memory)
+      // Fire-and-forget — never block chat response, never throw on failure.
+      // This backs up the new memory + its qdrantPointId so memory survives sandbox resets.
+      ;(async () => {
+        try {
+          const { pushToSupabase } = await import('@/lib/supabase-sync')
+          await pushToSupabase()
+        } catch (e) {
+          console.warn('[AgentMemory] Supabase push failed (non-critical):', e instanceof Error ? e.message : String(e))
+        }
+      })()
 
       return { id: memory.id, qdrantPointId }
     } catch (outerErr) {
@@ -940,5 +957,60 @@ export async function getSessionMessages(sessionId: string): Promise<Array<{
   } catch (err) {
     console.error('[AgentMemory] getSessionMessages error:', err instanceof Error ? err.message : String(err))
     return []
+  }
+}
+
+// ==================== CLOUD RESTORE (Supabase → SQLite) ====================
+
+/**
+ * Restore all memories from Supabase cloud backup into local SQLite.
+ *
+ * Called ONCE per process lifetime (guarded by globalForMemoryRestored flag).
+ * Pulls AgentMemory + MemoryArchive + MemoryAccessLog from Supabase backup
+ * tables and upserts them into local SQLite — ensuring memory survives
+ * sandbox resets.
+ *
+ * Non-blocking on failure: if Supabase is unreachable or backup tables
+ * don't exist yet, logs a warning and continues (app still works with
+ * empty local memory).
+ *
+ * @returns number of memory records restored
+ */
+export async function restoreMemoriesFromCloud(): Promise<number> {
+  const globalForMemoryRestored = globalThis as unknown as { __memoriesRestored?: boolean }
+  if (globalForMemoryRestored.__memoriesRestored) return 0
+  globalForMemoryRestored.__memoriesRestored = true
+
+  try {
+    const { pullFromSupabase, isSupabaseConfigured } = await import('@/lib/supabase-sync')
+    if (!isSupabaseConfigured()) {
+      console.log('[AgentMemory] Supabase not configured — skipping cloud memory restore')
+      return 0
+    }
+
+    console.log('[AgentMemory] Restoring memories from Supabase cloud backup...')
+    const result = await pullFromSupabase()
+
+    // Count memory-specific tables restored
+    const memResult = result.results.find(r => r.table === 'AgentMemory')
+    const archiveResult = result.results.find(r => r.table === 'MemoryArchive')
+    const logResult = result.results.find(r => r.table === 'MemoryAccessLog')
+    const restored = (memResult?.pulled || 0) + (archiveResult?.pulled || 0)
+
+    console.log(
+      `[AgentMemory] Cloud restore complete: ${memResult?.pulled || 0} memories, ` +
+      `${archiveResult?.pulled || 0} archives, ${logResult?.pulled || 0} access logs ` +
+      `(${result.durationMs}ms)`
+    )
+
+    return restored
+  } catch (err) {
+    console.warn(
+      '[AgentMemory] Cloud restore failed (non-critical):',
+      err instanceof Error ? err.message : String(err)
+    )
+    // Reset flag so it can retry on next call
+    globalForMemoryRestored.__memoriesRestored = false
+    return 0
   }
 }

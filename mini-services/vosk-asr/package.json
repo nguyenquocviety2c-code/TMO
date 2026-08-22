@@ -3,7 +3,7 @@
   "version": "1.0.0",
   "description": "Vosk Vietnamese Speech-to-Text mini-service",
   "scripts": {
-    "dev": "bun --hot index.ts"
+    "dev": "python3 index.py"
   },
   "dependencies": {}
 }

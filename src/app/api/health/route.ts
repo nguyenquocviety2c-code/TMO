@@ -10,6 +10,8 @@
 import { NextResponse } from 'next/server'
 import { checkQdrantHealth, initializeCollections } from '@/lib/qdrant'
 import { checkNeo4jHealth } from '@/lib/neo4j'
+import { checkR2Health } from '@/lib/r2-storage'
+import { checkSupabaseHealth } from '@/lib/supabase-sync'
 import { db } from '@/lib/db'
 import { getNvidiaModels, getProviderDiagnostics, getDailyQuotaStatus } from '@/lib/llm'
 
@@ -59,9 +61,11 @@ export async function GET() {
     await ensureQdrantInitialized()
 
     // Run health checks in parallel with individual timeouts
-    const [qdrant, neo4j] = await Promise.all([
+    const [qdrant, neo4j, r2, supabase] = await Promise.all([
       withTimeout(checkQdrantHealth(), 8000, { connected: false, error: 'Qdrant check timed out' }),
       withTimeout(checkNeo4jHealth(), 10000, { connected: false, error: 'Neo4j check timed out (10s)' }),
+      withTimeout(checkR2Health(), 8000, { configured: false, connected: false, bucket: '' }),
+      withTimeout(checkSupabaseHealth(), 8000, { configured: false, connected: false, tableCount: 0 }),
     ])
 
     // SQLite health check — try a simple query
@@ -92,7 +96,7 @@ export async function GET() {
       status: coreHealthy && anyLLMAvailable ? 'healthy' : 'degraded',
       responseTimeMs,
       timestamp: new Date().toISOString(),
-      services: { qdrant, neo4j, sqlite, llm },
+      services: { qdrant, neo4j, sqlite, r2, supabase, llm },
       providerDiagnostics,
       dailyQuotaStatus,
     })
@@ -107,6 +111,8 @@ export async function GET() {
         qdrant: { connected: false, error: 'Health check failed: ' + errorMessage },
         neo4j: { connected: false, error: 'Health check failed: ' + errorMessage },
         sqlite: { connected: false, error: 'Health check failed: ' + errorMessage },
+        r2: { configured: false, connected: false, bucket: '' },
+        supabase: { configured: false, connected: false, tableCount: 0 },
         llm: {},
       },
     }, { status: 200 })

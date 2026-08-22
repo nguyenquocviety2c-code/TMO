@@ -66,6 +66,8 @@ interface HealthResponse {
     qdrant: QdrantHealth
     neo4j: Neo4jHealth
     sqlite: SqliteHealth
+    r2: R2Health
+    supabase: SupabaseHealth
     llm: Record<string, LLMHealthItem>
   }
   providerDiagnostics?: Record<string, ProviderDiagnostic>
@@ -75,6 +77,8 @@ interface HealthResponse {
 interface QdrantHealth { connected: boolean; version?: string; error?: string; documentsCollection?: { exists: boolean; pointCount?: number }; chunksCollection?: { exists: boolean; pointCount?: number; vectorCount?: number } }
 interface Neo4jHealth { connected: boolean; nodeCount: number; relationshipCount: number; labels: string[]; error?: string }
 interface SqliteHealth { connected: boolean; error?: string; tableCount?: number }
+interface R2Health { configured: boolean; connected: boolean; bucket?: string; objectCount?: number; error?: string }
+interface SupabaseHealth { configured: boolean; connected: boolean; tableCount?: number; error?: string }
 interface LLMHealthItem { available: boolean; model: string; error?: string; geoBlocked?: boolean }
 interface ProviderDiagnostic {
   keyCount: number; availableCount: number; totalTokensUsed: number; totalDailyTokensUsed: number; totalDailyRequests: number; dailyTokenLimit: number; dailyQuotaExhaustedCount: number
@@ -362,62 +366,47 @@ function UploadSection({ onUploadComplete, existingDocNames }: { onUploadComplet
   }
 
   return (
-    <div className="nc-wrap nc-cyan nc-corner-glow">
-    <Card className="nc-panel nc-md nc-border-cyan">
-      <CardHeader className="pb-4">
-        <div className="flex items-center gap-2.5">
-          <div className="p-1.5 rounded-lg bg-gradient-to-br from-emerald-500 to-teal-600">
-            <Upload className="h-4 w-4 text-white" />
-          </div>
-          <div>
-            <CardTitle className="text-sm font-semibold tracking-tight text-stone-100">Tải lên PDF</CardTitle>
-            <CardDescription className="text-xs mt-0.5 text-stone-400">Tải tài liệu PDF — tối đa 100MB/file, mỗi file tải riêng biệt</CardDescription>
-          </div>
+    <div className="space-y-2">
+      {/* Upload toolbar — file input + domain select + Tải lên button (compact, inline) */}
+      <div className="flex gap-2 items-center flex-wrap">
+        <Input ref={fileInputRef} type="file" accept=".pdf" multiple disabled={uploading}
+          className="flex-1 min-w-[180px] text-xs h-9 text-stone-200 file:mr-2 file:py-1 file:px-3 file:rounded-lg file:border-0 file:text-xs file:font-medium file:bg-gradient-to-r file:from-emerald-900/40 file:to-teal-900/40 file:text-teal-400 hover:file:from-emerald-800/40 hover:file:to-teal-800/40 rounded-lg border-cyan-400/35 focus:border-emerald-600 focus:ring-emerald-600/20" />
+        <Select value={selectedDomain} onValueChange={setSelectedDomain}>
+          <SelectTrigger className="w-[150px] h-9 text-xs rounded-lg border-cyan-400/35 text-stone-200 focus:border-emerald-600"><SelectValue placeholder="Phân loại" /></SelectTrigger>
+          <SelectContent className="bg-slate-950/80 border-cyan-400/35">
+            <SelectItem value="auto" className="text-stone-200 focus:text-white focus:bg-stone-800/80">Tự động phân loại</SelectItem>
+            <SelectItem value="programming" className="text-stone-200 focus:text-white focus:bg-stone-800/80">Lập trình</SelectItem>
+            <SelectItem value="algorithm" className="text-stone-200 focus:text-white focus:bg-stone-800/80">Thuật toán</SelectItem>
+            <SelectItem value="ml" className="text-stone-200 focus:text-white focus:bg-stone-800/80">Machine Learning</SelectItem>
+            <SelectItem value="meta_cognitive" className="text-stone-200 focus:text-white focus:bg-stone-800/80">Siêu nhận thức</SelectItem>
+            <SelectItem value="linux" className="text-stone-200 focus:text-white focus:bg-stone-800/80">Linux</SelectItem>
+            <SelectItem value="security" className="text-stone-200 focus:text-white focus:bg-stone-800/80">Bảo mật</SelectItem>
+            <SelectItem value="ux_ui" className="text-stone-200 focus:text-white focus:bg-stone-800/80">Thiết kế UX/UI</SelectItem>
+          </SelectContent>
+        </Select>
+        <Button onClick={handleUpload} disabled={uploading} size="sm" className="lens-flare chamfer-sm h-9 px-4 bg-gradient-to-r from-emerald-500 to-teal-600 hover:from-emerald-600 hover:to-teal-700 text-white shadow-sm border-0">
+          {uploading ? <><Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" /> {uploadProgress || 'Đang tải...'}</> : <><FolderUp className="mr-1.5 h-3.5 w-3.5" /> Tải lên</>}
+        </Button>
+      </div>
+      {/* Per-file upload progress indicator */}
+      {uploadProgress && (
+        <div className="flex items-center gap-2 p-2 rounded-xl bg-teal-950/40 border border-teal-500/55 text-xs text-teal-400">
+          <Loader2 className="h-3.5 w-3.5 animate-spin flex-shrink-0" />
+          <span className="truncate">{uploadProgress}</span>
         </div>
-      </CardHeader>
-      <CardContent>
-        <div className="space-y-4">
-          <div className="flex gap-3">
-            <div className="flex-1">
-              <Input ref={fileInputRef} type="file" accept=".pdf" multiple disabled={uploading}
-                className="text-xs h-9 text-stone-200 file:mr-2 file:py-1 file:px-3 file:rounded-lg file:border-0 file:text-xs file:font-medium file:bg-gradient-to-r file:from-emerald-900/40 file:to-teal-900/40 file:text-teal-400 hover:file:from-emerald-800/40 hover:file:to-teal-800/40 rounded-lg border-cyan-400/35 focus:border-emerald-600 focus:ring-emerald-600/20" />
-            </div>
-            <Select value={selectedDomain} onValueChange={setSelectedDomain}>
-              <SelectTrigger className="w-[160px] h-9 text-xs rounded-lg border-cyan-400/35 text-stone-200 focus:border-emerald-600"><SelectValue placeholder="Phân loại" /></SelectTrigger>
-              <SelectContent className="bg-slate-950/80 border-cyan-400/35">
-                <SelectItem value="auto" className="text-stone-200 focus:text-white focus:bg-stone-800/80">Tự động phân loại</SelectItem>
-                <SelectItem value="programming" className="text-stone-200 focus:text-white focus:bg-stone-800/80">Lập trình</SelectItem>
-                <SelectItem value="algorithm" className="text-stone-200 focus:text-white focus:bg-stone-800/80">Thuật toán</SelectItem>
-                <SelectItem value="ml" className="text-stone-200 focus:text-white focus:bg-stone-800/80">Machine Learning</SelectItem>
-                <SelectItem value="meta_cognitive" className="text-stone-200 focus:text-white focus:bg-stone-800/80">Siêu nhận thức</SelectItem>
-                <SelectItem value="linux" className="text-stone-200 focus:text-white focus:bg-stone-800/80">Linux</SelectItem>
-                <SelectItem value="security" className="text-stone-200 focus:text-white focus:bg-stone-800/80">Bảo mật</SelectItem>
-                <SelectItem value="ux_ui" className="text-stone-200 focus:text-white focus:bg-stone-800/80">Thiết kế UX/UI</SelectItem>
-              </SelectContent>
-            </Select>
-            <Button onClick={handleUpload} disabled={uploading} size="sm" className="lens-flare chamfer-sm h-9 px-4 bg-gradient-to-r from-emerald-500 to-teal-600 hover:from-emerald-600 hover:to-teal-700 text-white shadow-sm border-0">
-              {uploading ? <><Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" /> {uploadProgress || 'Đang tải...'}</> : <><FolderUp className="mr-1.5 h-3.5 w-3.5" /> Tải lên</>}
-            </Button>
-          </div>
-          {/* Per-file upload progress indicator */}
-          {uploadProgress && (
-            <div className="flex items-center gap-2 p-2.5 rounded-xl bg-teal-950/40 border border-teal-500/55 text-xs text-teal-400">
-              <Loader2 className="h-3.5 w-3.5 animate-spin flex-shrink-0" />
-              <span className="truncate">{uploadProgress}</span>
-            </div>
-          )}
-          {/* Duplicate name warning — shown when selected files match existing documents */}
-          {duplicateWarning && duplicateWarning.length > 0 && (
-            <div className="p-3 rounded-xl bg-amber-950/40 border border-amber-500/55 text-xs text-amber-300">
-              <div className="flex items-start gap-2">
-                <AlertTriangle className="h-4 w-4 flex-shrink-0 mt-0.5 text-amber-500" />
-                <div className="flex-1 min-w-0">
-                  <span className="font-semibold">Trùng tên tài liệu!</span>
-                  <span className="ml-1 text-amber-400">Không thể tải lên {duplicateWarning.length} file:</span>
-                  <div className="mt-1.5 space-y-1 max-h-32 overflow-y-auto">
-                    {duplicateWarning.map((name, i) => (
-                      <div key={i} className="flex items-center gap-1.5 p-1 rounded bg-amber-900/40">
-                        <FileText className="h-3 w-3 flex-shrink-0" />
+      )}
+      {/* Duplicate name warning */}
+      {duplicateWarning && duplicateWarning.length > 0 && (
+        <div className="p-2 rounded-xl bg-amber-950/40 border border-amber-500/55 text-xs text-amber-300">
+          <div className="flex items-start gap-2">
+            <AlertTriangle className="h-4 w-4 flex-shrink-0 mt-0.5 text-amber-500" />
+            <div className="flex-1 min-w-0">
+              <span className="font-semibold">Trùng tên tài liệu!</span>
+              <span className="ml-1 text-amber-400">Không thể tải lên {duplicateWarning.length} file:</span>
+              <div className="mt-1.5 space-y-1 max-h-24 overflow-y-auto">
+                {duplicateWarning.map((name, i) => (
+                  <div key={i} className="flex items-center gap-1.5 p-1 rounded bg-amber-900/40">
+                    <FileText className="h-3 w-3 flex-shrink-0" />
                         <span className="truncate">{name}</span>
                       </div>
                     ))}
@@ -451,17 +440,14 @@ function UploadSection({ onUploadComplete, existingDocNames }: { onUploadComplet
               )}
             </div>
           )}
-        </div>
-      </CardContent>
-    </Card>
     </div>
   )
 }
 
 // ==================== DOCUMENTS LIST ====================
 
-function DocumentsList({ documents, onProcessDoc, onDeleteDoc, onPauseDoc, onReExtractDoc, onForceRecover, processingIds, extractingDocIds, pausedDocIds, userPausedDocIds, docPage, docTotal, docPageSize, onPageChange, docStatusBreakdown, docLoading, autoMode, onToggleAuto, onRegenerateEmbeddings, embeddingPseudoCount }: {
-  documents: DocumentRecord[]; onProcessDoc: (id: string) => void; onDeleteDoc: (id: string) => void; onPauseDoc: (id: string) => void; onReExtractDoc: (id: string) => void; onForceRecover: () => void; processingIds: Set<string>; extractingDocIds: Set<string>; pausedDocIds: Set<string>; userPausedDocIds: Set<string>; docPage: number; docTotal: number; docPageSize: number; onPageChange: (page: number) => void; docStatusBreakdown: Record<string, number>; docLoading: boolean; autoMode: boolean; onToggleAuto: () => void; onRegenerateEmbeddings: () => void; embeddingPseudoCount: number
+function DocumentsList({ documents, onProcessDoc, onDeleteDoc, onPauseDoc, onReExtractDoc, onForceRecover, processingIds, extractingDocIds, pausedDocIds, userPausedDocIds, docPage, docTotal, docPageSize, onPageChange, docStatusBreakdown, docLoading, autoMode, onToggleAuto, onRegenerateEmbeddings, embeddingPseudoCount, uploadSlot }: {
+  documents: DocumentRecord[]; onProcessDoc: (id: string) => void; onDeleteDoc: (id: string) => void; onPauseDoc: (id: string) => void; onReExtractDoc: (id: string) => void; onForceRecover: () => void; processingIds: Set<string>; extractingDocIds: Set<string>; pausedDocIds: Set<string>; userPausedDocIds: Set<string>; docPage: number; docTotal: number; docPageSize: number; onPageChange: (page: number) => void; docStatusBreakdown: Record<string, number>; docLoading: boolean; autoMode: boolean; onToggleAuto: () => void; onRegenerateEmbeddings: () => void; embeddingPseudoCount: number; uploadSlot?: React.ReactNode
 }) {
   // Track which document's extraction details are expanded
   const [expandedDocId, setExpandedDocId] = useState<string | null>(null)
@@ -648,6 +634,11 @@ function DocumentsList({ documents, onProcessDoc, onDeleteDoc, onPauseDoc, onReE
         </div>
       </CardHeader>
       <CardContent className="p-0">
+        {uploadSlot && (
+          <div className="px-4 pt-3 pb-2 border-b border-cyan-400/15">
+            {uploadSlot}
+          </div>
+        )}
         {docTotal === 0 ? (
           <div className="text-center py-10 text-stone-300 text-xs px-6 sparkle-container chamfer-md"><FolderOpen className="h-10 w-10 mx-auto mb-3 opacity-20" /><p className="font-medium">Chưa có tài liệu nào</p><p className="mt-1">Tải lên PDF để bắt đầu</p></div>
         ) : docLoading ? (
@@ -2618,10 +2609,10 @@ function AnalyticsSection({ data, onRefreshStats }: { data: AnalyticsData; onRef
               </div>
               <div className="space-y-1.5 text-xs">
                 <div className="flex justify-between"><span className="text-muted-foreground">Tổng embeddings:</span><span className="font-medium text-stone-200">{qualityMetrics.embedTotal}</span></div>
-                <div className="flex justify-between"><span className="text-muted-foreground">Real (1536-dim):</span><span className="font-medium text-stone-200">{qualityMetrics.embedReal}</span></div>
+                <div className="flex justify-between"><span className="text-muted-foreground">Real (2048-dim):</span><span className="font-medium text-stone-200">{qualityMetrics.embedReal}</span></div>
                 <div className="flex justify-between"><span className="text-muted-foreground">Pseudo (hash):</span><span className="font-medium text-stone-200">{qualityMetrics.embedPseudo}</span></div>
                 <div className="flex justify-between"><span className="text-muted-foreground">Chất lượng:</span><span className="font-medium text-stone-200">{(qualityMetrics.embedQuality * 100).toFixed(0)}%</span></div>
-                <div className="flex justify-between"><span className="text-muted-foreground">Dimension:</span><span className="font-medium text-stone-200">{embeddingStatus?.dimension || 1536}</span></div>
+                <div className="flex justify-between"><span className="text-muted-foreground">Dimension:</span><span className="font-medium text-stone-200">{embeddingStatus?.dimension || 2048}</span></div>
               </div>
               {qualityMetrics.embedReal > 0 ? (
                 <div className="mt-2 flex items-center gap-1 text-[10px] text-emerald-400"><CheckCircle2 className="h-3 w-3" /> Vector Search sẵn sàng</div>
@@ -2801,9 +2792,11 @@ function ConnectionStatus({ health, lastChecked, onRefresh, refreshing }: {
     )
   }
 
-  const { qdrant, neo4j, sqlite, llm } = health.services
+  const { qdrant, neo4j, sqlite, r2, supabase, llm } = health.services
   const neo4jError = neo4j.error
   const qdrantError = qdrant.error
+  const r2Error = r2?.error
+  const supabaseError = supabase?.error
 
   // Format last checked time
   const formatLastChecked = (date: Date | null) => {
@@ -2900,6 +2893,51 @@ function ConnectionStatus({ health, lastChecked, onRefresh, refreshing }: {
                 {sqlite?.connected ? (<>
                   {sqlite.tableCount !== undefined && <div>Entity records: {sqlite.tableCount.toLocaleString()}</div>}
                 </>) : <div className="text-red-400">Error: {sqlite?.error || 'Không kết nối'}</div>}
+              </div>
+            </StatusTooltipContent>
+          </StatusTooltip>
+
+          <div className="h-3 w-px bg-stone-700 hidden sm:block" />
+
+          {/* Cloudflare R2 */}
+          <StatusTooltip>
+            <StatusTooltipTrigger asChild>
+              <div className="flex items-center gap-1.5 cursor-default">
+                <div className={`w-2 h-2 rounded-full ${r2?.connected ? 'bg-emerald-500 shadow-[0_0_6px_rgba(16,185,129,0.5)]' : 'bg-red-500 shadow-[0_0_6px_rgba(239,68,68,0.5)]'}`} />
+                <span className="text-stone-300 font-medium">Cloudflare</span>
+                {r2?.connected && r2.objectCount !== undefined && <span className="text-stone-500 hidden sm:inline">{r2.objectCount} files</span>}
+                {!r2?.connected && <span className="text-red-400">{r2?.configured ? 'Error' : 'Off'}</span>}
+              </div>
+            </StatusTooltipTrigger>
+            <StatusTooltipContent side="top" className="bg-slate-900 border border-cyan-400/30 text-stone-200 text-[10px] max-w-[260px]">
+              <div className="space-y-1">
+                <div className="font-semibold text-stone-100">Cloudflare R2 (PDF Backup)</div>
+                {r2?.connected ? (<>
+                  <div>Bucket: {r2.bucket || 'themagnumopus'}</div>
+                  {r2.objectCount !== undefined && <div>Objects: {r2.objectCount.toLocaleString()}</div>}
+                  <div className="text-stone-400">Nguồn tài liệu chính</div>
+                </>) : <div className="text-red-400">Error: {r2Error || (r2?.configured ? 'Không kết nối' : 'Chưa cấu hình')}</div>}
+              </div>
+            </StatusTooltipContent>
+          </StatusTooltip>
+
+          {/* Supabase */}
+          <StatusTooltip>
+            <StatusTooltipTrigger asChild>
+              <div className="flex items-center gap-1.5 cursor-default">
+                <div className={`w-2 h-2 rounded-full ${supabase?.connected ? 'bg-emerald-500 shadow-[0_0_6px_rgba(16,185,129,0.5)]' : 'bg-red-500 shadow-[0_0_6px_rgba(239,68,68,0.5)]'}`} />
+                <span className="text-stone-300 font-medium">Supabase</span>
+                {supabase?.connected && supabase.tableCount !== undefined && <span className="text-stone-500 hidden md:inline">{supabase.tableCount} tables</span>}
+                {!supabase?.connected && <span className="text-red-400">{supabase?.configured ? 'Error' : 'Off'}</span>}
+              </div>
+            </StatusTooltipTrigger>
+            <StatusTooltipContent side="top" className="bg-slate-900 border border-cyan-400/30 text-stone-200 text-[10px] max-w-[260px]">
+              <div className="space-y-1">
+                <div className="font-semibold text-stone-100">Supabase (Cloud Sync)</div>
+                {supabase?.connected ? (<>
+                  {supabase.tableCount !== undefined && <div>Backup tables: {supabase.tableCount}</div>}
+                  <div className="text-stone-400">Backup SQLite → Cloud (12 bảng: memory, chat, config, personal data)</div>
+                </>) : <div className="text-red-400">Error: {supabaseError || (supabase?.configured ? 'Không kết nối' : 'Chưa cấu hình')}</div>}
               </div>
             </StatusTooltipContent>
           </StatusTooltip>
@@ -14055,10 +14093,7 @@ export default function Home() {
                   </TabsContent>
 
                   <TabsContent value="documents" className="mt-4">
-                    <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-                      <UploadSection onUploadComplete={(uploadedDocIds: string[]) => { fetchDocuments(true, 1); fetchStats() }} existingDocNames={existingDocNames} />
-                      <DocumentsList documents={documents} onProcessDoc={handleProcessDoc} onDeleteDoc={handleDeleteDoc} onPauseDoc={handlePauseDoc} onReExtractDoc={handleReExtractDoc} onForceRecover={handleForceRecover} processingIds={processingIds} extractingDocIds={extractingDocIds} pausedDocIds={pausedDocIds} userPausedDocIds={userPausedDocIds} docPage={docPage} docTotal={docTotal} docPageSize={docPageSize} onPageChange={(p) => fetchDocuments(false, p)} docStatusBreakdown={docStatusBreakdown} docLoading={docLoading} autoMode={autoMode} onToggleAuto={() => { const newMode = !autoMode; setAutoMode(newMode); try { localStorage.setItem('graphrag-auto-mode', String(newMode)) } catch {} ; sonnerToast.success(newMode ? 'Đã bật chế độ Tự động' : 'Đã tắt chế độ Tự động', { description: newMode ? '4 keys × 4 docs/key (tối đa 16 song song) — Ưu tiên tài liệu trích xuất dở trước, xong key nào → tự chuyển tài liệu mới' : 'Không tự động — cần bấm "Tiếp tục" thủ công', duration: 3000 }) }} onRegenerateEmbeddings={handleRegenerateEmbeddings} embeddingPseudoCount={embeddingStatus?.pseudo || 0} />
-                    </div>
+                      <DocumentsList documents={documents} onProcessDoc={handleProcessDoc} onDeleteDoc={handleDeleteDoc} onPauseDoc={handlePauseDoc} onReExtractDoc={handleReExtractDoc} onForceRecover={handleForceRecover} processingIds={processingIds} extractingDocIds={extractingDocIds} pausedDocIds={pausedDocIds} userPausedDocIds={userPausedDocIds} docPage={docPage} docTotal={docTotal} docPageSize={docPageSize} onPageChange={(p) => fetchDocuments(false, p)} docStatusBreakdown={docStatusBreakdown} docLoading={docLoading} autoMode={autoMode} onToggleAuto={() => { const newMode = !autoMode; setAutoMode(newMode); try { localStorage.setItem('graphrag-auto-mode', String(newMode)) } catch {} ; sonnerToast.success(newMode ? 'Đã bật chế độ Tự động' : 'Đã tắt chế độ Tự động', { description: newMode ? '4 keys × 4 docs/key (tối đa 16 song song) — Ưu tiên tài liệu trích xuất dở trước, xong key nào → tự chuyển tài liệu mới' : 'Không tự động — cần bấm "Tiếp tục" thủ công', duration: 3000 }) }} onRegenerateEmbeddings={handleRegenerateEmbeddings} embeddingPseudoCount={embeddingStatus?.pseudo || 0} uploadSlot={<UploadSection onUploadComplete={(uploadedDocIds: string[]) => { fetchDocuments(true, 1); fetchStats() }} existingDocNames={existingDocNames} />} />
                   </TabsContent>
 
                   <TabsContent value="analytics" className="mt-4">
@@ -14092,7 +14127,7 @@ export default function Home() {
                       {[
                         { step: 1, name: 'Query', icon: MessageCircle, desc: 'User đặt câu hỏi', color: 'bg-cyan-950/50 text-cyan-400 border-cyan-500/55' },
                         { step: 2, name: 'Classify', icon: Target, desc: 'LLM phân loại câu hỏi', color: 'bg-amber-950/50 text-amber-400 border-amber-500/55' },
-                        { step: 3, name: 'Vector', icon: Database, desc: 'pgvector similarity search', color: 'bg-teal-950/50 text-teal-400 border-teal-500/55' },
+                        { step: 3, name: 'Vector', icon: Database, desc: 'Qdrant similarity search', color: 'bg-teal-950/50 text-teal-400 border-teal-500/55' },
                         { step: 4, name: 'Graph', icon: GitBranch, desc: 'Neo4j Cypher traversal', color: 'bg-orange-950/50 text-orange-400 border-orange-500/55' },
                         { step: 5, name: 'RRF Fuse', icon: Layers, desc: 'Reciprocal Rank Fusion', color: 'bg-violet-950/50 text-violet-400 border-violet-500/55' },
                         { step: 6, name: 'Generate', icon: Sparkles, desc: 'LLM tạo câu trả lời', color: 'bg-pink-950/50 text-pink-400 border-pink-500/55' },

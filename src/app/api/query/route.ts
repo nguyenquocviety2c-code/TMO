@@ -936,7 +936,7 @@ async function regenerateEmbeddings(documentId?: string): Promise<{ total: numbe
     for (const chunk of chunks) {
       try {
         const { vector, model } = await generateEmbedding(chunk.payload.content)
-        if (model === 'pseudo-hash-1536') { errors++; continue }
+        if (model === 'pseudo-hash-2048') { errors++; continue }
         await upsertChunks([{ id: chunk.id, vector, payload: chunk.payload }])
         updated++
       } catch {
@@ -1015,7 +1015,7 @@ export async function GET(request: NextRequest) {
       const real = stats.vectorsIndexed
       const pseudo = 0 // No pseudo vectors in Qdrant architecture
       const realRatio = total > 0 ? real / total : 0
-      return NextResponse.json({ total, real, pseudo, realRatio, hasRealEmbeddings: real > 0, dimension: 1536 })
+      return NextResponse.json({ total, real, pseudo, realRatio, hasRealEmbeddings: real > 0, dimension: 2048 })
     }
 
     if (action === 'stats') {

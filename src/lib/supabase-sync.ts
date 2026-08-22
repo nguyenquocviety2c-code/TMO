@@ -82,6 +82,7 @@ export async function pushToSupabase(): Promise<FullSyncResult> {
         name: a.name,
         description: a.description,
         instruction: a.instruction,
+        capable: a.capable,
         domain: a.domain,
         provider: a.provider,
         model: a.model,
@@ -122,9 +123,10 @@ export async function pushToSupabase(): Promise<FullSyncResult> {
     totalPushed += skills.length
   } catch (e) { results.push({ table: 'AgentSkill', pushed: 0, pulled: 0, errors: [String(e)] }) }
 
-  // 3. AgentMemory
+  // 3. AgentMemory — FULL backup including qdrantPointId, embeddingModel, tags, domain, tier, expiresAt
+  //    (Previous version omitted these — memory would lose vector linkage on restore)
   try {
-    const memories = await db.agentMemory.findMany({ take: 500 })
+    const memories = await db.agentMemory.findMany({ take: 1000 })
     const { error } = await client.from('agent_memory_backup').upsert(
       memories.map(m => ({
         id: m.id,
@@ -137,10 +139,14 @@ export async function pushToSupabase(): Promise<FullSyncResult> {
         importance: m.importance,
         access_count: m.accessCount,
         last_accessed_at: m.lastAccessedAt?.toISOString(),
+        qdrant_point_id: m.qdrantPointId,
+        embedding_model: m.embeddingModel,
         source: m.source,
+        tags: m.tags,
         domain: (m as { domain?: string }).domain || 'work',
         tier: (m as { tier?: string }).tier || 'warm',
         is_active: m.isActive,
+        expires_at: (m as { expiresAt?: Date | null }).expiresAt?.toISOString(),
         created_at: m.createdAt?.toISOString(),
         updated_at: m.updatedAt?.toISOString(),
       })),
@@ -149,6 +155,48 @@ export async function pushToSupabase(): Promise<FullSyncResult> {
     results.push({ table: 'AgentMemory', pushed: memories.length, pulled: 0, errors: error ? [error.message] : [] })
     totalPushed += memories.length
   } catch (e) { results.push({ table: 'AgentMemory', pushed: 0, pulled: 0, errors: [String(e)] }) }
+
+  // 3b. MemoryArchive — COLD tier summaries (NEW backup target)
+  try {
+    const archives = await db.memoryArchive.findMany({ take: 1000 })
+    const { error } = await client.from('memory_archive_backup').upsert(
+      archives.map(a => ({
+        id: a.id,
+        agent_id: a.agentId,
+        original_ids: a.originalIds,
+        summary_content: a.summaryContent,
+        domain: a.domain,
+        importance: a.importance,
+        source_count: a.sourceCount,
+        qdrant_point_id: a.qdrantPointId,
+        embedding_model: a.embeddingModel,
+        expires_at: a.expiresAt?.toISOString(),
+        created_at: a.createdAt?.toISOString(),
+      })),
+      { onConflict: 'id' }
+    )
+    results.push({ table: 'MemoryArchive', pushed: archives.length, pulled: 0, errors: error ? [error.message] : [] })
+    totalPushed += archives.length
+  } catch (e) { results.push({ table: 'MemoryArchive', pushed: 0, pulled: 0, errors: [String(e)] }) }
+
+  // 3c. MemoryAccessLog — access history for recall analytics (NEW backup target)
+  try {
+    const logs = await db.memoryAccessLog.findMany({ take: 1000, orderBy: { createdAt: 'desc' } })
+    const { error } = await client.from('memory_access_log_backup').upsert(
+      logs.map(l => ({
+        id: l.id,
+        memory_id: l.memoryId,
+        agent_id: l.agentId,
+        session_id: l.sessionId,
+        query: l.query,
+        relevance: l.relevance,
+        created_at: l.createdAt?.toISOString(),
+      })),
+      { onConflict: 'id' }
+    )
+    results.push({ table: 'MemoryAccessLog', pushed: logs.length, pulled: 0, errors: error ? [error.message] : [] })
+    totalPushed += logs.length
+  } catch (e) { results.push({ table: 'MemoryAccessLog', pushed: 0, pulled: 0, errors: [String(e)] }) }
 
   // 4. AgentSession
   try {
@@ -245,6 +293,84 @@ export async function pushToSupabase(): Promise<FullSyncResult> {
     totalPushed += policies.length
   } catch (e) { results.push({ table: 'KnowledgeAccessPolicy', pushed: 0, pulled: 0, errors: [String(e)] }) }
 
+  // 9. UserProfile — personal data (name, language, preferences, expertise)
+  try {
+    const profiles = await db.userProfile.findMany()
+    const { error } = await client.from('user_profile_backup').upsert(
+      profiles.map(p => ({
+        id: p.id,
+        user_id: p.userId,
+        key: p.key,
+        value: p.value,
+        source: p.source,
+        confidence: p.confidence,
+        access_count: p.accessCount,
+        is_active: p.isActive,
+        created_at: p.createdAt?.toISOString(),
+        updated_at: p.updatedAt?.toISOString(),
+      })),
+      { onConflict: 'id' }
+    )
+    results.push({ table: 'UserProfile', pushed: profiles.length, pulled: 0, errors: error ? [error.message] : [] })
+    totalPushed += profiles.length
+  } catch (e) { results.push({ table: 'UserProfile', pushed: 0, pulled: 0, errors: [String(e)] }) }
+
+  // 10. AgentInsight — auto-learned insights (factual/procedural/preference/pattern)
+  try {
+    const insights = await db.agentInsight.findMany({ take: 1000 })
+    const { error } = await client.from('agent_insight_backup').upsert(
+      insights.map(i => ({
+        id: i.id,
+        agent_id: i.agentId,
+        content: i.content,
+        source: i.source,
+        type: i.type,
+        confidence: i.confidence,
+        created_at: i.createdAt?.toISOString(),
+      })),
+      { onConflict: 'id' }
+    )
+    results.push({ table: 'AgentInsight', pushed: insights.length, pulled: 0, errors: error ? [error.message] : [] })
+    totalPushed += insights.length
+  } catch (e) { results.push({ table: 'AgentInsight', pushed: 0, pulled: 0, errors: [String(e)] }) }
+
+  // 11. AgentPreference — agent-specific preferences
+  try {
+    const prefs = await db.agentPreference.findMany()
+    const { error } = await client.from('agent_preference_backup').upsert(
+      prefs.map(p => ({
+        id: p.id,
+        agent_id: p.agentId,
+        preference_key: p.preferenceKey,
+        preference_value: p.preferenceValue,
+        source: p.source,
+        created_at: p.createdAt?.toISOString(),
+      })),
+      { onConflict: 'id' }
+    )
+    results.push({ table: 'AgentPreference', pushed: prefs.length, pulled: 0, errors: error ? [error.message] : [] })
+    totalPushed += prefs.length
+  } catch (e) { results.push({ table: 'AgentPreference', pushed: 0, pulled: 0, errors: [String(e)] }) }
+
+  // 12. AgentCorrection — corrections from feedback
+  try {
+    const corrections = await db.agentCorrection.findMany({ take: 1000 })
+    const { error } = await client.from('agent_correction_backup').upsert(
+      corrections.map(c => ({
+        id: c.id,
+        agent_id: c.agentId,
+        wrong_answer: c.wrongAnswer,
+        correct_answer: c.correctAnswer,
+        reason: c.reason,
+        applied: c.applied,
+        created_at: c.createdAt?.toISOString(),
+      })),
+      { onConflict: 'id' }
+    )
+    results.push({ table: 'AgentCorrection', pushed: corrections.length, pulled: 0, errors: error ? [error.message] : [] })
+    totalPushed += corrections.length
+  } catch (e) { results.push({ table: 'AgentCorrection', pushed: 0, pulled: 0, errors: [String(e)] }) }
+
   const durationMs = Date.now() - startTime
   console.log(`[Supabase] Push complete: ${totalPushed} records in ${durationMs}ms`)
   return { results, totalPushed, totalPulled: 0, durationMs }
@@ -270,41 +396,52 @@ export async function pullFromSupabase(): Promise<FullSyncResult> {
   try {
     const { data, error } = await client.from('agent_profiles_backup').select('*')
     if (!error && data && data.length > 0) {
+      let pulled = 0
       for (const a of data) {
-        await db.agentProfile.upsert({
-          where: { id: a.id },
-          create: {
-            id: a.id,
-            name: a.name,
-            description: a.description || '',
-            instruction: a.instruction || '',
-            domain: a.domain || 'mixed',
-            provider: a.provider || 'nvidia',
-            model: a.model || 'moonshotai/kimi-k3',
-            team: a.team || null,
-            position: a.position || null,
-            avatar: a.avatar || '🤖',
-            temperature: parseFloat(a.temperature) || 0.5,
-            maxTokens: parseInt(a.maxTokens) || 4096,
-            enabled: a.enabled ?? true,
-            isSystem: a.isSystem ?? false,
-          },
-          update: {
-            model: a.model,
-            enabled: a.enabled,
-          },
-        })
+        try {
+          // Check if an agent with this name already exists (avoid unique constraint violation)
+          const existing = await db.agentProfile.findFirst({ where: { name: a.name }, select: { id: true } })
+          if (existing && existing.id !== a.id) {
+            // Name conflict — skip this record (keep existing local agent)
+            continue
+          }
+          await db.agentProfile.upsert({
+            where: { id: a.id },
+            create: {
+              id: a.id,
+              name: a.name,
+              description: a.description || '',
+              instruction: a.instruction || '',
+              capable: a.capable || '',
+              domain: a.domain || 'mixed',
+              provider: a.provider || 'nvidia',
+              model: a.model || 'moonshotai/kimi-k3',
+              team: a.team || null,
+              position: a.position || null,
+              avatar: a.avatar || '🤖',
+              temperature: parseFloat(a.temperature) || 0.5,
+              maxTokens: parseInt(a.maxTokens) || 4096,
+              enabled: a.enabled ?? true,
+              isSystem: a.isSystem ?? false,
+            },
+            update: {
+              model: a.model,
+              enabled: a.enabled,
+            },
+          })
+          pulled++
+        } catch (e) { /* skip individual conflict */ }
       }
-      results.push({ table: 'AgentProfile', pushed: 0, pulled: data.length, errors: [] })
-      totalPulled += data.length
+      results.push({ table: 'AgentProfile', pushed: 0, pulled, errors: [] })
+      totalPulled += pulled
     } else {
       results.push({ table: 'AgentProfile', pushed: 0, pulled: 0, errors: error ? [error.message] : [] })
     }
   } catch (e) { results.push({ table: 'AgentProfile', pushed: 0, pulled: 0, errors: [String(e)] }) }
 
-  // 2. AgentMemory — restore memories
+  // 2. AgentMemory — FULL restore including qdrantPointId + embeddingModel + tags + domain + tier + expiresAt
   try {
-    const { data, error } = await client.from('agent_memory_backup').select('*').limit(500)
+    const { data, error } = await client.from('agent_memory_backup').select('*').limit(1000)
     if (!error && data && data.length > 0) {
       for (const m of data) {
         await db.agentMemory.upsert({
@@ -319,12 +456,30 @@ export async function pullFromSupabase(): Promise<FullSyncResult> {
             context: m.context,
             importance: m.importance || 0.5,
             accessCount: m.access_count || 0,
+            lastAccessedAt: m.last_accessed_at ? new Date(m.last_accessed_at) : null,
+            qdrantPointId: m.qdrant_point_id || null,
+            embeddingModel: m.embedding_model || null,
             source: m.source || 'auto',
+            tags: m.tags || null,
             domain: m.domain || 'work',
             tier: m.tier || 'warm',
             isActive: m.is_active ?? true,
+            expiresAt: m.expires_at ? new Date(m.expires_at) : null,
           },
-          update: {},
+          update: {
+            // Update mutable fields on existing records
+            content: m.content,
+            importance: m.importance || 0.5,
+            accessCount: m.access_count || 0,
+            lastAccessedAt: m.last_accessed_at ? new Date(m.last_accessed_at) : undefined,
+            qdrantPointId: m.qdrant_point_id || null,
+            embeddingModel: m.embedding_model || null,
+            tags: m.tags || null,
+            domain: m.domain || 'work',
+            tier: m.tier || 'warm',
+            isActive: m.is_active ?? true,
+            expiresAt: m.expires_at ? new Date(m.expires_at) : null,
+          },
         })
       }
       results.push({ table: 'AgentMemory', pushed: 0, pulled: data.length, errors: [] })
@@ -334,24 +489,360 @@ export async function pullFromSupabase(): Promise<FullSyncResult> {
     }
   } catch (e) { results.push({ table: 'AgentMemory', pushed: 0, pulled: 0, errors: [String(e)] }) }
 
-  // 3-8: Other tables — similar pattern (abbreviated for now, can expand later)
-  for (const [table, backupTable] of [
-    ['AgentSession', 'agent_sessions_backup'],
-    ['ChatMessage', 'chat_messages_backup'],
-    ['MCPBridgeConfig', 'mcp_bridge_config_backup'],
-    ['KnowledgeAccessPolicy', 'knowledge_access_policy_backup'],
-  ] as const) {
-    try {
-      const { data, error } = await client.from(backupTable).select('*').limit(200)
-      results.push({
-        table,
-        pushed: 0,
-        pulled: data?.length || 0,
-        errors: error ? [error.message] : [],
-      })
-      totalPulled += data?.length || 0
-    } catch (e) { results.push({ table, pushed: 0, pulled: 0, errors: [String(e)] }) }
-  }
+  // 2b. MemoryArchive — restore COLD tier summaries
+  try {
+    const { data, error } = await client.from('memory_archive_backup').select('*').limit(1000)
+    if (!error && data && data.length > 0) {
+      for (const a of data) {
+        await db.memoryArchive.upsert({
+          where: { id: a.id },
+          create: {
+            id: a.id,
+            agentId: a.agent_id,
+            originalIds: a.original_ids,
+            summaryContent: a.summary_content,
+            domain: a.domain || 'work',
+            importance: a.importance || 0.3,
+            sourceCount: a.source_count || 1,
+            qdrantPointId: a.qdrant_point_id || null,
+            embeddingModel: a.embedding_model || null,
+            expiresAt: a.expires_at ? new Date(a.expires_at) : null,
+            createdAt: a.created_at ? new Date(a.created_at) : new Date(),
+          },
+          update: {
+            summaryContent: a.summary_content,
+            importance: a.importance || 0.3,
+            qdrantPointId: a.qdrant_point_id || null,
+          },
+        })
+      }
+      results.push({ table: 'MemoryArchive', pushed: 0, pulled: data.length, errors: [] })
+      totalPulled += data.length
+    } else {
+      results.push({ table: 'MemoryArchive', pushed: 0, pulled: 0, errors: error ? [error.message] : [] })
+    }
+  } catch (e) { results.push({ table: 'MemoryArchive', pushed: 0, pulled: 0, errors: [String(e)] }) }
+
+  // 2c. MemoryAccessLog — restore access history (skip conflicts to preserve latest)
+  try {
+    const { data, error } = await client.from('memory_access_log_backup').select('*').limit(1000)
+    if (!error && data && data.length > 0) {
+      let pulled = 0
+      for (const l of data) {
+        try {
+          await db.memoryAccessLog.upsert({
+            where: { id: l.id },
+            create: {
+              id: l.id,
+              memoryId: l.memory_id,
+              agentId: l.agent_id,
+              sessionId: l.session_id,
+              query: l.query,
+              relevance: l.relevance || 0.5,
+              createdAt: l.created_at ? new Date(l.created_at) : new Date(),
+            },
+            update: {},
+          })
+          pulled++
+        } catch { /* skip conflict */ }
+      }
+      results.push({ table: 'MemoryAccessLog', pushed: 0, pulled, errors: [] })
+      totalPulled += pulled
+    } else {
+      results.push({ table: 'MemoryAccessLog', pushed: 0, pulled: 0, errors: error ? [error.message] : [] })
+    }
+  } catch (e) { results.push({ table: 'MemoryAccessLog', pushed: 0, pulled: 0, errors: [String(e)] }) }
+
+  // 3. AgentSkill — restore installed skills
+  try {
+    const { data, error } = await client.from('agent_skills_backup').select('*').limit(500)
+    if (!error && data && data.length > 0) {
+      let pulled = 0
+      for (const s of data) {
+        try {
+          await db.agentSkill.upsert({
+            where: { id: s.id },
+            create: {
+              id: s.id,
+              agentId: s.agent_id || 'default',
+              slug: s.slug,
+              name: s.name,
+              content: s.content,
+              source: s.source || 'bundled',
+              enabled: s.enabled ?? true,
+              version: s.version || '1.0.0',
+              installedAt: s.installed_at ? new Date(s.installed_at) : new Date(),
+            },
+            update: {
+              content: s.content,
+              enabled: s.enabled ?? true,
+              version: s.version,
+            },
+          })
+          pulled++
+        } catch { /* skip conflict */ }
+      }
+      results.push({ table: 'AgentSkill', pushed: 0, pulled, errors: [] })
+      totalPulled += pulled
+    } else {
+      results.push({ table: 'AgentSkill', pushed: 0, pulled: 0, errors: error ? [error.message] : [] })
+    }
+  } catch (e) { results.push({ table: 'AgentSkill', pushed: 0, pulled: 0, errors: [String(e)] }) }
+
+  // 4. AgentSession — restore chat sessions
+  try {
+    const { data, error } = await client.from('agent_sessions_backup').select('*').limit(500)
+    if (!error && data && data.length > 0) {
+      let pulled = 0
+      for (const s of data) {
+        try {
+          await db.agentSession.upsert({
+            where: { sessionId: s.session_id },
+            create: {
+              sessionId: s.session_id,
+              model: s.model,
+              provider: s.provider,
+              title: s.title,
+              messageCount: s.message_count || 0,
+              agentProfileId: s.agent_profile_id,
+              teamMode: s.team_mode,
+              teamName: s.team_name,
+            },
+            update: {
+              messageCount: s.message_count || 0,
+              title: s.title,
+            },
+          })
+          pulled++
+        } catch { /* skip conflict */ }
+      }
+      results.push({ table: 'AgentSession', pushed: 0, pulled, errors: [] })
+      totalPulled += pulled
+    } else {
+      results.push({ table: 'AgentSession', pushed: 0, pulled: 0, errors: error ? [error.message] : [] })
+    }
+  } catch (e) { results.push({ table: 'AgentSession', pushed: 0, pulled: 0, errors: [String(e)] }) }
+
+  // 5. ChatMessage — restore chat history
+  try {
+    const { data, error } = await client.from('chat_messages_backup').select('*').limit(1000)
+    if (!error && data && data.length > 0) {
+      let pulled = 0
+      for (const m of data) {
+        try {
+          await db.chatMessage.upsert({
+            where: { id: m.id },
+            create: {
+              id: m.id,
+              sessionId: m.session_id,
+              role: m.role,
+              content: m.content,
+              model: m.model,
+              provider: m.provider,
+              createdAt: m.created_at ? new Date(m.created_at) : new Date(),
+            },
+            update: {},
+          })
+          pulled++
+        } catch { /* skip conflict */ }
+      }
+      results.push({ table: 'ChatMessage', pushed: 0, pulled, errors: [] })
+      totalPulled += pulled
+    } else {
+      results.push({ table: 'ChatMessage', pushed: 0, pulled: 0, errors: error ? [error.message] : [] })
+    }
+  } catch (e) { results.push({ table: 'ChatMessage', pushed: 0, pulled: 0, errors: [String(e)] }) }
+
+  // 6. MCPBridgeConfig — restore MCP tool configs
+  try {
+    const { data, error } = await client.from('mcp_bridge_config_backup').select('*').limit(200)
+    if (!error && data && data.length > 0) {
+      let pulled = 0
+      for (const c of data) {
+        try {
+          await db.mCPBridgeConfig.upsert({
+            where: { id: c.id },
+            create: {
+              id: c.id,
+              direction: c.direction,
+              toolName: c.tool_name,
+              enabled: c.enabled ?? true,
+              config: typeof c.config === 'string' ? c.config : JSON.stringify(c.config || {}),
+            },
+            update: {
+              enabled: c.enabled ?? true,
+              config: typeof c.config === 'string' ? c.config : JSON.stringify(c.config || {}),
+            },
+          })
+          pulled++
+        } catch { /* skip conflict */ }
+      }
+      results.push({ table: 'MCPBridgeConfig', pushed: 0, pulled, errors: [] })
+      totalPulled += pulled
+    } else {
+      results.push({ table: 'MCPBridgeConfig', pushed: 0, pulled: 0, errors: error ? [error.message] : [] })
+    }
+  } catch (e) { results.push({ table: 'MCPBridgeConfig', pushed: 0, pulled: 0, errors: [String(e)] }) }
+
+  // 7. KnowledgeAccessPolicy — restore KB access policies
+  try {
+    const { data, error } = await client.from('knowledge_access_policy_backup').select('*').limit(100)
+    if (!error && data && data.length > 0) {
+      let pulled = 0
+      for (const p of data) {
+        try {
+          await db.knowledgeAccessPolicy.upsert({
+            where: { id: p.id },
+            create: {
+              id: p.id,
+              agentId: p.agent_id || 'default',
+              allowRead: p.allow_read ?? true,
+              allowWrite: p.allow_write ?? true,
+              allowDelete: p.allow_delete ?? false,
+              allowedCollections: p.allowed_collections || 'theopus_documents,theopus_chunks',
+              allowedLabels: p.allowed_labels || '*',
+            },
+            update: {
+              allowRead: p.allow_read ?? true,
+              allowWrite: p.allow_write ?? true,
+              allowDelete: p.allow_delete ?? false,
+            },
+          })
+          pulled++
+        } catch { /* skip conflict */ }
+      }
+      results.push({ table: 'KnowledgeAccessPolicy', pushed: 0, pulled, errors: [] })
+      totalPulled += pulled
+    } else {
+      results.push({ table: 'KnowledgeAccessPolicy', pushed: 0, pulled: 0, errors: error ? [error.message] : [] })
+    }
+  } catch (e) { results.push({ table: 'KnowledgeAccessPolicy', pushed: 0, pulled: 0, errors: [String(e)] }) }
+
+  // 8. UserProfile — restore personal data (name, language, preferences)
+  try {
+    const { data, error } = await client.from('user_profile_backup').select('*').limit(500)
+    if (!error && data && data.length > 0) {
+      let pulled = 0
+      for (const p of data) {
+        try {
+          await db.userProfile.upsert({
+            where: { id: p.id },
+            create: {
+              id: p.id,
+              userId: p.user_id || 'default',
+              key: p.key,
+              value: p.value,
+              source: p.source || 'auto',
+              confidence: p.confidence || 0.5,
+              accessCount: p.access_count || 0,
+              isActive: p.is_active ?? true,
+            },
+            update: {
+              value: p.value,
+              confidence: p.confidence,
+              isActive: p.is_active ?? true,
+            },
+          })
+          pulled++
+        } catch { /* skip conflict */ }
+      }
+      results.push({ table: 'UserProfile', pushed: 0, pulled, errors: [] })
+      totalPulled += pulled
+    } else {
+      results.push({ table: 'UserProfile', pushed: 0, pulled: 0, errors: error ? [error.message] : [] })
+    }
+  } catch (e) { results.push({ table: 'UserProfile', pushed: 0, pulled: 0, errors: [String(e)] }) }
+
+  // 9. AgentInsight — restore auto-learned insights
+  try {
+    const { data, error } = await client.from('agent_insight_backup').select('*').limit(1000)
+    if (!error && data && data.length > 0) {
+      let pulled = 0
+      for (const i of data) {
+        try {
+          await db.agentInsight.upsert({
+            where: { id: i.id },
+            create: {
+              id: i.id,
+              agentId: i.agent_id || 'default',
+              content: i.content,
+              source: i.source,
+              type: i.type,
+              confidence: i.confidence || 0.5,
+              createdAt: i.created_at ? new Date(i.created_at) : new Date(),
+            },
+            update: {},
+          })
+          pulled++
+        } catch { /* skip conflict */ }
+      }
+      results.push({ table: 'AgentInsight', pushed: 0, pulled, errors: [] })
+      totalPulled += pulled
+    } else {
+      results.push({ table: 'AgentInsight', pushed: 0, pulled: 0, errors: error ? [error.message] : [] })
+    }
+  } catch (e) { results.push({ table: 'AgentInsight', pushed: 0, pulled: 0, errors: [String(e)] }) }
+
+  // 10. AgentPreference — restore agent preferences
+  try {
+    const { data, error } = await client.from('agent_preference_backup').select('*').limit(500)
+    if (!error && data && data.length > 0) {
+      let pulled = 0
+      for (const p of data) {
+        try {
+          await db.agentPreference.upsert({
+            where: { id: p.id },
+            create: {
+              id: p.id,
+              agentId: p.agent_id || 'default',
+              preferenceKey: p.preference_key,
+              preferenceValue: p.preference_value,
+              source: p.source || 'auto',
+              createdAt: p.created_at ? new Date(p.created_at) : new Date(),
+            },
+            update: {
+              preferenceValue: p.preference_value,
+            },
+          })
+          pulled++
+        } catch { /* skip conflict */ }
+      }
+      results.push({ table: 'AgentPreference', pushed: 0, pulled, errors: [] })
+      totalPulled += pulled
+    } else {
+      results.push({ table: 'AgentPreference', pushed: 0, pulled: 0, errors: error ? [error.message] : [] })
+    }
+  } catch (e) { results.push({ table: 'AgentPreference', pushed: 0, pulled: 0, errors: [String(e)] }) }
+
+  // 11. AgentCorrection — restore agent corrections
+  try {
+    const { data, error } = await client.from('agent_correction_backup').select('*').limit(1000)
+    if (!error && data && data.length > 0) {
+      let pulled = 0
+      for (const c of data) {
+        try {
+          await db.agentCorrection.upsert({
+            where: { id: c.id },
+            create: {
+              id: c.id,
+              agentId: c.agent_id || 'default',
+              wrongAnswer: c.wrong_answer,
+              correctAnswer: c.correct_answer,
+              reason: c.reason,
+              applied: c.applied ?? false,
+              createdAt: c.created_at ? new Date(c.created_at) : new Date(),
+            },
+            update: {},
+          })
+          pulled++
+        } catch { /* skip conflict */ }
+      }
+      results.push({ table: 'AgentCorrection', pushed: 0, pulled, errors: [] })
+      totalPulled += pulled
+    } else {
+      results.push({ table: 'AgentCorrection', pushed: 0, pulled: 0, errors: error ? [error.message] : [] })
+    }
+  } catch (e) { results.push({ table: 'AgentCorrection', pushed: 0, pulled: 0, errors: [String(e)] }) }
 
   const durationMs = Date.now() - startTime
   console.log(`[Supabase] Pull complete: ${totalPulled} records in ${durationMs}ms`)
@@ -380,7 +871,7 @@ export async function checkSupabaseHealth(): Promise<{
     return {
       configured: true,
       connected: !error,
-      tableCount: 9, // 8 backup tables + sync_log
+      tableCount: 13, // 12 backup tables + sync_log (memory + chat + config + personal data)
       error: error?.message,
     }
   } catch (e) {

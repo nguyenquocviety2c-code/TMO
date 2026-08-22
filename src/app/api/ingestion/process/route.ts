@@ -36,6 +36,7 @@ import { upsertDocument, getDocument, listDocuments, updateDocumentStatus, delet
 import type { DocumentPayload, ChunkPayload } from '@/lib/qdrant'
 import { db } from '@/lib/db'
 import { invalidateDocumentCache } from '@/lib/doc-cache'
+import { downloadFileFromR2, isR2Configured } from '@/lib/r2-storage'
 import { resolveEntities as resolveEntitiesLib, type ResolvedEntity as ResolvedEntityLib, type DuplicatePair as DuplicatePairLib } from '@/lib/ingestion/entity-resolver'
 import { randomUUID } from 'crypto'
 import { readFile } from 'fs/promises'
@@ -135,6 +136,8 @@ function qdrantDocToRecord(payload: DocumentPayload, id: string): Record<string,
     processing_percent: payload.processing_percent,
     created_at: payload.created_at,
     updated_at: payload.updated_at,
+    // Preserve R2 linkage for fallback download when local file is missing
+    r2_key: (payload as Record<string, unknown>).r2_key,
   }
 }
 
@@ -1889,15 +1892,34 @@ async function runIngestionPipeline(documentId: string, slotIndex: number = -1):
       // Delete old data before re-processing
       await deleteOldDocumentData(documentId)
 
-      // Step 2: Download PDF from local filesystem
+      // Step 2: Download PDF — try local filesystem first, then R2 cloud backup
+      // (R2-restored documents don't have local files yet — auto-pull from R2)
       steps = markStepRunning(steps, 'download')
       await updateDocProgress(documentId, { status: 'parsing', steps })
       if (!document.file_path) throw new Error('Document has no file_path')
 
       let pdfBuffer: Buffer
       try {
-        const fileData = await downloadFromFilesystem(document.file_path as string)
-        if (!fileData) throw new Error('Failed to download PDF: file not found on local filesystem')
+        // First attempt: local filesystem
+        let fileData: Buffer | null = await downloadFromFilesystem(document.file_path as string)
+
+        // Fallback: pull from R2 cloud backup (for documents restored from R2
+        // that don't have a local copy yet — e.g. after sandbox reset)
+        if (!fileData && isR2Configured()) {
+          // r2_key was preserved by qdrantDocToRecord when the doc was created from R2 metadata
+          const r2Key = (document as { r2_key?: string }).r2_key
+            || `pdfs/${documentId}_${(document.title || '').replace(/[^a-zA-Z0-9._-]/g, '_')}.pdf`
+          console.log(`[Process] Local file missing — restoring from R2: ${r2Key}`)
+          const r2Result = await downloadFileFromR2(r2Key, document.file_path as string)
+          if (r2Result.success) {
+            fileData = await readFile(document.file_path as string)
+            console.log(`[Process] Restored ${r2Result.size} bytes from R2 → ${document.file_path}`)
+          } else {
+            throw new Error(`Local file not found AND R2 download failed for key "${r2Key}": ${r2Result.error || 'unknown'}`)
+          }
+        }
+
+        if (!fileData) throw new Error('PDF not found on local filesystem and R2 not configured')
         pdfBuffer = fileData
       } catch (downloadErr) { throw new Error(`Failed to download PDF: ${downloadErr instanceof Error ? downloadErr.message : String(downloadErr)}`) }
       steps = markStepCompleted(steps, 'download', `${(pdfBuffer.length / 1024).toFixed(0)} KB`)
@@ -3378,7 +3400,70 @@ export async function POST(request: NextRequest) {
           } catch (sqliteErr) {
             console.warn(`[Process] SQLite fallback failed for ${docId.slice(0, 8)}:`, sqliteErr instanceof Error ? sqliteErr.message : String(sqliteErr))
           }
-          console.warn(`[Process] Document ${docId} not found in Qdrant or SQLite — skipping`)
+
+          // R2 FALLBACK: Document not in Qdrant or SQLite — check R2 cloud backup.
+          // This handles documents restored from R2 (after sandbox reset) that show in
+          // the UI list but have no Qdrant metadata yet. Create the Qdrant record from
+          // R2 metadata so the pipeline can process them.
+          if (isR2Configured()) {
+            try {
+              const { listR2Objects } = await import('@/lib/r2-storage')
+              const r2List = await listR2Objects('pdfs/', 500)
+              if (r2List.success) {
+                // Find the R2 object matching this docId (key prefix = docId)
+                const r2Obj = r2List.objects.find(o => {
+                  const basename = o.key.split('/').pop() || o.key
+                  const underscoreIdx = basename.indexOf('_')
+                  const prefix = underscoreIdx > 0 ? basename.substring(0, underscoreIdx) : basename.replace(/\.pdf$/i, '')
+                  return prefix === docId
+                })
+                if (r2Obj) {
+                  const basename = r2Obj.key.split('/').pop() || r2Obj.key
+                  const filename = basename.indexOf('_') > 0 ? basename.substring(basename.indexOf('_') + 1) : basename
+                  const filePath = `${UPLOAD_DIR}/${basename}`
+                  console.log(`[Process] Document ${docId.slice(0, 8)}... found in R2 (${r2Obj.key}) — creating Qdrant record`)
+                  // Create Qdrant document record from R2 metadata
+                  const newPayload: Record<string, unknown> = {
+                    title: filename.replace(/\.pdf$/i, ''),
+                    file_path: filePath,
+                    domain: 'mixed',
+                    page_count: null,
+                    status: 'uploaded',
+                    error_message: null,
+                    processing_steps: [],
+                    processing_percent: 0,
+                    r2_key: r2Obj.key,
+                    created_at: r2Obj.lastModified.toISOString(),
+                    updated_at: r2Obj.lastModified.toISOString(),
+                  }
+                  await upsertDocument(docId, newPayload as DocumentPayload)
+                  // Re-read from Qdrant
+                  const retryPayload = await getDocument(docId)
+                  if (retryPayload) {
+                    const currentDoc = qdrantDocToRecord(retryPayload, docId)
+                    const isPartialCheck = false // fresh doc
+                    const cleanedStepsCheck = getDefaultSteps()
+                    await updateDocumentStatus(docId, {
+                      status: 'parsing',
+                      processing_steps: cleanedStepsCheck as DocumentPayload['processing_steps'],
+                      processing_percent: 0,
+                    })
+                    const slotIndex = acquireKey(docId)
+                    if (slotIndex < 0) {
+                      console.log(`[Process] No free key for doc ${docId} — will be picked up when a key frees`)
+                    }
+                    clearDocPaused(docId)
+                    activeDocIds.push(docId)
+                    continue
+                  }
+                }
+              }
+            } catch (r2Err) {
+              console.warn(`[Process] R2 fallback failed for ${docId.slice(0, 8)}:`, r2Err instanceof Error ? r2Err.message : String(r2Err))
+            }
+          }
+
+          console.warn(`[Process] Document ${docId} not found in Qdrant, SQLite, or R2 — skipping`)
           continue
         }
         const currentDoc = qdrantDocToRecord(docPayload, docId)
