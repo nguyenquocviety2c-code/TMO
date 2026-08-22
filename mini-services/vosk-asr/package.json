@@ -1,9 +1,0 @@
-{
-  "name": "vosk-asr",
-  "version": "1.0.0",
-  "description": "Vosk Vietnamese Speech-to-Text mini-service",
-  "scripts": {
-    "dev": "python3 index.py"
-  },
-  "dependencies": {}
-}

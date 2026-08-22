@@ -10,10 +10,6 @@
 // module (Database > Tài liệu) — without it the document list is always empty.
 // Binary downloaded to /home/z/qdrant/qdrant (v1.19.0).
 //
-// Vosk ASR (port 3004) IS managed here — offline Vietnamese speech-to-text.
-// Python mini-service at /home/z/tmo-app/mini-services/vosk-asr/index.py.
-// Used by Live Mode (POST /api/voice/transcribe) before falling back to z-ai cloud.
-//
 // Neo4j (AuraDB cloud) is NOT managed here — it is a managed cloud service.
 // Once AuraDB credentials are configured in .env, the app connects automatically.
 //
@@ -78,26 +74,5 @@ module.exports = {
       merge_logs: true,
       kill_timeout: 5000,
     },
-    {
-      // Vosk ASR — offline Vietnamese speech-to-text (port 3004).
-      // Python mini-service using vosk-model-vn-0.4 (~70MB, loaded at startup).
-      // Used by Live Mode: POST /api/voice/transcribe → /transcribe on 3004.
-      // Falls back to z-ai cloud ASR if this is down.
-      name: 'vosk-asr',
-      script: 'python3',
-      args: 'index.py',
-      cwd: '/home/z/tmo-app/mini-services/vosk-asr',
-      env: {
-        PYTHONUNBUFFERED: '1',
-      },
-      watch: false,
-      autorestart: true,
-      max_restarts: 50,
-      restart_delay: 3000,
-      out_file: '/home/z/my-project/.zscripts/vosk.log',
-      error_file: '/home/z/my-project/.zscripts/vosk.log',
-      merge_logs: true,
-      kill_timeout: 5000,
-    },
-  ],
+],
 };
