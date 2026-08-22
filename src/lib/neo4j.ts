@@ -315,7 +315,7 @@ export async function getNeo4jDriver(): Promise<Neo4jDriver | null> {
 async function getSession(): Promise<Session> {
   const driver = await getNeo4jDriver()
   if (!driver) throw new Error('Neo4j driver not available')
-  return driver.session({ database: process.env.NEO4j_DATABASE || undefined })
+  return driver.session({ database: process.env.NEO4J_DATABASE || undefined })
 }
 
 /**
@@ -1618,6 +1618,134 @@ export async function deleteRelationshipsByDocument(documentId: string): Promise
 }
 
 // ==================== DOCUMENT GRAPH OPERATIONS ====================
+
+/**
+ * List ALL Document nodes in the graph.
+ *
+ * NOTE: In this app's data model, `:Document`-labeled nodes come from TWO
+ * sources that share the same label but use DIFFERENT id schemes:
+ *   (a) Entity nodes created during extraction — id = `global__<title>__document`
+ *       (these are entities the LLM typed as "Document", e.g. a paper title).
+ *   (b) UUID-based Document nodes created by `upsertDocumentNode` — id = the
+ *       PDF's upload UUID. These are ONLY created via /api/sync-neo4j, not the
+ *       normal process pipeline, so they may not exist at all.
+ *
+ * Because of (a), this function is NOT reliable for matching R2 PDF UUIDs.
+ * For that, use `getProcessedDocumentsFromNeo4j()` below, which keys off the
+ * `documentId` property stored on RELATIONSHIP edges (always set during
+ * extraction, line ~1568 of process/route.ts).
+ */
+export async function listAllDocumentNodesFromNeo4j(): Promise<
+  Record<string, {
+    id: string
+    title: string
+    domain: string
+    status: string
+    page_count: number
+    created_at: string
+    updated_at: string
+  }>
+> {
+  try {
+    const rows = await readCypher<{
+      id: string
+      title: string
+      domain: string
+      status: string
+      page_count: number
+      created_at: string
+      updated_at: string
+    }>(`MATCH (d:Document)
+         RETURN d.id AS id,
+                d.title AS title,
+                d.domain AS domain,
+                d.status AS status,
+                d.page_count AS page_count,
+                d.created_at AS created_at,
+                d.updated_at AS updated_at`)
+    const map: Record<string, (typeof rows)[number]> = {}
+    for (const r of rows) {
+      if (r.id) map[r.id] = r
+    }
+    return map
+  } catch (err) {
+    console.error(
+      '[Neo4j] listAllDocumentNodesFromNeo4j error:',
+      err instanceof Error ? err.message : String(err)
+    )
+    return {}
+  }
+}
+
+/**
+ * Build the authoritative map of PDF UUIDs that were processed in a prior
+ * session, keyed by document UUID.
+ *
+ * Entity nodes do NOT carry a `documentId` property, and `:Document`-labeled
+ * nodes may be entity-style (`global__…__document`) rather than UUID-based.
+ * The RELIABLE signal that a PDF was processed is the `documentId` property
+ * on RELATIONSHIP edges, which the extraction pipeline always sets
+ * (process/route.ts ~line 1568: `SET rel.documentId = $documentId`).
+ *
+ * Returns, per processed document UUID:
+ *   - entityCount: entities linked via CONTAINS (0 if no UUID Document node)
+ *   - relCount:    relationships whose documentId matches
+ *   - relTypes:    distinct relationship types (USES, APPLIES_TO, ...)
+ *
+ * Used by /api/ingestion/reconcile to rebuild SQLite + Qdrant status.
+ */
+export async function getProcessedDocumentsFromNeo4j(): Promise<
+  Record<string, { entityCount: number; relCount: number; relTypes: string[] }>
+> {
+  const map: Record<string, { entityCount: number; relCount: number; relTypes: string[] }> = {}
+  try {
+    // Relationship counts + types per documentId
+    const rows = await readCypher<{
+      docId: string
+      relCount: number
+      relTypes: string[]
+    }>(`MATCH ()-[r]->()
+         WHERE r.documentId IS NOT NULL
+         RETURN r.documentId AS docId,
+                count(r) AS relCount,
+                collect(DISTINCT type(r)) AS relTypes`)
+    for (const r of rows) {
+      if (r.docId) {
+        map[r.docId] = {
+          entityCount: 0,
+          relCount: r.relCount ?? 0,
+          relTypes: r.relTypes ?? [],
+        }
+      }
+    }
+
+    // Entity counts per documentId via CONTAINS relationships (if UUID Document
+    // nodes exist). This is best-effort — if upsertDocumentNode was never
+    // called, there are no CONTAINS edges and entityCount stays 0.
+    try {
+      const entityRows = await readCypher<{ docId: string; entityCount: number }>(
+        `MATCH (d:Document)-[:CONTAINS]->(e)
+         WHERE d.id IS NOT NULL
+         RETURN d.id AS docId, count(e) AS entityCount`
+      )
+      for (const r of entityRows) {
+        if (r.docId && map[r.docId]) {
+          map[r.docId].entityCount = r.entityCount ?? 0
+        } else if (r.docId) {
+          map[r.docId] = { entityCount: r.entityCount ?? 0, relCount: 0, relTypes: [] }
+        }
+      }
+    } catch {
+      // CONTAINS query is best-effort — ignore failures
+    }
+  } catch (err) {
+    console.error(
+      '[Neo4j] getProcessedDocumentsFromNeo4j error:',
+      err instanceof Error ? err.message : String(err)
+    )
+  }
+  return map
+}
 
 /**
  * Create or update a Document node in the graph.

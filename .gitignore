@@ -125,3 +125,9 @@ tsc-output.txt
 *.bak
 docker-compose.yml~
 .env
+
+# Auto-generated screenshots (from agent-browser verification)
+preview-*.png
+
+# Supabase CLI temp artifacts (from supabase link)
+supabase/.temp/

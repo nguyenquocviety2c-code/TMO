@@ -41,6 +41,10 @@ module.exports = {
         NODE_ENV: 'development',
         NEXT_TELEMETRY_DISABLED: '1',
         PORT: '3000',
+        // Explicit absolute DB path so the app always uses the SQLite database
+        // that was initialized by `bun run db:push`, regardless of the shell
+        // environment that launched PM2.
+        DATABASE_URL: 'file:/home/z/my-project/db/custom.db',
       },
       watch: false,
       autorestart: true,

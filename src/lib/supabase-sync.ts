@@ -371,6 +371,107 @@ export async function pushToSupabase(): Promise<FullSyncResult> {
     totalPushed += corrections.length
   } catch (e) { results.push({ table: 'AgentCorrection', pushed: 0, pulled: 0, errors: [String(e)] }) }
 
+  // 15. Document — document processing state (CRITICAL for surviving sandbox resets)
+  //     Requires the documents_backup table created by migration
+  //     supabase/migrations/20260822110000_add_document_extraction_backup_tables.sql
+  try {
+    const docs = await db.document.findMany()
+    const { error } = await client.from('documents_backup').upsert(
+      docs.map(d => ({
+        id: d.id,
+        title: d.title,
+        file_path: d.filePath,
+        domain: d.domain,
+        page_count: d.pageCount,
+        status: d.status,
+        error_message: d.errorMessage,
+        user_paused: d.userPaused,
+        processing_steps: d.processingSteps,
+        processing_percent: d.processingPercent,
+        created_at: d.createdAt?.toISOString(),
+        updated_at: d.updatedAt?.toISOString(),
+      })),
+      { onConflict: 'id' }
+    )
+    results.push({ table: 'Document', pushed: docs.length, pulled: 0, errors: error ? [error.message] : [] })
+    totalPushed += docs.length
+  } catch (e) { results.push({ table: 'Document', pushed: 0, pulled: 0, errors: [String(e)] }) }
+
+  // 16. LocalEntity — extracted entities buffer (mirrors Neo4j after sync)
+  try {
+    const entities = await db.localEntity.findMany({ take: 5000 })
+    const { error } = await client.from('local_entities_backup').upsert(
+      entities.map(e => ({
+        id: e.id,
+        document_id: e.documentId,
+        chunk_id: e.chunkId,
+        entity_name: e.entityName,
+        entity_type: e.entityType,
+        description: e.description,
+        properties: e.properties,
+        confidence_score: e.confidenceScore,
+        source: e.source,
+        domain: e.domain,
+        resolved_entity_id: e.resolvedEntityId,
+        synced: e.synced,
+        created_at: e.createdAt?.toISOString(),
+        updated_at: e.updatedAt?.toISOString(),
+      })),
+      { onConflict: 'id' }
+    )
+    results.push({ table: 'LocalEntity', pushed: entities.length, pulled: 0, errors: error ? [error.message] : [] })
+    totalPushed += entities.length
+  } catch (e) { results.push({ table: 'LocalEntity', pushed: 0, pulled: 0, errors: [String(e)] }) }
+
+  // 17. LocalRelationship — extracted relationships buffer
+  try {
+    const rels = await db.localRelationship.findMany({ take: 5000 })
+    const { error } = await client.from('local_relationships_backup').upsert(
+      rels.map(r => ({
+        id: r.id,
+        document_id: r.documentId,
+        source_entity_id: r.sourceEntityId,
+        target_entity_id: r.targetEntityId,
+        source_entity_name: r.sourceEntityName,
+        target_entity_name: r.targetEntityName,
+        relationship_type: r.relationshipType,
+        description: r.description,
+        confidence_score: r.confidenceScore,
+        source: r.source,
+        synced: r.synced,
+        created_at: r.createdAt?.toISOString(),
+        updated_at: r.updatedAt?.toISOString(),
+      })),
+      { onConflict: 'id' }
+    )
+    results.push({ table: 'LocalRelationship', pushed: rels.length, pulled: 0, errors: error ? [error.message] : [] })
+    totalPushed += rels.length
+  } catch (e) { results.push({ table: 'LocalRelationship', pushed: 0, pulled: 0, errors: [String(e)] }) }
+
+  // 18. LocalResolvedEntity — canonical merged entities (post-resolution)
+  try {
+    const resolved = await db.localResolvedEntity.findMany({ take: 5000 })
+    const { error } = await client.from('local_resolved_entities_backup').upsert(
+      resolved.map(r => ({
+        id: r.id,
+        document_id: r.documentId,
+        canonical_name: r.canonicalName,
+        entity_type: r.entityType,
+        description: r.description,
+        properties: r.properties,
+        avg_confidence: r.avgConfidence,
+        occurrence_count: r.occurrenceCount,
+        domains: r.domains,
+        synced: r.synced,
+        created_at: r.createdAt?.toISOString(),
+        updated_at: r.updatedAt?.toISOString(),
+      })),
+      { onConflict: 'id' }
+    )
+    results.push({ table: 'LocalResolvedEntity', pushed: resolved.length, pulled: 0, errors: error ? [error.message] : [] })
+    totalPushed += resolved.length
+  } catch (e) { results.push({ table: 'LocalResolvedEntity', pushed: 0, pulled: 0, errors: [String(e)] }) }
+
   const durationMs = Date.now() - startTime
   console.log(`[Supabase] Push complete: ${totalPushed} records in ${durationMs}ms`)
   return { results, totalPushed, totalPulled: 0, durationMs }
@@ -843,6 +944,162 @@ export async function pullFromSupabase(): Promise<FullSyncResult> {
       results.push({ table: 'AgentCorrection', pushed: 0, pulled: 0, errors: error ? [error.message] : [] })
     }
   } catch (e) { results.push({ table: 'AgentCorrection', pushed: 0, pulled: 0, errors: [String(e)] }) }
+
+  // 12. Document — restore document processing state
+  //     Requires the documents_backup table created by migration
+  //     supabase/migrations/20260822110000_add_document_extraction_backup_tables.sql
+  try {
+    const { data, error } = await client.from('documents_backup').select('*').limit(5000)
+    if (!error && data && data.length > 0) {
+      let pulled = 0
+      for (const d of data) {
+        try {
+          await db.document.upsert({
+            where: { id: d.id },
+            create: {
+              id: d.id,
+              title: d.title,
+              filePath: d.file_path || '',
+              domain: d.domain || 'mixed',
+              pageCount: d.page_count ?? null,
+              status: d.status || 'uploaded',
+              errorMessage: d.error_message ?? null,
+              userPaused: d.user_paused ?? false,
+              processingSteps: d.processing_steps || '[]',
+              processingPercent: d.processing_percent ?? 0,
+              createdAt: d.created_at ? new Date(d.created_at) : new Date(),
+              updatedAt: d.updated_at ? new Date(d.updated_at) : new Date(),
+            },
+            update: {
+              title: d.title,
+              filePath: d.file_path || '',
+              domain: d.domain || 'mixed',
+              pageCount: d.page_count ?? null,
+              status: d.status || 'uploaded',
+              errorMessage: d.error_message ?? null,
+              userPaused: d.user_paused ?? false,
+              processingSteps: d.processing_steps || '[]',
+              processingPercent: d.processing_percent ?? 0,
+              updatedAt: d.updated_at ? new Date(d.updated_at) : new Date(),
+            },
+          })
+          pulled++
+        } catch { /* skip conflict */ }
+      }
+      results.push({ table: 'Document', pushed: 0, pulled, errors: [] })
+      totalPulled += pulled
+    } else {
+      results.push({ table: 'Document', pushed: 0, pulled: 0, errors: error ? [error.message] : [] })
+    }
+  } catch (e) { results.push({ table: 'Document', pushed: 0, pulled: 0, errors: [String(e)] }) }
+
+  // 13. LocalEntity — restore extracted entities buffer
+  try {
+    const { data, error } = await client.from('local_entities_backup').select('*').limit(5000)
+    if (!error && data && data.length > 0) {
+      let pulled = 0
+      for (const e of data) {
+        try {
+          await db.localEntity.upsert({
+            where: { id: e.id },
+            create: {
+              id: e.id,
+              documentId: e.document_id ?? null,
+              chunkId: e.chunk_id ?? null,
+              entityName: e.entity_name,
+              entityType: e.entity_type,
+              description: e.description ?? null,
+              properties: e.properties ?? null,
+              confidenceScore: e.confidence_score ?? 0.5,
+              source: e.source || 'unknown',
+              domain: e.domain ?? null,
+              resolvedEntityId: e.resolved_entity_id ?? null,
+              synced: e.synced ?? false,
+              createdAt: e.created_at ? new Date(e.created_at) : new Date(),
+              updatedAt: e.updated_at ? new Date(e.updated_at) : new Date(),
+            },
+            update: {},
+          })
+          pulled++
+        } catch { /* skip conflict */ }
+      }
+      results.push({ table: 'LocalEntity', pushed: 0, pulled, errors: [] })
+      totalPulled += pulled
+    } else {
+      results.push({ table: 'LocalEntity', pushed: 0, pulled: 0, errors: error ? [error.message] : [] })
+    }
+  } catch (e) { results.push({ table: 'LocalEntity', pushed: 0, pulled: 0, errors: [String(e)] }) }
+
+  // 14. LocalRelationship — restore extracted relationships buffer
+  try {
+    const { data, error } = await client.from('local_relationships_backup').select('*').limit(5000)
+    if (!error && data && data.length > 0) {
+      let pulled = 0
+      for (const r of data) {
+        try {
+          await db.localRelationship.upsert({
+            where: { id: r.id },
+            create: {
+              id: r.id,
+              documentId: r.document_id ?? null,
+              sourceEntityId: r.source_entity_id ?? null,
+              targetEntityId: r.target_entity_id ?? null,
+              sourceEntityName: r.source_entity_name ?? null,
+              targetEntityName: r.target_entity_name ?? null,
+              relationshipType: r.relationship_type,
+              description: r.description ?? null,
+              confidenceScore: r.confidence_score ?? 0.5,
+              source: r.source || 'unknown',
+              synced: r.synced ?? false,
+              createdAt: r.created_at ? new Date(r.created_at) : new Date(),
+              updatedAt: r.updated_at ? new Date(r.updated_at) : new Date(),
+            },
+            update: {},
+          })
+          pulled++
+        } catch { /* skip conflict */ }
+      }
+      results.push({ table: 'LocalRelationship', pushed: 0, pulled, errors: [] })
+      totalPulled += pulled
+    } else {
+      results.push({ table: 'LocalRelationship', pushed: 0, pulled: 0, errors: error ? [error.message] : [] })
+    }
+  } catch (e) { results.push({ table: 'LocalRelationship', pushed: 0, pulled: 0, errors: [String(e)] }) }
+
+  // 15. LocalResolvedEntity — restore canonical merged entities
+  try {
+    const { data, error } = await client.from('local_resolved_entities_backup').select('*').limit(5000)
+    if (!error && data && data.length > 0) {
+      let pulled = 0
+      for (const r of data) {
+        try {
+          await db.localResolvedEntity.upsert({
+            where: { id: r.id },
+            create: {
+              id: r.id,
+              documentId: r.document_id ?? null,
+              canonicalName: r.canonical_name,
+              entityType: r.entity_type,
+              description: r.description ?? null,
+              properties: r.properties ?? null,
+              avgConfidence: r.avg_confidence ?? 0.5,
+              occurrenceCount: r.occurrence_count ?? 1,
+              domains: r.domains ?? null,
+              synced: r.synced ?? false,
+              createdAt: r.created_at ? new Date(r.created_at) : new Date(),
+              updatedAt: r.updated_at ? new Date(r.updated_at) : new Date(),
+            },
+            update: {},
+          })
+          pulled++
+        } catch { /* skip conflict */ }
+      }
+      results.push({ table: 'LocalResolvedEntity', pushed: 0, pulled, errors: [] })
+      totalPulled += pulled
+    } else {
+      results.push({ table: 'LocalResolvedEntity', pushed: 0, pulled: 0, errors: error ? [error.message] : [] })
+    }
+  } catch (e) { results.push({ table: 'LocalResolvedEntity', pushed: 0, pulled: 0, errors: [String(e)] }) }
 
   const durationMs = Date.now() - startTime
   console.log(`[Supabase] Pull complete: ${totalPulled} records in ${durationMs}ms`)

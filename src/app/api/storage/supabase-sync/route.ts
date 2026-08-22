@@ -67,6 +67,10 @@ export async function GET() {
       'token_usage_backup',
       'mcp_bridge_config_backup',
       'knowledge_access_policy_backup',
+      'documents_backup',
+      'local_entities_backup',
+      'local_relationships_backup',
+      'local_resolved_entities_backup',
       'sync_log',
     ],
     endpoints: {

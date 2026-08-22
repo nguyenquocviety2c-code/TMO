@@ -3190,6 +3190,215 @@ async function runIngestionPipeline(documentId: string, slotIndex: number = -1):
   }
 }
 
+// ==================== EMBED-ONLY PIPELINE ====================
+
+/**
+ * Re-generate embeddings ONLY — skips the expensive LLM extraction step.
+ *
+ * This is for documents that have entities in Neo4j (from a prior extraction
+ * session, restored via /api/ingestion/reconcile) but NO chunks in Qdrant
+ * (local store was wiped). The reconciled docs have status='extracted' and
+ * 90% processing_percent, but the "Embed %" badge shows 0% because Qdrant
+ * chunks (which hold the embedding vectors) are empty.
+ *
+ * Pipeline: download PDF from R2 → parse → chunk → save chunks to Qdrant
+ *           → generate embeddings (NVIDIA) → save embeddings to Qdrant.
+ *
+ * Skipped steps: extract (LLM), resolve, neo4j — because Neo4j already has
+ * the entities (from the prior session) and re-running extraction would burn
+ * LLM tokens for no benefit (Neo4j MERGE would just match existing nodes).
+ *
+ * After success: doc status → 'indexed', processing_percent → 100%.
+ */
+async function runEmbedOnlyPipeline(documentId: string): Promise<Record<string, unknown>> {
+  const startTime = Date.now()
+  const EMBED_DIM = getEmbeddingDimension()
+  try {
+    // 1. Get document metadata from Qdrant (must exist — reconcile created it)
+    const docPayload = await getDocument(documentId)
+    if (!docPayload) throw new Error(`Document not found in Qdrant: ${documentId}`)
+    const document = qdrantDocToRecord(docPayload, documentId)
+
+    console.log(`[EmbedOnly] Starting for doc ${documentId.slice(0, 8)}... ("${document.title}", status=${document.status})`)
+
+    // Build steps: download/parse/chunk/embeddings run; extract/resolve/neo4j marked completed (done in prior session)
+    const steps: ProcessingStepRecord[] = [
+      { name: 'download', label: 'Tải PDF', status: 'running', startedAt: new Date().toISOString(), completedAt: null, detail: null },
+      { name: 'parse', label: 'Phân tích PDF', status: 'pending', startedAt: null, completedAt: null, detail: null },
+      { name: 'chunk', label: 'Chia chunks', status: 'pending', startedAt: null, completedAt: null, detail: null },
+      { name: 'extract', label: 'Trích xuất entities', status: 'completed', startedAt: 'prior-session', completedAt: 'prior-session', detail: 'Entities đã có trong Neo4j (reconciled) — bỏ qua LLM' },
+      { name: 'resolve', label: 'Hợp nhất entities', status: 'completed', startedAt: 'prior-session', completedAt: 'prior-session', detail: 'Đã resolve trong phiên trước' },
+      { name: 'neo4j', label: 'Ghi Neo4j', status: 'completed', startedAt: 'prior-session', completedAt: 'prior-session', detail: 'Entities đã có trong Neo4j Aura' },
+      { name: 'embeddings', label: 'Tạo embeddings', status: 'pending', startedAt: null, completedAt: null, detail: null },
+    ]
+    await updateDocumentStatus(documentId, {
+      status: 'parsing',
+      processing_steps: steps as DocumentPayload['processing_steps'],
+      processing_percent: 5,
+      error_message: null,
+    })
+    try {
+      await db.document.update({
+        where: { id: documentId },
+        data: { status: 'parsing', processingSteps: JSON.stringify(steps), processingPercent: 5, errorMessage: null },
+      })
+    } catch { /* non-fatal */ }
+
+    // 2. Download PDF (local FS first, then R2 — matches main pipeline)
+    if (!document.file_path) throw new Error('Document has no file_path')
+    let pdfBuffer: Buffer | null = await downloadFromFilesystem(document.file_path as string)
+    if (!pdfBuffer && isR2Configured()) {
+      const r2Key = (document as { r2_key?: string }).r2_key
+        || `pdfs/${documentId}_${(document.title || '').replace(/[^a-zA-Z0-9._-]/g, '_')}.pdf`
+      console.log(`[EmbedOnly] Local file missing — restoring from R2: ${r2Key}`)
+      const r2Result = await downloadFileFromR2(r2Key, document.file_path as string)
+      if (r2Result.success) {
+        pdfBuffer = await readFile(document.file_path as string)
+        console.log(`[EmbedOnly] Restored ${r2Result.size} bytes from R2`)
+      } else {
+        throw new Error(`PDF not found locally and R2 download failed: ${r2Result.error || 'unknown'}`)
+      }
+    }
+    if (!pdfBuffer) throw new Error('PDF not found on local filesystem and R2 not configured')
+
+    steps[0] = { ...steps[0], status: 'completed', completedAt: new Date().toISOString(), detail: `${(pdfBuffer.length / 1024).toFixed(0)} KB` }
+    steps[1] = { ...steps[1], status: 'running' }
+    await updateDocumentStatus(documentId, {
+      status: 'parsing',
+      processing_steps: steps as DocumentPayload['processing_steps'],
+      processing_percent: 10,
+    })
+
+    // 3. Parse PDF
+    const { text: rawText, totalPages: parsedPages } = await extractPDFText(pdfBuffer)
+    if (!rawText || rawText.trim().length === 0) {
+      throw new Error('PDF parsing returned no text — document may be scanned/image-only')
+    }
+
+    const domain = (document.domain || 'mixed') as DocumentDomain
+    steps[1] = { ...steps[1], status: 'completed', completedAt: new Date().toISOString(), detail: `${parsedPages} trang` }
+    steps[2] = { ...steps[2], status: 'running' }
+    await updateDocumentStatus(documentId, {
+      status: 'chunked',
+      processing_steps: steps as DocumentPayload['processing_steps'],
+      processing_percent: 15,
+      ...(parsedPages ? { page_count: parsedPages } : {}),
+    })
+    try {
+      await db.document.update({
+        where: { id: documentId },
+        data: { pageCount: parsedPages || null, status: 'chunked', processingPercent: 15 },
+      })
+    } catch { /* non-fatal */ }
+
+    // 4. Chunk + save to Qdrant (zero-vector placeholders — real vectors added after)
+    const parseChunks = chunkText(rawText, domain)
+    if (parseChunks.length === 0) throw new Error('Chunking returned no chunks')
+    console.log(`[EmbedOnly] Chunked into ${parseChunks.length} chunks (domain=${domain})`)
+
+    const chunkPoints = parseChunks.map(chunk => ({
+      id: randomUUID(),
+      vector: new Array(EMBED_DIM).fill(0),
+      payload: {
+        document_id: documentId,
+        chunk_index: chunk.chunkIndex,
+        content: sanitizeForDB(chunk.content),
+        heading_path: sanitizeForDB(chunk.headingPath),
+        token_count: chunk.tokenCount,
+        domain: chunk.domain,
+        created_at: new Date().toISOString(),
+      } as ChunkPayload,
+    }))
+    const chunksUpserted = await upsertChunks(chunkPoints)
+    if (!chunksUpserted) throw new Error('Failed to save chunks to Qdrant')
+
+    steps[2] = { ...steps[2], status: 'completed', completedAt: new Date().toISOString(), detail: `${parseChunks.length} chunks` }
+    steps[6] = { ...steps[6], status: 'running' }
+    await updateDocumentStatus(documentId, {
+      status: 'extracting',
+      processing_steps: steps as DocumentPayload['processing_steps'],
+      processing_percent: 20,
+    })
+    try {
+      await db.document.update({
+        where: { id: documentId },
+        data: { status: 'extracting', processingPercent: 20 },
+      })
+    } catch { /* non-fatal */ }
+
+    // 5. Generate embeddings (NVIDIA) — the actual work
+    const texts = chunkPoints.map(c => (c.payload as ChunkPayload).content)
+    const embeddingResults = await generateEmbeddingBatch(texts)
+    let embeddingsSaved = 0
+    const realVectorPoints: Array<{ id: string; vector: number[]; payload: ChunkPayload }> = []
+    for (let i = 0; i < chunkPoints.length; i++) {
+      const emb = embeddingResults[i]
+      if (emb && emb.vector && emb.vector.length === EMBED_DIM) {
+        realVectorPoints.push({
+          id: chunkPoints[i].id,
+          vector: emb.vector,
+          payload: chunkPoints[i].payload as ChunkPayload,
+        })
+        embeddingsSaved++
+      }
+    }
+    if (realVectorPoints.length > 0) {
+      const ok = await upsertChunks(realVectorPoints)
+      if (!ok) console.error('[EmbedOnly] upsertChunks returned false — embeddings may not have saved')
+    }
+    console.log(`[EmbedOnly] Saved ${embeddingsSaved}/${parseChunks.length} embeddings to Qdrant`)
+
+    // 6. Mark complete
+    const finalSteps = steps.map(s => ({ ...s, status: 'completed' as const, completedAt: s.completedAt || new Date().toISOString() }))
+    const finalPercent = 100
+    await updateDocumentStatus(documentId, {
+      status: 'indexed',
+      processing_steps: finalSteps as DocumentPayload['processing_steps'],
+      processing_percent: finalPercent,
+      error_message: null,
+    })
+    try {
+      await db.document.update({
+        where: { id: documentId },
+        data: {
+          status: 'indexed',
+          processingSteps: JSON.stringify(finalSteps),
+          processingPercent: finalPercent,
+          errorMessage: null,
+        },
+      })
+    } catch { /* non-fatal */ }
+
+    return {
+      documentId,
+      totalChunks: parseChunks.length,
+      embeddingsSaved,
+      provider: 'nvidia-embed-only',
+      model: 'nvidia/llama-nemotron-embed-1b-v2',
+      durationMs: Date.now() - startTime,
+      status: 'indexed' as const,
+      totalPages: parsedPages,
+      skippedExtraction: true,
+    }
+  } catch (error) {
+    const errorMessage = error instanceof Error ? error.message : String(error)
+    console.error(`[EmbedOnly] FAILED for ${documentId.slice(0, 8)}...:`, errorMessage)
+    try {
+      await updateDocumentStatus(documentId, { status: 'error', error_message: `Embed-only: ${errorMessage}` })
+      await db.document.update({
+        where: { id: documentId },
+        data: { status: 'error', errorMessage: `Embed-only: ${errorMessage}` },
+      })
+    } catch { /* non-fatal */ }
+    return {
+      documentId,
+      error: errorMessage,
+      durationMs: Date.now() - startTime,
+      status: 'error' as const,
+    }
+  }
+}
+
 // ==================== POST HANDLER ====================
 
 export async function POST(request: NextRequest) {
@@ -3197,6 +3406,45 @@ export async function POST(request: NextRequest) {
     const body = await request.json()
     let documentIds: string[] = []
     const isReExtract = body.reExtract === true
+    const isEmbedOnly = body.embedOnly === true
+
+    // EMBED-ONLY MODE: for reconciled docs (status='extracted', entities in Neo4j,
+    // Qdrant chunks empty). Generates embeddings without re-running LLM extraction.
+    // Accepts: documentId | documentIds | all (picks 'extracted' status docs).
+    if (isEmbedOnly) {
+      if (body.all === true) {
+        const embedDocs = await fetchDocsByStatuses(['extracted'], { limit: 500, orderBy: 'created_at', orderDir: 'asc' })
+        documentIds = embedDocs.map(d => d.id)
+      } else if (body.documentId) {
+        documentIds = [body.documentId]
+      } else if (body.documentIds && Array.isArray(body.documentIds)) {
+        documentIds = body.documentIds
+      } else {
+        return NextResponse.json({ error: 'embedOnly requires documentId, documentIds, or all=true' }, { status: 400 })
+      }
+      if (documentIds.length === 0) {
+        return NextResponse.json({ message: 'No documents to embed (need status=extracted)', results: [] })
+      }
+      console.log(`[Process] embedOnly request: ${documentIds.length} doc(s)`)
+      // Run embed-only pipeline for each doc. Sequentially — embeddings are
+      // rate-limited by NVIDIA (40 RPM/key), and concurrent calls would
+      // trip rate limiting. Each doc is independent so no shared state.
+      const results: Record<string, unknown>[] = []
+      for (const docId of documentIds) {
+        const r = await runEmbedOnlyPipeline(docId)
+        results.push(r)
+      }
+      const ok = results.filter(r => r.status === 'indexed').length
+      const failed = results.filter(r => r.status === 'error').length
+      return NextResponse.json({
+        message: `embedOnly complete: ${ok} indexed, ${failed} failed`,
+        embedOnly: true,
+        total: results.length,
+        indexed: ok,
+        failed,
+        results,
+      })
+    }
 
     if (body.all === true) {
       const pendingDocs = await fetchDocsByStatuses(['uploaded', 'error', 'partial'], { orderBy: 'created_at', orderDir: 'asc' })
@@ -4414,16 +4662,50 @@ async function autoRecoverStuckDocs(): Promise<{ recovered: number; smartRecover
         recoveredCount++
         console.log(`[Recovery] Doc "${doc.payload.title}" has ${chunkCount} chunks but 0 entities — marking as 'partial'`)
       } else {
-        // No chunks and no entities — reset to 'uploaded' for fresh processing
-        await updateDocumentStatus(doc.id, {
-          status: 'uploaded',
-          error_message: null,
-          processing_steps: stepsToQdrantFormat(getDefaultSteps()),
-          processing_percent: 0,
-        })
-        try { await db.document.update({ where: { id: doc.id }, data: { status: 'uploaded', errorMessage: null, processingSteps: '[]', processingPercent: 0 } }) } catch { /* non-fatal */ }
-        recoveredCount++
-        console.log(`[Recovery] Reset doc "${doc.payload.title}" → 'uploaded' (no data, ready for re-processing)`)
+        // No LOCAL chunks/entities. Before resetting, check whether Neo4j
+        // (the durable cloud graph) still holds extraction results for this
+        // document — the local SQLite/Qdrant buffers may have been wiped on a
+        // fresh setup even though the cloud graph survived. Relationship edges
+        // always carry a `documentId` property (set during extraction), so
+        // counting them is the reliable signal that a doc was processed.
+        let neo4jRelCount = 0
+        try {
+          const rows = await readCypher<{ cnt: number }>(
+            `MATCH ()-[r]->() WHERE r.documentId = $docId RETURN count(r) AS cnt`,
+            { docId: doc.id }
+          )
+          neo4jRelCount = (rows[0]?.cnt as number) ?? 0
+        } catch { /* non-fatal — treat as 0 */ }
+
+        if (neo4jRelCount > 0) {
+          // Extraction result survives in Neo4j cloud graph — preserve as
+          // 'extracted' (90%, embeddings pending re-run) instead of resetting.
+          const preservedSteps = getDefaultSteps().map((s, i) =>
+            i < 6
+              ? { ...s, status: 'completed' as const, startedAt: 'reconciled', completedAt: 'reconciled', detail: 'Restored from Neo4j during recovery' }
+              : s
+          )
+          await updateDocumentStatus(doc.id, {
+            status: 'extracted',
+            error_message: null,
+            processing_steps: stepsToQdrantFormat(preservedSteps),
+            processing_percent: 90,
+          })
+          try { await db.document.update({ where: { id: doc.id }, data: { status: 'extracted', errorMessage: null, processingSteps: JSON.stringify(preservedSteps), processingPercent: 90 } }) } catch { /* non-fatal */ }
+          smartRecoveredCount++
+          console.log(`[Recovery] Preserved doc "${doc.payload.title}" → 'extracted' (${neo4jRelCount} Neo4j rels; local buffers empty — likely reconciled)`)
+        } else {
+          // Genuinely no data anywhere — reset to 'uploaded' for fresh processing
+          await updateDocumentStatus(doc.id, {
+            status: 'uploaded',
+            error_message: null,
+            processing_steps: stepsToQdrantFormat(getDefaultSteps()),
+            processing_percent: 0,
+          })
+          try { await db.document.update({ where: { id: doc.id }, data: { status: 'uploaded', errorMessage: null, processingSteps: '[]', processingPercent: 0 } }) } catch { /* non-fatal */ }
+          recoveredCount++
+          console.log(`[Recovery] Reset doc "${doc.payload.title}" → 'uploaded' (no data anywhere, ready for re-processing)`)
+        }
       }
     }
 

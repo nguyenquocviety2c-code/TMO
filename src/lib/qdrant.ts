@@ -907,7 +907,12 @@ export async function getQdrantStats(): Promise<{
     if (names.includes(COLLECTION_CHUNKS)) {
       const info = await qdrant.getCollection(COLLECTION_CHUNKS)
       totalChunks = info.points_count
-      vectorsIndexed = info.vectors_count
+      // vectors_count can be null for some Qdrant versions/configs (scalar-quantized
+      // single-vector collections). Every chunk point always carries a real vector
+      // (the pipeline refuses to upsert zero-vector placeholders since the pseudo
+      // fallback was removed), so points_count is the accurate embedding count.
+      // Fall back to points_count when vectors_count is null/undefined.
+      vectorsIndexed = info.vectors_count ?? info.points_count ?? 0
     }
 
     return {
