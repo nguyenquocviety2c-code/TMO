@@ -1256,6 +1256,7 @@ function KnowledgeExplorer() {
   const [paths, setPaths] = useState<Array<{ nodes: string[]; edges: Array<{ source: string; type: string; target: string }>; length: number }> | null>(null)
   const [loading, setLoading] = useState(false)
   const [graphLoading, setGraphLoading] = useState(false)
+  const [graphMode, setGraphMode] = useState<'2d' | '3d'>('2d')
   const [highlightSearch, setHighlightSearch] = useState('')
   const [pathHighlight, setPathHighlight] = useState<string[]>([])
 
@@ -1281,12 +1282,12 @@ function KnowledgeExplorer() {
     setGraphLoading(true)
     try {
       // Fetch entities
-      const entRes = await fetch('/api/ingestion/entities?limit=30')
+      const entRes = await fetch('/api/ingestion/entities?limit=150')
       const entData = await entRes.json()
       const entities: EntityRecord[] = entData.entities || []
 
       // Fetch relationships
-      const relRes = await fetch('/api/ingestion/relationships?limit=200')
+      const relRes = await fetch('/api/ingestion/relationships?limit=500')
       const relData = await relRes.json()
       const rels: RelationshipRecord[] = relData.relationships || []
 
@@ -1859,8 +1860,21 @@ function KnowledgeExplorer() {
                   <CardTitle className="text-sm font-semibold tracking-tight text-stone-100">Knowledge Graph</CardTitle>
                   <Badge variant="secondary" className="text-[10px]">{graphNodes.length} nodes · {graphLinks.length} edges</Badge>
                 </div>
-                {/* Zoom Controls */}
+                {/* Zoom Controls + 2D/3D Toggle */}
                 <div className="flex items-center gap-1">
+                  {/* 2D/3D Mode Toggle */}
+                  <div className="flex items-center rounded-lg border border-magenta-400/35 overflow-hidden mr-1">
+                    <button
+                      onClick={() => setGraphMode('2d')}
+                      className={`px-2 h-7 text-[10px] font-medium transition-colors ${graphMode === '2d' ? 'bg-magenta-600/40 text-white' : 'bg-slate-950/60 text-stone-400 hover:text-stone-200'}`}
+                      title="2D view (D3 force-directed)"
+                    >2D</button>
+                    <button
+                      onClick={() => setGraphMode('3d')}
+                      className={`px-2 h-7 text-[10px] font-medium transition-colors ${graphMode === '3d' ? 'bg-magenta-600/40 text-white' : 'bg-slate-950/60 text-stone-400 hover:text-stone-200'}`}
+                      title="3D view (glowing nodes + light connections)"
+                    >3D</button>
+                  </div>
                   <Button variant="outline" size="icon" className="h-7 w-7 btn-glow" onClick={handleZoomIn} title="Zoom In">
                     <ZoomIn className="h-3.5 w-3.5" />
                   </Button>
@@ -1894,9 +1908,21 @@ function KnowledgeExplorer() {
                 </div>
               ) : (
                 <div ref={containerRef} className="relative w-full border-t" style={{ minHeight: 450 }}>
-                  <svg ref={svgRef} className="w-full" style={{ height: 500, background: 'transparent' }} />
-                  {/* Tooltip */}
-                  <div ref={tooltipRef} className="absolute hidden pointer-events-none z-50 bg-slate-950/80 rounded-lg shadow-lg border border-cyan-400/40 px-3 py-2" />
+                  {graphMode === '3d' ? (
+                    <KnowledgeGraph3D
+                      nodes={graphNodes}
+                      links={graphLinks}
+                      getNodeColor={getNodeColor}
+                      getNodeRadius={getNodeRadius}
+                      onNodeClick={(name) => void expandNode(name)}
+                    />
+                  ) : (
+                    <>
+                      <svg ref={svgRef} className="w-full" style={{ height: 500, background: 'transparent' }} />
+                      {/* Tooltip */}
+                      <div ref={tooltipRef} className="absolute hidden pointer-events-none z-50 bg-slate-950/80 rounded-lg shadow-lg border border-cyan-400/40 px-3 py-2" />
+                    </>
+                  )}
                 </div>
               )}
               {/* Legend */}
@@ -2641,7 +2667,7 @@ function AnalyticsSection({ data, onRefreshStats }: { data: AnalyticsData; onRef
               <CheckCircle2 className="h-3.5 w-3.5 inline mr-1" /> Knowledge Base đang cân bằng — không phát hiện khoảng trống đáng kể
             </div>
           ) : (
-            <div className="space-y-2">
+            <div className="space-y-2 max-h-[280px] overflow-y-auto custom-scrollbar pr-1">
               {gapAnalysis.map((gap, i) => (
                 <div key={i} className={`p-3 rounded-xl border flex items-start gap-2 text-xs ${
                   gap.severity === 'warning' ? 'bg-amber-950/40 border-amber-500/55 text-amber-400' :
@@ -14368,5 +14394,158 @@ export default function Home() {
         refreshing={healthRefreshing}
       />
     </div>
+  )
+}
+
+// ==================== 3D KNOWLEDGE GRAPH (glowing nodes + light connections) ====================
+
+/**
+ * KnowledgeGraph3D — 3D force-directed graph with glowing nodes + animated light connections.
+ * Uses 3d-force-graph (three.js + d3-force-3d wrapper).
+ *
+ * Visual design:
+ *   - Nodes are glowing spheres (emissive material + bloom-like halo)
+ *   - Connections are glowing lines (animated particles flowing along edges)
+ *   - Camera orbits with mouse drag, zoom with scroll
+ *   - Click node → expand (calls onNodeClick)
+ *
+ * Performance: handles up to ~500 nodes smoothly on modern GPUs.
+ */
+function KnowledgeGraph3D({ nodes, links, getNodeColor, getNodeRadius, onNodeClick }: {
+  nodes: GraphNode[]
+  links: GraphLink[]
+  getNodeColor: (type: string) => string
+  getNodeRadius: (occurrences: number) => number
+  onNodeClick: (name: string) => void
+}) {
+  const containerRef = useRef<HTMLDivElement>(null)
+  const graphInstanceRef = useRef<unknown>(null)
+
+  useEffect(() => {
+    if (!containerRef.current || nodes.length === 0) return
+
+    // Dynamic import to keep three.js out of initial bundle
+    let destroyed = false
+    Promise.all([
+      import('3d-force-graph'),
+      import('three'),
+    ]).then(([{ default: ForceGraph3D }, THREE]) => {
+      if (destroyed || !containerRef.current) return
+
+      // Build graph data
+      const graphData = {
+        nodes: nodes.map(n => ({
+          id: n.id,
+          name: n.name,
+          type: n.type,
+          val: getNodeRadius(n.occurrences || 1),  // node size
+          color: getNodeColor(n.type),
+          occurrences: n.occurrences || 1,
+        })),
+        links: links.map(l => ({
+          source: l.source as string,
+          target: l.target as string,
+          relType: l.relType,
+          color: 'rgba(180, 200, 255, 0.4)',
+        })),
+      }
+
+      // Convert hex colors to numeric for emissive
+      const hexToInt = (hex: string) => {
+        const h = hex.replace('#', '')
+        return parseInt(h.length === 3 ? h.split('').map(c => c + c).join('') : h, 16)
+      }
+
+      const graph = new ForceGraph3D(containerRef.current)
+        .graphData(graphData)
+        .backgroundColor('rgba(0,0,0,0)')
+        .nodeRelSize(6)
+        .nodeVal((node: { val?: number }) => node.val || 6)
+        .nodeColor((node: { color?: string }) => node.color || '#9ca3af')
+        .nodeOpacity(0.95)
+        .nodeLabel((node: { name?: string; type?: string }) => {
+          const n = node as { name?: string; type?: string; occurrences?: number }
+          return `<div style="background:rgba(15,23,42,0.95);padding:6px 10px;border-radius:6px;border:1px solid rgba(34,211,238,0.4);color:#e2e8f0;font-size:11px;"><b>${n.name}</b><br/><span style="color:#67e8f9;">${n.type}</span>${n.occurrences ? `<br/><span style="color:#94a3b8;">×${n.occurrences} occurrences</span>` : ''}</div>`
+        })
+        .nodeThreeObject((node: { color?: string; val?: number }) => {
+          const n = node as { color?: string; val?: number }
+          // Glowing sphere with emissive material
+          const colorHex = n.color || '#9ca3af'
+          const geometry = new THREE.SphereGeometry(Math.max(0.5, (n.val || 6) / 4), 16, 16)
+          const material = new THREE.MeshBasicMaterial({
+            color: colorHex,
+            transparent: true,
+            opacity: 0.9,
+          })
+          const mesh = new THREE.Mesh(geometry, material)
+          // Add glow halo (transparent larger sphere)
+          const haloGeo = new THREE.SphereGeometry(Math.max(0.8, (n.val || 6) / 3), 12, 12)
+          const haloMat = new THREE.MeshBasicMaterial({
+            color: colorHex,
+            transparent: true,
+            opacity: 0.25,
+          })
+          const halo = new THREE.Mesh(haloGeo, haloMat)
+          mesh.add(halo)
+          return mesh
+        })
+        .linkColor((link: { color?: string }) => (link as { color?: string }).color || 'rgba(180,200,255,0.4)')
+        .linkWidth(0.8)
+        .linkOpacity(0.6)
+        .linkDirectionalParticles(2)
+        .linkDirectionalParticleWidth(0.6)
+        .linkDirectionalParticleColor(() => 'rgba(120, 200, 255, 0.8)')
+        .linkDirectionalParticleSpeed(0.004)
+        .linkDirectionalArrowLength(3.5)
+        .linkDirectionalArrowRelPos(1)
+        .linkLabel((link: { relType?: string }) => {
+          const l = link as { relType?: string }
+          return l.relType ? `<div style="background:rgba(15,23,42,0.9);padding:3px 6px;border-radius:4px;color:#94a3b8;font-size:9px;">${l.relType}</div>` : ''
+        })
+        .onNodeClick((node: { name?: string }) => {
+          const n = node as { name?: string }
+          if (n.name) onNodeClick(n.name)
+        })
+        .cooldownTicks(100)
+        .warmupTicks(50)
+
+      // Camera position + initial zoom
+      graph.cameraPosition({ z: 250 })
+
+      // Enable orbit controls
+      const controls = graph.controls() as unknown as { autoRotate?: boolean; autoRotateSpeed?: number; enableDamping?: boolean; dampingFactor?: number }
+      if (controls) {
+        controls.enableDamping = true
+        controls.dampingFactor = 0.3
+      }
+
+      // Resize handler
+      const handleResize = () => {
+        if (containerRef.current) {
+          graph.width(containerRef.current.clientWidth)
+          graph.height(500)
+        }
+      }
+      window.addEventListener('resize', handleResize)
+      handleResize()
+
+      graphInstanceRef.current = graph
+    })
+
+    return () => {
+      destroyed = true
+      const g = graphInstanceRef.current as { _destructor?: () => void } | null
+      if (g?._destructor) g._destructor()
+      graphInstanceRef.current = null
+      if (containerRef.current) containerRef.current.innerHTML = ''
+    }
+  }, [nodes, links, getNodeColor, getNodeRadius, onNodeClick])
+
+  return (
+    <div
+      ref={containerRef}
+      className="w-full"
+      style={{ height: 500, background: 'radial-gradient(ellipse at center, rgba(15,23,42,0.4) 0%, rgba(2,6,23,0.6) 100%)' }}
+    />
   )
 }

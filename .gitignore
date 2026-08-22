@@ -124,3 +124,4 @@ tsc-output.txt
 *.md~
 *.bak
 docker-compose.yml~
+.env

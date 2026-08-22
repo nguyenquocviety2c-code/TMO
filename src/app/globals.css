@@ -162,6 +162,26 @@
   background: rgba(217, 70, 239, 0.55);
 }
 
+/* --- Custom scrollbar for compact panels (Gap Analysis, etc.) --- */
+.custom-scrollbar {
+  scrollbar-width: thin !important;
+  scrollbar-color: rgba(251, 191, 36, 0.4) transparent !important;
+}
+.custom-scrollbar::-webkit-scrollbar {
+  width: 5px !important;
+  display: block !important;
+}
+.custom-scrollbar::-webkit-scrollbar-track {
+  background: transparent;
+}
+.custom-scrollbar::-webkit-scrollbar-thumb {
+  background: rgba(251, 191, 36, 0.4);
+  border-radius: 3px;
+}
+.custom-scrollbar::-webkit-scrollbar-thumb:hover {
+  background: rgba(251, 191, 36, 0.6);
+}
+
 /* --- Chamfered corner clip-paths (ALL 4 corners chamfered — 8-point polygon) --- */
 .chamfer-sm {
   clip-path: polygon(6px 0, calc(100% - 6px) 0, 100% 6px, 100% calc(100% - 6px), calc(100% - 6px) 100%, 6px 100%, 0 calc(100% - 6px), 0 6px);
